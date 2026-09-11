@@ -5,10 +5,9 @@
  *   - Coordinating who's free to play (!free, !notfree)
  *   - Tracking match results / a simple leaderboard (!score, !leaderboard)
  *   - Weather checks for outdoor play (!weather)
- *   - Scheduling daily matches via WhatsApp polls: "@tenbot create a poll for 8"
- *     posts a poll with slots 1..8; once every slot has exactly one voter,
- *     the bot automatically posts doubles matchups for two sets, rotating
- *     partners between sets.
+ *   - Scheduling matches via WhatsApp polls: "@tenbot create a poll for 2" (singles)
+ *     or "@tenbot create a poll for 8" (doubles). Once every slot has exactly one voter,
+ *     the bot automatically posts singles/doubles matchups with rotations.
  *   - General questions, answered by Claude with live group context (@tenbot ...)
  *
  * Setup:
@@ -23,8 +22,7 @@
  *     no browser/Puppeteer involved. It's still an UNOFFICIAL client (not the
  *     WhatsApp Business API), so use responsibly: avoid spammy/high-volume
  *     behavior, and know there's a (small but real) risk of your account
- *     being flagged if Wha
- *     tsApp detects automation abuse.
+ *     being flagged if WhatsApp detects automation abuse.
  *   - Session data is cached locally after the first QR scan (in
  *     auth_info_baileys/), so you won't need to re-scan every restart.
  */
@@ -55,8 +53,8 @@ const { resolvePlayDateTime } = require('./lib/pollTime');
 // Set this to the exact group name (subject) you want the bot to listen to.
 // Leave as null to have the bot log every group name/ID it sees, so you can
 // find the right one.
-//const TARGET_GROUP_NAME = 'SCVCC Early Morning Tennis Group (that usually plays in the evenings!)';
-const TARGET_GROUP_NAME = 'Bot-testing';
+const TARGET_GROUP_NAME = 'SCVCC Early Morning Tennis Group (that usually plays in the evenings!)';
+//const TARGET_GROUP_NAME = 'Bot-testing';
 
 // Only call the LLM when the bot is directly addressed (recommended for
 // groups, otherwise it'll try to reply to every single message). Structured
@@ -81,10 +79,69 @@ const SYSTEM_PROMPT =
   'You are a helpful assistant in a WhatsApp group chat for a group of tennis ' +
   'players who organize casual matches together. Keep replies short and ' +
   'conversational (1-3 sentences) unless asked for more detail. You have ' +
-  "access to the group's current availability list, win/loss leaderboard, and " +
-  'any active match-scheduling poll (given below) -- use it to answer ' +
-  "questions naturally, but if the answer isn't in that data, say so rather " +
-  'than guessing. Avoid emojis unless they fit naturally.';
+  "access to tools to create match polls (2 spots for singles, or 4/8/12 spots for doubles), " +
+  "check weather, cancel polls, and access the group's availability list, win/loss leaderboard, " +
+  'and active polls (given below). When a message contains a request to create a poll alongside ' +
+  'other questions, call the create_poll tool and answer the other questions naturally in your reply.';
+
+// Tools exposed to Claude for handling natural language requests
+const CLAUDE_TOOLS = [
+  {
+    name: 'create_poll',
+    description: 'Creates and sends a WhatsApp poll with numbered spots (1..N) for organizing a tennis match in the group. Supports singles (2 spots) and doubles (4, 8, 12, etc.). Use this whenever the user wants to create a poll, organize singles or doubles, set up spots for tennis, etc.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        size: {
+          type: 'integer',
+          description: 'Number of spots in the poll. Must be 2 (for singles) or a positive multiple of 4 (e.g. 4, 8, 12, 16 for doubles).'
+        },
+        when: {
+          type: 'string',
+          description: 'Human-readable day/time description (e.g. "Saturday 9am", "Tomorrow 7pm", "Tonight 6pm").'
+        },
+        dayWord: {
+          type: 'string',
+          description: 'Day word mentioned in the request (e.g. "today", "tomorrow", "Saturday", "Sun").'
+        },
+        timeWord: {
+          type: 'string',
+          description: 'Time word mentioned in the request (e.g. "9am", "6:30pm", "7pm").'
+        }
+      },
+      required: ['size']
+    }
+  },
+  {
+    name: 'get_weather',
+    description: 'Get weather forecast for outdoor tennis play for a specific city or location.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        location: {
+          type: 'string',
+          description: 'Location / city name. Defaults to the group\'s default location if omitted.'
+        }
+      }
+    }
+  },
+  {
+    name: 'cancel_poll',
+    description: 'Cancels the active match poll so the bot stops tracking and auto-generating matchups.',
+    input_schema: {
+      type: 'object',
+      properties: {}
+    }
+  },
+  {
+    name: 'rematch',
+    description: 'Regenerates matchups and rotations from the current poll votes.',
+    input_schema: {
+      type: 'object',
+      properties: {}
+    }
+  }
+];
 
 // How many past messages (per chat) to keep for conversational context
 const HISTORY_LIMIT = 10;
@@ -126,6 +183,45 @@ const storeKey = (remoteJid, id) => `${remoteJid}:${id}`;
 
 function persistPolls() {
   pollStore.save({ messageStore, activePolls, latestPollIdByChat });
+}
+
+function escapeRegex(str) {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Checks whether an incoming message is addressed to the bot, matching any case
+ * variation of TRIGGER_PREFIX (e.g. @tenbot, @Tenbot, @TENBOT, @TenBot, tenbot),
+ * optional punctuation (colons, commas), or WhatsApp native @-mentions.
+ */
+function isAddressedToBot(text, msg, botJids, triggerPrefix = TRIGGER_PREFIX) {
+  if (!triggerPrefix) return { addressed: true, promptText: text };
+
+  const mentionedJids = msg?.message?.extendedTextMessage?.contextInfo?.mentionedJid || [];
+  const isDirectlyMentioned = mentionedJids.some((jid) => botJids.includes(jidNormalizedUser(jid)));
+
+  const baseName = escapeRegex(triggerPrefix.replace(/^@/, ''));
+  const prefixRegex = new RegExp(`^@?${baseName}[:,]?\\s*`, 'i');
+  const anywhereRegex = new RegExp(`@?${baseName}[:,]?\\b`, 'ig');
+
+  if (prefixRegex.test(text)) {
+    const promptText = text.replace(prefixRegex, '').trim();
+    return { addressed: true, promptText };
+  }
+
+  if (isDirectlyMentioned || anywhereRegex.test(text)) {
+    let promptText = text.replace(anywhereRegex, '').trim();
+    for (const jid of botJids) {
+      const num = jid.split('@')[0];
+      if (num) {
+        promptText = promptText.replace(new RegExp(`@${escapeRegex(num)}[:,]?\\s*`, 'g'), '').trim();
+      }
+    }
+    promptText = promptText.replace(/^[,\s:]+/, '').replace(/\s{2,}/g, ' ').trim();
+    return { addressed: true, promptText };
+  }
+
+  return { addressed: false, promptText: text };
 }
 
 /**
@@ -348,7 +444,7 @@ async function startBot() {
         if (currMeId) recordName(currMeId, currMeName);
         if (currMeLid) recordName(currMeLid, currMeName);
       }
-      console.log('✅ Tennis group bot is ready and listening.');
+      console.log(`✅ Tennis group bot is ready and listening for group ${TARGET_GROUP_NAME}.`);
     }
   });
 
@@ -416,7 +512,7 @@ async function handleMessage(sock, msg) {
   const metadata = await getGroupMetadata(sock, remoteJid);
   const groupName = metadata?.subject || remoteJid;
 
-  console.log(`Received message from group ${groupName}`)
+  console.log(`Received message from group ${groupName}`);
 
   if (!TARGET_GROUP_NAME) {
     console.log(`[Group seen] "${groupName}" (id: ${remoteJid})`);
@@ -437,7 +533,7 @@ async function handleMessage(sock, msg) {
 
   console.log(`[${groupName}] ${sender}: ${text}`);
 
-  const reply = await getResponse(sock, text.trim(), remoteJid, sender);
+  const reply = await getResponse(sock, text.trim(), remoteJid, sender, msg);
   if (reply) {
     await sock.sendMessage(remoteJid, { text: reply });
   }
@@ -454,13 +550,50 @@ function extractText(message) {
 }
 
 /**
- * Routes an incoming message to the right handler: structured tennis
- * commands first, then poll creation, then the LLM fallback for anything
- * else addressed to the bot. Handlers that need to send something other
- * than a plain text reply (like the poll itself) return null here and send
- * directly via `sock`.
+ * Executes a tool called by Claude and returns the result string.
  */
-async function getResponse(sock, text, chatId, sender) {
+async function executeTool(sock, chatId, sender, toolUse) {
+  const { name, input } = toolUse;
+  if (name === 'create_poll') {
+    const size = input.size;
+    const when = input.when || null;
+    const dayWord = input.dayWord || null;
+    const timeWord = input.timeWord || null;
+    const err = await createMatchPoll(sock, chatId, size, when, dayWord, timeWord);
+    if (err) {
+      return `Failed to create poll: ${err}`;
+    }
+    return `Poll for ${size} spots (${size === 2 ? 'Singles' : 'Doubles'}${when ? ` -- ${when}` : ''}) created and posted to the group.`;
+  }
+  if (name === 'get_weather') {
+    const location = input.location || DEFAULT_LOCATION;
+    try {
+      const forecast = await weather.getForecast(location);
+      return weather.formatForecast(forecast);
+    } catch (err) {
+      return `Failed to get weather for ${location}: ${err.message}`;
+    }
+  }
+  if (name === 'cancel_poll') {
+    const pollId = latestPollIdByChat.get(chatId);
+    if (!pollId || !activePolls.has(pollId)) return 'No active poll to cancel.';
+    activePolls.get(pollId).status = 'cancelled';
+    persistPolls();
+    return 'Poll cancelled successfully.';
+  }
+  if (name === 'rematch') {
+    const res = await regenerateMatchups(sock, chatId);
+    return res || 'Matchups regenerated and posted.';
+  }
+  return `Unknown tool ${name}`;
+}
+
+/**
+ * Routes an incoming message to the right handler: structured tennis
+ * commands first, then the LLM with tool support for free-form queries,
+ * questions, and poll creation.
+ */
+async function getResponse(sock, text, chatId, sender, msg) {
   const lower = text.toLowerCase();
 
   // --- Basic commands ---
@@ -536,28 +669,20 @@ async function getResponse(sock, text, chatId, sender) {
     return pollStatusText(chatId);
   }
 
-  // --- Trigger check for @tenbot-addressed messages ---
-  let promptText = text;
-  if (TRIGGER_PREFIX) {
-    if (!lower.startsWith(TRIGGER_PREFIX.toLowerCase())) {
-      return null; // not addressed to the bot, stay quiet
-    }
-    promptText = text.slice(TRIGGER_PREFIX.length).trim();
-    if (!promptText) return null;
-  }
+  // --- Trigger check for bot-addressed messages (case-insensitive, with/without @, native mentions) ---
+  const mePn = jidNormalizedUser(sock?.user?.id || sock?.authState?.creds?.me?.id || '');
+  const meLid = jidNormalizedUser(sock?.user?.lid || sock?.authState?.creds?.me?.lid || '');
+  const botJids = [mePn, meLid].filter(Boolean);
 
-  // --- Poll creation intent, e.g. "@tenbot create a poll for 8 on Sat at 9am" ---
-  if (/\bpoll\b/i.test(promptText)) {
-    const { size, when, dayWord, timeWord } = extractPollDetails(promptText);
-    if (!size) {
-      return `How many spots should the poll have? e.g. "${TRIGGER_PREFIX} create a poll for 8" or "${TRIGGER_PREFIX} create a poll for 8 on Saturday at 9am"`;
-    }
-    return await createMatchPoll(sock, chatId, size, when, dayWord, timeWord);
+  const { addressed, promptText } = isAddressedToBot(text, msg, botJids);
+  if (TRIGGER_PREFIX && !addressed) {
+    return null; // not addressed to the bot, stay quiet
   }
+  if (!promptText) return null;
 
-  // --- LLM fallback ---
+  // --- LLM (handles free-form queries, poll creation, weather, Q&A, etc.) ---
   try {
-    return await callClaude(chatId, sender, promptText);
+    return await callClaude(sock, chatId, sender, promptText);
   } catch (err) {
     console.error('LLM call failed:', err);
     return "Sorry, I couldn't come up with a reply just now.";
@@ -574,13 +699,13 @@ function helpText() {
     '!score <winner> def <loser> <score> – record a match, e.g. "!score Mike def John 6-4 6-2"',
     '!leaderboard – show the win/loss leaderboard',
     '!weather [location] – forecast for outdoor play (defaults to ' + DEFAULT_LOCATION + ')',
-    `${TRIGGER_PREFIX} create a poll for <N> – post a poll with N numbered spots; once everyone's voted in, matchups post automatically`,
+    `${TRIGGER_PREFIX} create a poll for <N> – post a poll with N spots (2 for singles, 4/8/12 for doubles); once everyone's voted in, matchups post automatically`,
     '!cancelpoll – stop the current poll from auto-generating matchups',
     '!pollstatus – debug: show raw vote count and voters for the current poll',
     '!rematch – regenerate matchups from the current poll\'s votes',
     '!cleanuppolls – debug: force a sweep that deletes expired/completed polls now',
     '!reset – clear the bot\'s conversation memory',
-    TRIGGER_PREFIX ? `${TRIGGER_PREFIX} <question> – ask the bot anything` : '(bot also responds to any message)'
+    TRIGGER_PREFIX ? `${TRIGGER_PREFIX} <question> – ask the bot anything (including free-form poll creation and questions)` : '(bot also responds to any message)'
   ].join('\n');
 }
 
@@ -620,68 +745,31 @@ function handleScoreCommand(text) {
 
 // ---- Poll creation & vote handling ----
 
-const DAY_WORDS_REGEX =
-  /\b(today|tomorrow|tonight|mon(?:day)?|tue(?:s|sday)?|wed(?:nesday)?|thu(?:rs|rsday)?|fri(?:day)?|sat(?:urday)?|sun(?:day)?)\b/i;
-const TIME_REGEX = /\b(\d{1,2}(?::\d{2})?\s*(?:am|pm))\b/i;
-
-function titleCase(word) {
-  return word.charAt(0).toUpperCase() + word.slice(1).toLowerCase();
-}
-
-/**
- * Pulls a player count and an optional "when" phrase (day and/or time) out
- * of a poll-creation request. The time is stripped out before looking for
- * the player count so a time like "6pm" never gets mistaken for it -- e.g.
- * "poll for 8 on Saturday at 9am" and "poll at 9am for 8 on Saturday" both
- * correctly resolve to size=8, when="Saturday 9am".
- */
-function extractPollDetails(promptText) {
-  const dayMatch = promptText.match(DAY_WORDS_REGEX);
-  const timeMatch = promptText.match(TIME_REGEX);
-
-  let sizeSearchText = promptText;
-  if (timeMatch) {
-    sizeSearchText = sizeSearchText.replace(timeMatch[0], ' ');
-  }
-  const sizeMatch = sizeSearchText.match(/\d+/);
-
-  const whenParts = [];
-  if (dayMatch) whenParts.push(titleCase(dayMatch[0]));
-  if (timeMatch) whenParts.push(timeMatch[0].replace(/\s+/g, '').toLowerCase());
-
-  return {
-    size: sizeMatch ? parseInt(sizeMatch[0], 10) : null,
-    when: whenParts.length ? whenParts.join(' ') : null,
-    // Raw matches (not the display-formatted ones above) for resolvePlayDateTime.
-    dayWord: dayMatch ? dayMatch[0] : null,
-    timeWord: timeMatch ? timeMatch[0] : null
-  };
-}
-
 /**
  * Creates and sends a WhatsApp poll with numbered slots 1..size, and starts
  * tracking it so we can auto-generate matchups once it fills up. `when` is
  * an optional day/time phrase (e.g. "Saturday 9am") echoed in the poll title;
  * `dayWord`/`timeWord` are the raw matches used to compute an absolute play
- * time for expiry purposes.
+ * time for expiry purposes. Supports size=2 (singles) or multiples of 4 (doubles).
  */
 async function createMatchPoll(sock, remoteJid, size, when, dayWord, timeWord) {
   if (!Number.isInteger(size) || size <= 0) {
-    return `Give me a valid number of players, e.g. "${TRIGGER_PREFIX} create a poll for 8".`;
+    return `Give me a valid number of players, e.g. "${TRIGGER_PREFIX} create a poll for 2" (singles) or "${TRIGGER_PREFIX} create a poll for 8" (doubles).`;
   }
-  if (size % 4 !== 0) {
-    return `Poll size needs to be a multiple of 4 for doubles (e.g. 4, 8, 12) -- got ${size}.`;
+  if (size !== 2 && size % 4 !== 0) {
+    return `Poll size needs to be 2 for singles or a multiple of 4 for doubles (e.g. 4, 8, 12) -- got ${size}.`;
   }
   if (size > 40) {
     return 'That\'s a lot of players for one poll -- try 40 or fewer.';
   }
 
   const values = Array.from({ length: size }, (_, i) => `${i + 1}`);
+  const matchType = size === 2 ? 'Singles' : `${size} spots`;
   const suffix = when ? ` -- ${when}` : ' for today\'s matches';
 
   const sent = await sock.sendMessage(remoteJid, {
     poll: {
-      name: `🎾 Vote for a spot! (${size} spots${suffix})`,
+      name: `🎾 Vote for a spot! (${matchType}${suffix})`,
       values,
       selectableCount: 1
     }
@@ -703,7 +791,7 @@ async function createMatchPoll(sock, remoteJid, size, when, dayWord, timeWord) {
   });
   latestPollIdByChat.set(remoteJid, pollId);
   persistPolls();
-  console.log(`[poll] Created poll ${pollId} for ${size} spots in ${remoteJid}${when ? ` (${when})` : ''}, play time ${playAt.toISOString()}`);
+  console.log(`[poll] Created poll ${pollId} for ${size} spots (${size === 2 ? 'singles' : 'doubles'}) in ${remoteJid}${when ? ` (${when})` : ''}, play time ${playAt.toISOString()}`);
 
   return null; // the poll message itself is the response; no extra text needed
 }
@@ -995,10 +1083,11 @@ function buildContextBlurb(chatId) {
 }
 
 /**
- * Calls the Anthropic API with the chat's recent history plus a live data
- * snapshot (availability/leaderboard/poll status) for context.
+ * Calls the Anthropic API with tools, recent chat history, and live context.
+ * Enables Claude to handle free-form poll creation requests while answering
+ * any other questions in the same message.
  */
-async function callClaude(chatId, sender, promptText) {
+async function callClaude(sock, chatId, sender, promptText) {
   const history = chatHistories.get(chatId) || [];
 
   const userMessage = { role: 'user', content: `${sender}: ${promptText}` };
@@ -1006,36 +1095,63 @@ async function callClaude(chatId, sender, promptText) {
 
   const systemWithContext = `${SYSTEM_PROMPT}\n\n${buildContextBlurb(chatId)}`;
 
-  const response = await fetch('https://api.anthropic.com/v1/messages', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'x-api-key': process.env.ANTHROPIC_API_KEY,
-      'anthropic-version': '2023-06-01'
-    },
-    body: JSON.stringify({
-      model: 'claude-sonnet-4-6',
-      max_tokens: 300,
-      system: systemWithContext,
-      messages
-    })
-  });
+  const makeApiCall = async (msgs) => {
+    const response = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': process.env.ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01'
+      },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        max_tokens: 400,
+        system: systemWithContext,
+        tools: CLAUDE_TOOLS,
+        messages: msgs
+      })
+    });
 
-  if (!response.ok) {
-    const errBody = await response.text();
-    throw new Error(`Anthropic API error ${response.status}: ${errBody}`);
+    if (!response.ok) {
+      const errBody = await response.text();
+      throw new Error(`Anthropic API error ${response.status}: ${errBody}`);
+    }
+
+    return await response.json();
+  };
+
+  let data = await makeApiCall(messages);
+  const toolUseBlocks = data.content?.filter((b) => b.type === 'tool_use') || [];
+
+  if (toolUseBlocks.length > 0) {
+    const toolResults = [];
+    for (const toolUse of toolUseBlocks) {
+      const result = await executeTool(sock, chatId, sender, toolUse);
+      toolResults.push({
+        type: 'tool_result',
+        tool_use_id: toolUse.id,
+        content: typeof result === 'string' ? result : JSON.stringify(result)
+      });
+    }
+
+    const followUpMessages = [
+      ...messages,
+      { role: 'assistant', content: data.content },
+      { role: 'user', content: toolResults }
+    ];
+
+    data = await makeApiCall(followUpMessages);
   }
 
-  const data = await response.json();
   const replyText = data.content
-    .filter((block) => block.type === 'text')
+    ?.filter((block) => block.type === 'text')
     .map((block) => block.text)
     .join('\n')
     .trim();
 
   const updatedHistory = [
     ...messages,
-    { role: 'assistant', content: replyText }
+    { role: 'assistant', content: replyText || '' }
   ].slice(-HISTORY_LIMIT * 2);
   chatHistories.set(chatId, updatedHistory);
 
