@@ -7,8 +7,9 @@
  *   - Weather checks for outdoor play (!weather)
  *   - Scheduling matches via WhatsApp polls: "@tenbot create a poll for 2" (singles)
  *     or "@tenbot create a poll for 8" (doubles). The creator is automatically Player 1
- *     (unless specified otherwise), with votes starting from Player 2. Once all spots fill,
- *     the bot automatically posts singles/doubles matchups with rotations.
+ *     (unless specified otherwise or if they already have another match poll within 1 hour),
+ *     with votes starting from Player 2. Once all spots fill, the bot automatically posts
+ *     singles/doubles matchups with rotations.
  *   - General questions, answered by Claude with live group context (@tenbot ...)
  *
  * Setup:
@@ -90,17 +91,19 @@ const SYSTEM_PROMPT =
   'conversational (1-3 sentences) unless asked for more detail. You have ' +
   "access to tools to create match polls (2 spots for singles, or 4/8/12 spots for doubles), " +
   "check weather, cancel polls, and access the group's availability list, win/loss leaderboard, " +
-  'and active polls (given below). Results can be reported to you in plain words ("Mike & Sara ' +
+  'and active polls (given below). Multiple polls can be created for different times or by different users. ' +
+  'Results can be reported to you in plain words ("Mike & Sara ' +
   'beat John & Alex 6-4", or "we won" right after a draw) and are logged automatically before ' +
   "you see the message, so don't claim you can't record scores. By default, the user asking to create the poll is Player 1 " +
-  'unless they explicitly state they are not playing. When a message contains a request to create ' +
+  'unless they explicitly state they are not playing or they already have another match poll scheduled within 1 hour. ' +
+  'When a message contains a request to create ' +
   'a poll alongside other questions, call the create_poll tool and answer the other questions naturally.';
 
 // Tools exposed to Claude for handling natural language requests
 const CLAUDE_TOOLS = [
   {
     name: 'create_poll',
-    description: 'Creates and sends a WhatsApp poll with numbered spots for organizing a tennis match in the group. Supports singles (2 spots) and doubles (4, 8, 12, etc.). The user asking to create the poll is automatically included as Player 1 unless they explicitly state they are not playing.',
+    description: 'Creates and sends a WhatsApp poll with numbered spots for organizing a tennis match in the group. Supports singles (2 spots) and doubles (4, 8, 12, etc.). The user asking to create the poll is automatically included as Player 1 unless they explicitly state they are not playing or already have another poll scheduled within 1 hour.',
     input_schema: {
       type: 'object',
       properties: {
@@ -182,6 +185,9 @@ const pnToLid = new Map();
 // Best-effort JID -> display name map, built up from messages we see.
 // Poll votes only carry a JID, not a name, so this is how we label voters.
 const knownNames = new Map();
+
+// Generic placeholder names that shouldn't match across different users by name alone
+const GENERIC_NAMES = new Set(['someone', 'player', 'player 1', 'player 2', 'player 3', 'player 4', 'me']);
 
 // Last free-form result recorded per chat: chatId -> { signature, at }.
 // Unlike "!score", saying a result in words isn't a deliberate act of logging,
@@ -277,6 +283,68 @@ function recordName(jid, name) {
     const lid = pnToLid.get(norm);
     if (lid) knownNames.set(lid, name);
   }
+}
+
+/**
+ * Checks if two identities (JID and/or display name) represent the same user.
+ */
+function isSameUser(jid1, jid2, name1, name2) {
+  const k1 = ratings.keyFor(name1);
+  const k2 = ratings.keyFor(name2);
+  if (k1 && k2 && !GENERIC_NAMES.has(k1) && !GENERIC_NAMES.has(k2) && k1 === k2) {
+    return true;
+  }
+  if (!jid1 || !jid2) return false;
+  const norm1 = jidNormalizedUser(jid1);
+  const norm2 = jidNormalizedUser(jid2);
+  if (norm1 && norm2 && norm1 === norm2) return true;
+  const pn1 = lidToPn.get(norm1) || (norm1?.endsWith('@s.whatsapp.net') ? norm1 : null);
+  const pn2 = lidToPn.get(norm2) || (norm2?.endsWith('@s.whatsapp.net') ? norm2 : null);
+  if (pn1 && pn2 && pn1 === pn2) return true;
+  const lid1 = pnToLid.get(norm1) || (norm1?.endsWith('@lid') ? norm1 : null);
+  const lid2 = pnToLid.get(norm2) || (norm2?.endsWith('@lid') ? norm2 : null);
+  if (lid1 && lid2 && lid1 === lid2) return true;
+  return false;
+}
+
+/**
+ * Checks whether a user is currently a player/creator/voter in a given poll.
+ */
+function isUserInPoll(pollState, userJid, userName) {
+  if (!pollState) return false;
+
+  // 1. Check if user is the creator (Player 1)
+  if (pollState.creator) {
+    if (isSameUser(pollState.creator.jid, userJid, pollState.creator.name, userName)) {
+      return true;
+    }
+  }
+
+  // 2. Check voteBuffer (active votes in this poll)
+  if (pollState.voteBuffer && pollState.voteBuffer instanceof Map) {
+    for (const voterJid of pollState.voteBuffer.keys()) {
+      const voterName = nameFor(voterJid);
+      if (isSameUser(voterJid, userJid, voterName, userName)) {
+        return true;
+      }
+    }
+  }
+
+  // 3. Check lastPlayers if poll was resolved
+  if (Array.isArray(pollState.lastPlayers)) {
+    const userKey = ratings.keyFor(userName);
+    const resolvedName = userJid ? nameFor(userJid) : null;
+    const resolvedKey = resolvedName ? ratings.keyFor(resolvedName) : null;
+
+    for (const p of pollState.lastPlayers) {
+      const pKey = ratings.keyFor(p);
+      if (GENERIC_NAMES.has(pKey)) continue;
+      if (userKey && !GENERIC_NAMES.has(userKey) && pKey === userKey) return true;
+      if (resolvedKey && !GENERIC_NAMES.has(resolvedKey) && pKey === resolvedKey) return true;
+    }
+  }
+
+  return false;
 }
 
 /**
@@ -605,12 +673,17 @@ async function executeTool(sock, chatId, sender, toolUse, msg) {
     const creatorName = sender !== 'Someone' ? sender : (msg?.key?.participant ? nameFor(msg.key.participant) : 'Player 1');
     const creatorJid = msg?.key?.participant || msg?.key?.remoteJid || null;
 
-    const err = await createMatchPoll(sock, chatId, size, when, dayWord, timeWord, creatorName, creatorJid, includeCreator);
-    if (err) {
-      return `Failed to create poll: ${err}`;
+    const res = await createMatchPoll(sock, chatId, size, when, dayWord, timeWord, creatorName, creatorJid, includeCreator);
+    if (res?.err) {
+      return `Failed to create poll: ${res.err}`;
     }
-    const needed = includeCreator ? size - 1 : size;
-    return `Poll for ${size} spots (${size === 2 ? 'Singles' : 'Doubles'}${when ? ` -- ${when}` : ''}) created with ${creatorName} as Player 1 (${needed} spot(s) to vote on: ${includeCreator ? `Player 2..Player ${size}` : `Player 1..Player ${size}`}).`;
+    if (res?.includedCreator) {
+      const needed = size - 1;
+      return `Poll for ${size} spots (${size === 2 ? 'Singles' : 'Doubles'}${when ? ` -- ${when}` : ''}) created with ${creatorName} as Player 1 (${needed} spot(s) to vote on: Player 2..Player ${size}).`;
+    } else {
+      const note = res?.reason ? ` (${res.reason}, so not automatically added as Player 1)` : '';
+      return `Poll for ${size} spots (${size === 2 ? 'Singles' : 'Doubles'}${when ? ` -- ${when}` : ''}) created with all ${size} spot(s) open to vote on: Player 1..Player ${size}${note}.`;
+    }
   }
   if (name === 'get_weather') {
     const location = input.location || DEFAULT_LOCATION;
@@ -622,9 +695,18 @@ async function executeTool(sock, chatId, sender, toolUse, msg) {
     }
   }
   if (name === 'cancel_poll') {
-    const pollId = latestPollIdByChat.get(chatId);
-    if (!pollId || !activePolls.has(pollId)) return 'No active poll to cancel.';
-    activePolls.get(pollId).status = 'cancelled';
+    let targetPollId = null;
+    for (const [pollId, pollState] of [...activePolls.entries()].reverse()) {
+      if (pollState.remoteJid === chatId && pollState.status === 'active') {
+        targetPollId = pollId;
+        break;
+      }
+    }
+    if (!targetPollId) {
+      targetPollId = latestPollIdByChat.get(chatId);
+    }
+    if (!targetPollId || !activePolls.has(targetPollId)) return 'No active poll to cancel.';
+    activePolls.get(targetPollId).status = 'cancelled';
     persistPolls();
     return 'Poll cancelled successfully.';
   }
@@ -698,9 +780,18 @@ async function getResponse(sock, text, chatId, sender, msg) {
 
   // --- Poll management ---
   if (lower === '!cancelpoll') {
-    const pollId = latestPollIdByChat.get(chatId);
-    if (!pollId || !activePolls.has(pollId)) return 'No active poll to cancel.';
-    activePolls.get(pollId).status = 'cancelled';
+    let targetPollId = null;
+    for (const [pollId, pollState] of [...activePolls.entries()].reverse()) {
+      if (pollState.remoteJid === chatId && pollState.status === 'active') {
+        targetPollId = pollId;
+        break;
+      }
+    }
+    if (!targetPollId) {
+      targetPollId = latestPollIdByChat.get(chatId);
+    }
+    if (!targetPollId || !activePolls.has(targetPollId)) return 'No active poll to cancel.';
+    activePolls.get(targetPollId).status = 'cancelled';
     persistPolls();
     return 'Poll cancelled -- I won\'t auto-generate matchups from it anymore.';
   }
@@ -768,7 +859,7 @@ function helpText() {
     '!weather [location] – forecast for outdoor play (defaults to ' + DEFAULT_LOCATION + ')',
     `${TRIGGER_PREFIX} create a poll for <N> – post a match poll with N spots (2 for singles, 4/8/12 for doubles); creator is Player 1 by default`,
     '!cancelpoll – stop the current poll from auto-generating matchups',
-    '!pollstatus – debug: show raw vote count and voters for the current poll',
+    '!pollstatus – debug: show raw vote count and voters for active poll(s)',
     '!rematch – regenerate matchups from the current poll\'s votes',
     '!cleanuppolls – debug: force a sweep that deletes expired/completed polls now',
     '!reset – clear the bot\'s conversation memory',
@@ -883,14 +974,26 @@ function knownPlayers(chatId) {
   for (const p of storage.getLeaderboard()) add(p.name);
   for (const a of storage.getAvailability()) add(a.player);
 
-  const pollState = lastPollStateFor(chatId);
-  for (const name of pollState?.lastPlayers || []) add(name);
+  for (const [, pollState] of activePolls.entries()) {
+    if (pollState.remoteJid === chatId) {
+      if (pollState.creator?.name) add(pollState.creator.name);
+      for (const name of pollState.lastPlayers || []) add(name);
+      if (pollState.voteBuffer && pollState.voteBuffer instanceof Map) {
+        for (const voterJid of pollState.voteBuffer.keys()) add(nameFor(voterJid));
+      }
+    }
+  }
 
   return byKey;
 }
 
 /** The most recent poll state for a chat, if there is one. */
 function lastPollStateFor(chatId) {
+  for (const [, pollState] of [...activePolls.entries()].reverse()) {
+    if (pollState.remoteJid === chatId && (pollState.lastSchedule || pollState.lastPlayers)) {
+      return pollState;
+    }
+  }
   const pollId = latestPollIdByChat.get(chatId);
   return (pollId && activePolls.get(pollId)) || null;
 }
@@ -971,26 +1074,57 @@ function formatRatings() {
  * Creates and sends a WhatsApp poll with numbered slots, and starts tracking
  * it so we can auto-generate matchups once it fills up.
  * If includeCreator is true, creatorName is Player 1, and options are labeled
- * "Player 2" .. "Player <size>".
+ * "Player 2" .. "Player <size>". If a poll already exists for the same person
+ * within 1 hour of the new poll's start time, the new poll is created with open
+ * slots (Player 1..Player <size>) without auto-adding the creator.
  */
 async function createMatchPoll(sock, remoteJid, size, when, dayWord, timeWord, creatorName = null, creatorJid = null, includeCreator = true) {
   if (!Number.isInteger(size) || size <= 0) {
-    return `Give me a valid number of players, e.g. "${TRIGGER_PREFIX} create a poll for 2" (singles) or "${TRIGGER_PREFIX} create a poll for 8" (doubles).`;
+    return { err: `Give me a valid number of players, e.g. "${TRIGGER_PREFIX} create a poll for 2" (singles) or "${TRIGGER_PREFIX} create a poll for 8" (doubles).` };
   }
   if (size !== 2 && size % 4 !== 0) {
-    return `Poll size needs to be 2 for singles or a multiple of 4 for doubles (e.g. 4, 8, 12) -- got ${size}.`;
+    return { err: `Poll size needs to be 2 for singles or a multiple of 4 for doubles (e.g. 4, 8, 12) -- got ${size}.` };
   }
   if (size > 40) {
-    return 'That\'s a lot of players for one poll -- try 40 or fewer.';
+    return { err: 'That\'s a lot of players for one poll -- try 40 or fewer.' };
   }
 
-  const startIdx = includeCreator ? 2 : 1;
-  const count = includeCreator ? size - 1 : size;
+  const playAt = resolvePlayDateTime(dayWord, timeWord);
+  let shouldIncludeCreator = includeCreator;
+  let excludedReason = null;
+
+  // Check if a poll already exists for the same person within one hour of the new poll's start time
+  if (shouldIncludeCreator && (creatorJid || creatorName)) {
+    const ONE_HOUR_MS = 60 * 60 * 1000;
+    const newPlayTime = playAt.getTime();
+
+    for (const [existingPollId, existingPoll] of activePolls.entries()) {
+      if (existingPoll.remoteJid !== remoteJid) continue;
+      if (existingPoll.status === 'cancelled') continue;
+      if (!existingPoll.playAt) continue;
+
+      const existingPlayTime = new Date(existingPoll.playAt).getTime();
+      if (Number.isNaN(existingPlayTime)) continue;
+
+      if (Math.abs(newPlayTime - existingPlayTime) <= ONE_HOUR_MS) {
+        if (isUserInPoll(existingPoll, creatorJid, creatorName)) {
+          shouldIncludeCreator = false;
+          const existingWhen = existingPoll.when || new Date(existingPoll.playAt).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+          excludedReason = `a poll already exists for ${creatorName || 'you'} within one hour of this start time (${existingWhen})`;
+          console.log(`[poll] Not auto-adding ${creatorName || 'creator'} as Player 1 in new poll: already in poll ${existingPollId} within 1 hour`);
+          break;
+        }
+      }
+    }
+  }
+
+  const startIdx = shouldIncludeCreator ? 2 : 1;
+  const count = shouldIncludeCreator ? size - 1 : size;
   const values = Array.from({ length: count }, (_, i) => `Player ${i + startIdx}`);
 
   const matchType = size === 2 ? 'Singles' : `${size} spots`;
   const suffix = when ? ` -- ${when}` : ' for today\'s matches';
-  const titlePrefix = includeCreator && creatorName
+  const titlePrefix = shouldIncludeCreator && creatorName
     ? `🎾 ${creatorName}'s match: Vote for a spot!`
     : '🎾 Vote for a spot!';
 
@@ -1003,7 +1137,6 @@ async function createMatchPoll(sock, remoteJid, size, when, dayWord, timeWord, c
   });
 
   const pollId = sent.key.id;
-  const playAt = resolvePlayDateTime(dayWord, timeWord);
 
   messageStore.set(storeKey(sent.key.remoteJid, pollId), sent.message);
   activePolls.set(pollId, {
@@ -1012,16 +1145,16 @@ async function createMatchPoll(sock, remoteJid, size, when, dayWord, timeWord, c
     when: when || null,
     playAt: playAt.toISOString(),
     status: 'active', // 'active' | 'resolved' | 'cancelled'
-    creator: includeCreator ? { name: creatorName || 'Player 1', jid: creatorJid || null } : null,
+    creator: shouldIncludeCreator ? { name: creatorName || 'Player 1', jid: creatorJid || null } : null,
     lastConflictSignature: null,
     voteBuffer: new Map(), // voterJid -> raw pollUpdate entry
     lastPlayers: null
   });
   latestPollIdByChat.set(remoteJid, pollId);
   persistPolls();
-  console.log(`[poll] Created poll ${pollId} for ${size} spots (${size === 2 ? 'singles' : 'doubles'}, creator: ${creatorName || 'none'}) in ${remoteJid}${when ? ` (${when})` : ''}, play time ${playAt.toISOString()}`);
+  console.log(`[poll] Created poll ${pollId} for ${size} spots (${size === 2 ? 'singles' : 'doubles'}, creator: ${shouldIncludeCreator ? (creatorName || 'Player 1') : 'none (not included)'}) in ${remoteJid}${when ? ` (${when})` : ''}, play time ${playAt.toISOString()}`);
 
-  return null; // the poll message itself is the response; no extra text needed
+  return { err: null, includedCreator: shouldIncludeCreator, reason: excludedReason };
 }
 
 /**
@@ -1223,19 +1356,31 @@ async function processPollVoteEvent(sock, pollMessageKey, rawPollUpdates) {
 
 /** Regenerates and re-announces matchups from the latest poll's current votes. */
 async function regenerateMatchups(sock, chatId) {
-  const pollId = latestPollIdByChat.get(chatId);
-  const pollState = pollId && activePolls.get(pollId);
-  if (!pollState) {
+  let targetPollId = null;
+  let targetPollState = null;
+  for (const [pollId, pollState] of [...activePolls.entries()].reverse()) {
+    if (pollState.remoteJid === chatId && pollState.lastPlayers) {
+      targetPollId = pollId;
+      targetPollState = pollState;
+      break;
+    }
+  }
+  if (!targetPollState) {
+    const pollId = latestPollIdByChat.get(chatId);
+    targetPollState = pollId && activePolls.get(pollId);
+    targetPollId = pollId;
+  }
+  if (!targetPollState) {
     return `No poll to work from yet -- create one with "${TRIGGER_PREFIX} create a poll for <N>" first.`;
   }
-  if (pollState.lastPlayers) {
-    ratings.ensureRated(pollState.lastPlayers);
-    const schedule = generateMatchups(pollState.lastPlayers);
-    const header = pollState.when ? `📅 ${pollState.when}\n\n` : '';
-    await sock.sendMessage(pollState.remoteJid, { text: header + formatMatchups(schedule) });
+  if (targetPollState.lastPlayers) {
+    ratings.ensureRated(targetPollState.lastPlayers);
+    const schedule = generateMatchups(targetPollState.lastPlayers);
+    const header = targetPollState.when ? `📅 ${targetPollState.when}\n\n` : '';
+    await sock.sendMessage(targetPollState.remoteJid, { text: header + formatMatchups(schedule) });
     // Replaces this poll's previous entry, so a rematch doesn't count twice.
-    pairHistory.recordDraw(pollId, schedule);
-    pollState.lastSchedule = summarizeSchedule(schedule);
+    pairHistory.recordDraw(targetPollId, schedule);
+    targetPollState.lastSchedule = summarizeSchedule(schedule);
     persistPolls();
     return null;
   }
@@ -1265,35 +1410,38 @@ function nameFor(jid) {
 
 /**
  * Debug helper: reports what the bot has actually recorded for the current
- * poll, straight from the raw vote buffer (not the aggregated tally), so you
- * can tell whether votes are being received at all versus a matching/logic
- * issue further downstream.
+ * active poll(s), straight from the raw vote buffer (not the aggregated tally),
+ * so you can tell whether votes are being received at all.
  */
 function pollStatusText(chatId) {
-  const pollId = latestPollIdByChat.get(chatId);
-  const pollState = pollId && activePolls.get(pollId);
-  if (!pollState) {
+  const chatPolls = [...activePolls.entries()].filter(([, state]) => state.remoteJid === chatId);
+  if (chatPolls.length === 0) {
     return 'No poll on record for this chat -- create one with "' + TRIGGER_PREFIX + ' create a poll for <N>".';
   }
-  const voters = [...pollState.voteBuffer.keys()].map(nameFor);
-  const playAtLocal = pollState.playAt ? new Date(pollState.playAt).toLocaleString() : 'unknown';
-  const neededVotes = pollState.creator ? pollState.size - 1 : pollState.size;
-  const lines = [
-    `Poll ${pollId}${pollState.when ? ` (${pollState.when})` : ''}: ${pollState.size} spots (${pollState.size === 2 ? 'Singles' : 'Doubles'}).`,
-    pollState.creator ? `Creator (Player 1): ${pollState.creator.name || 'Player 1'}` : null,
-    `Status: ${pollState.status}`,
-    `Play time: ${playAtLocal} (auto-deleted ${POLL_EXPIRY_GRACE_HOURS}h after this if not already gone)`,
-    `Raw votes recorded: ${pollState.voteBuffer.size}/${neededVotes} needed`,
-    `Voters seen so far: ${voters.length ? voters.join(', ') : '(none yet)'}`
-  ].filter(Boolean);
-  return lines.join('\n');
+
+  const sections = chatPolls.map(([pollId, pollState]) => {
+    const voters = [...pollState.voteBuffer.keys()].map(nameFor);
+    const playAtLocal = pollState.playAt ? new Date(pollState.playAt).toLocaleString() : 'unknown';
+    const neededVotes = pollState.creator ? pollState.size - 1 : pollState.size;
+    const lines = [
+      `Poll ${pollId}${pollState.when ? ` (${pollState.when})` : ''}: ${pollState.size} spots (${pollState.size === 2 ? 'Singles' : 'Doubles'}).`,
+      pollState.creator ? `Creator (Player 1): ${pollState.creator.name || 'Player 1'}` : 'Creator: None (all spots open)',
+      `Status: ${pollState.status}`,
+      `Play time: ${playAtLocal} (auto-deleted ${POLL_EXPIRY_GRACE_HOURS}h after this if not already gone)`,
+      `Raw votes recorded: ${pollState.voteBuffer.size}/${neededVotes} needed`,
+      `Voters seen so far: ${voters.length ? voters.join(', ') : '(none yet)'}`
+    ];
+    return lines.join('\n');
+  });
+
+  return sections.join('\n\n---\n\n');
 }
 
 // ---- LLM Q&A ----
 
 /**
  * Builds a short summary of current availability, leaderboard, and any
- * active poll to give the LLM real context instead of letting it guess.
+ * active polls to give the LLM real context instead of letting it guess.
  */
 function buildContextBlurb(chatId) {
   const availability = storage.getAvailability();
@@ -1312,21 +1460,23 @@ function buildContextBlurb(chatId) {
     ? recent.map((m) => `${m.winner} def ${m.loser} (${m.score})`).join('; ')
     : 'none';
 
-  const pollId = latestPollIdByChat.get(chatId);
-  const pollState = pollId && activePolls.get(pollId);
+  const chatPolls = [...activePolls.entries()].filter(([, state]) => state.remoteJid === chatId);
   let pollText = 'no active poll';
-  if (pollState) {
-    const filledCount = pollState.voteBuffer.size;
-    const neededVotes = pollState.creator ? pollState.size - 1 : pollState.size;
-    const whenSuffix = pollState.when ? ` for ${pollState.when}` : '';
-    const creatorSuffix = pollState.creator ? ` (created by ${pollState.creator.name || 'Player 1'}, who is Player 1)` : '';
-    if (pollState.status === 'resolved') {
-      pollText = `a ${pollState.size}-spot poll${whenSuffix} just filled up and matchups were posted`;
-    } else if (pollState.status === 'cancelled') {
-      pollText = `a ${pollState.size}-spot poll${whenSuffix} was cancelled`;
-    } else {
-      pollText = `a ${pollState.size}-spot poll${whenSuffix}${creatorSuffix} is active with ${filledCount}/${neededVotes} votes needed so far`;
-    }
+  if (chatPolls.length > 0) {
+    const pollDescriptions = chatPolls.map(([id, pollState]) => {
+      const filledCount = pollState.voteBuffer?.size || 0;
+      const neededVotes = pollState.creator ? pollState.size - 1 : pollState.size;
+      const whenSuffix = pollState.when ? ` for ${pollState.when}` : '';
+      const creatorSuffix = pollState.creator ? ` (created by ${pollState.creator.name || 'Player 1'}, who is Player 1)` : ' (all spots open)';
+      if (pollState.status === 'resolved') {
+        return `[Poll ${id}] a ${pollState.size}-spot poll${whenSuffix} filled up and matchups were posted`;
+      } else if (pollState.status === 'cancelled') {
+        return `[Poll ${id}] a ${pollState.size}-spot poll${whenSuffix} was cancelled`;
+      } else {
+        return `[Poll ${id}] a ${pollState.size}-spot poll${whenSuffix}${creatorSuffix} is active with ${filledCount}/${neededVotes} votes needed`;
+      }
+    });
+    pollText = pollDescriptions.join('; ');
   }
 
   const rated = ratings.getAllRatings();
