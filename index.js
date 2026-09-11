@@ -5,11 +5,14 @@
  *   - Coordinating who's free to play (!free, !notfree)
  *   - Tracking match results / a simple leaderboard (!score, !leaderboard)
  *   - Weather checks for outdoor play (!weather)
- *   - Scheduling matches via WhatsApp polls: "@tenbot create a poll for 2" (singles)
- *     or "@tenbot create a poll for 8" (doubles). The creator is automatically Player 1
- *     (unless specified otherwise or if they already have another match poll within 1 hour),
- *     with votes starting from Player 2. Once all spots fill, the bot automatically posts
- *     singles/doubles matchups with rotations.
+ *   - Scheduling matches via WhatsApp polls:
+ *       - Fixed spots: "@tenbot create a poll for 2" (singles) or "@tenbot create a poll for 8" (doubles).
+ *         The creator is automatically Player 1 (unless specified otherwise or if they already have
+ *         another match poll within 1 hour), with votes starting from Player 2. Once all spots fill,
+ *         the bot automatically posts singles/doubles matchups with rotations.
+ *       - Opt-in (Yes/No): "@tenbot create a poll for tomorrow 9am" (no size specified). Creates a
+ *         Yes/No poll. The bot waits for a user prompt ("@tenbot generate matchups" or "!matchups")
+ *         to create matchups for players who voted Yes.
  *   - General questions, answered by Claude with live group context (@tenbot ...)
  *
  * Setup:
@@ -63,8 +66,8 @@ const { resolvePlayDateTime } = require('./lib/pollTime');
 // Set this to the exact group name (subject) you want the bot to listen to.
 // Leave as null to have the bot log every group name/ID it sees, so you can
 // find the right one.
-//const TARGET_GROUP_NAME = 'SCVCC Early Morning Tennis Group (that usually plays in the evenings!)';
-const TARGET_GROUP_NAME = 'Bot-testing';
+const TARGET_GROUP_NAME = 'SCVCC Early Morning Tennis Group (that usually plays in the evenings!)';
+//const TARGET_GROUP_NAME = 'Bot-testing';
 
 // Only call the LLM when the bot is directly addressed (recommended for
 // groups, otherwise it'll try to reply to every single message). Structured
@@ -89,27 +92,31 @@ const SYSTEM_PROMPT =
   'You are a helpful assistant in a WhatsApp group chat for a group of tennis ' +
   'players who organize casual matches together. Keep replies short and ' +
   'conversational (1-3 sentences) unless asked for more detail. You have ' +
-  "access to tools to create match polls (2 spots for singles, or 4/8/12 spots for doubles), " +
+  "access to tools to create match polls (fixed-spot polls for 2 singles or 4/8/12 doubles, " +
+  "or Yes/No opt-in polls when no number of players is specified), generate matchups from poll votes, " +
   "check weather, cancel polls, and access the group's availability list, win/loss leaderboard, " +
   'and active polls (given below). Multiple polls can be created for different times or by different users. ' +
   'Results can be reported to you in plain words ("Mike & Sara ' +
   'beat John & Alex 6-4", or "we won" right after a draw) and are logged automatically before ' +
-  "you see the message, so don't claim you can't record scores. By default, the user asking to create the poll is Player 1 " +
+  "you see the message, so don't claim you can't record scores. " +
+  'If the user asks to create a poll without specifying the number of players (e.g. "create a poll for tomorrow 9am"), ' +
+  'call create_poll without size to create a Yes/No opt-in poll. For Yes/No polls, matchups are created when ' +
+  'the user prompts to create/generate matchups (using generate_matchups). ' +
+  'For fixed-spot polls, by default the user asking to create the poll is Player 1 ' +
   'unless they explicitly state they are not playing or they already have another match poll scheduled within 1 hour. ' +
-  'When a message contains a request to create ' +
-  'a poll alongside other questions, call the create_poll tool and answer the other questions naturally.';
+  'When a message contains a request to create a poll alongside other questions, call the create_poll tool and answer the other questions naturally.';
 
 // Tools exposed to Claude for handling natural language requests
 const CLAUDE_TOOLS = [
   {
     name: 'create_poll',
-    description: 'Creates and sends a WhatsApp poll with numbered spots for organizing a tennis match in the group. Supports singles (2 spots) and doubles (4, 8, 12, etc.). The user asking to create the poll is automatically included as Player 1 unless they explicitly state they are not playing or already have another poll scheduled within 1 hour.',
+    description: 'Creates and sends a WhatsApp poll for organizing a tennis match in the group. If size is specified (2 for singles, 4/8/12 for doubles), creates numbered slot spots where creator is Player 1 by default. If size is omitted or not specified, creates an opt-in poll with only two options (Yes and No) where players vote Yes to opt in.',
     input_schema: {
       type: 'object',
       properties: {
         size: {
           type: 'integer',
-          description: 'Total number of players for the match. Must be 2 (for singles) or a positive multiple of 4 (e.g. 4, 8, 12, 16 for doubles).'
+          description: 'Total number of players for the match (2 for singles, 4/8/12/16 for doubles). If omitted or not specified, a Yes/No opt-in poll is created.'
         },
         when: {
           type: 'string',
@@ -125,10 +132,17 @@ const CLAUDE_TOOLS = [
         },
         includeCreator: {
           type: 'boolean',
-          description: 'Whether the user requesting the poll is playing in it. Defaults to true unless the user explicitly mentions they are not playing.'
+          description: 'Whether the user requesting the fixed-spot poll is playing in it. Defaults to true unless the user explicitly mentions they are not playing.'
         }
-      },
-      required: ['size']
+      }
+    }
+  },
+  {
+    name: 'generate_matchups',
+    description: 'Generates and posts singles/doubles matchups and rotations from the current poll votes. For Yes/No opt-in polls, considers only players who voted Yes. Also used when user asks to make the draw, create matchups, or rematch.',
+    input_schema: {
+      type: 'object',
+      properties: {}
     }
   },
   {
@@ -205,7 +219,7 @@ let botSock = null;
 // the in-memory maps and as the persisted key format.
 const {
   messageStore,   // `${remoteJid}:${id}` -> stored WAMessage content, needed for getMessage() and vote decoding
-  activePolls,    // pollId -> { remoteJid, size, when, playAt, status, creator, lastConflictSignature, voteBuffer, lastPlayers }
+  activePolls,    // pollId -> { remoteJid, size, type, when, playAt, status, creator, lastConflictSignature, voteBuffer, lastPlayers }
   latestPollIdByChat // chatId -> pollId, so "!cancelpoll"/"!rematch"/"!pollstatus" know which poll to act on
 } = pollStore.load();
 
@@ -665,7 +679,7 @@ function extractText(message) {
 async function executeTool(sock, chatId, sender, toolUse, msg) {
   const { name, input } = toolUse;
   if (name === 'create_poll') {
-    const size = input.size;
+    const size = input.size || null;
     const when = input.when || null;
     const dayWord = input.dayWord || null;
     const timeWord = input.timeWord || null;
@@ -677,6 +691,9 @@ async function executeTool(sock, chatId, sender, toolUse, msg) {
     if (res?.err) {
       return `Failed to create poll: ${res.err}`;
     }
+    if (res?.isOptIn) {
+      return `Opt-in poll created with "Yes" and "No" options${when ? ` for ${when}` : ''}. Players can vote "Yes" to opt in. When ready, ask me to generate the matchups!`;
+    }
     if (res?.includedCreator) {
       const needed = size - 1;
       return `Poll for ${size} spots (${size === 2 ? 'Singles' : 'Doubles'}${when ? ` -- ${when}` : ''}) created with ${creatorName} as Player 1 (${needed} spot(s) to vote on: Player 2..Player ${size}).`;
@@ -684,6 +701,10 @@ async function executeTool(sock, chatId, sender, toolUse, msg) {
       const note = res?.reason ? ` (${res.reason}, so not automatically added as Player 1)` : '';
       return `Poll for ${size} spots (${size === 2 ? 'Singles' : 'Doubles'}${when ? ` -- ${when}` : ''}) created with all ${size} spot(s) open to vote on: Player 1..Player ${size}${note}.`;
     }
+  }
+  if (name === 'generate_matchups' || name === 'rematch') {
+    const res = await generateMatchupsFromPoll(sock, chatId);
+    return res || 'Matchups generated and posted.';
   }
   if (name === 'get_weather') {
     const location = input.location || DEFAULT_LOCATION;
@@ -709,10 +730,6 @@ async function executeTool(sock, chatId, sender, toolUse, msg) {
     activePolls.get(targetPollId).status = 'cancelled';
     persistPolls();
     return 'Poll cancelled successfully.';
-  }
-  if (name === 'rematch') {
-    const res = await regenerateMatchups(sock, chatId);
-    return res || 'Matchups regenerated and posted.';
   }
   return `Unknown tool ${name}`;
 }
@@ -796,8 +813,8 @@ async function getResponse(sock, text, chatId, sender, msg) {
     return 'Poll cancelled -- I won\'t auto-generate matchups from it anymore.';
   }
 
-  if (lower === '!rematch') {
-    return await regenerateMatchups(sock, chatId);
+  if (lower === '!rematch' || lower === '!matchups' || lower === '!draw') {
+    return await generateMatchupsFromPoll(sock, chatId);
   }
 
   if (lower === '!cleanuppolls') {
@@ -857,10 +874,10 @@ function helpText() {
     '!leaderboard – show the win/loss leaderboard',
     '!ratings – show player ratings used to balance the courts',
     '!weather [location] – forecast for outdoor play (defaults to ' + DEFAULT_LOCATION + ')',
-    `${TRIGGER_PREFIX} create a poll for <N> – post a match poll with N spots (2 for singles, 4/8/12 for doubles); creator is Player 1 by default`,
+    `${TRIGGER_PREFIX} create a poll [for <N>] – post a match poll (N spots for singles/doubles, or Yes/No opt-in if N is omitted)`,
+    '!matchups (or !draw, !rematch) – generate matchups from Yes votes in an opt-in poll, or re-draw a completed poll',
     '!cancelpoll – stop the current poll from auto-generating matchups',
     '!pollstatus – debug: show raw vote count and voters for active poll(s)',
-    '!rematch – regenerate matchups from the current poll\'s votes',
     '!cleanuppolls – debug: force a sweep that deletes expired/completed polls now',
     '!reset – clear the bot\'s conversation memory',
     TRIGGER_PREFIX ? `${TRIGGER_PREFIX} <question> – ask the bot anything (including free-form poll creation and questions)` : '(bot also responds to any message)'
@@ -1071,22 +1088,25 @@ function formatRatings() {
 // ---- Poll creation & vote handling ----
 
 /**
- * Creates and sends a WhatsApp poll with numbered slots, and starts tracking
- * it so we can auto-generate matchups once it fills up.
- * If includeCreator is true, creatorName is Player 1, and options are labeled
- * "Player 2" .. "Player <size>". If a poll already exists for the same person
- * within 1 hour of the new poll's start time, the new poll is created with open
- * slots (Player 1..Player <size>) without auto-adding the creator.
+ * Creates and sends a WhatsApp poll.
+ * - If size is given (2 for singles, 4/8/12 for doubles), numbered slots are created
+ *   ("Player 2" .. "Player <size>" with creator as Player 1 by default).
+ * - If size is omitted (null/undefined), creates an opt-in poll with only two options:
+ *   "Yes" and "No". The bot then waits for a user prompt to generate matchups from Yes voters.
  */
-async function createMatchPoll(sock, remoteJid, size, when, dayWord, timeWord, creatorName = null, creatorJid = null, includeCreator = true) {
-  if (!Number.isInteger(size) || size <= 0) {
-    return { err: `Give me a valid number of players, e.g. "${TRIGGER_PREFIX} create a poll for 2" (singles) or "${TRIGGER_PREFIX} create a poll for 8" (doubles).` };
-  }
-  if (size !== 2 && size % 4 !== 0) {
-    return { err: `Poll size needs to be 2 for singles or a multiple of 4 for doubles (e.g. 4, 8, 12) -- got ${size}.` };
-  }
-  if (size > 40) {
-    return { err: 'That\'s a lot of players for one poll -- try 40 or fewer.' };
+async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWord = null, timeWord = null, creatorName = null, creatorJid = null, includeCreator = true) {
+  const isOptIn = !size;
+
+  if (size !== null && size !== undefined) {
+    if (!Number.isInteger(size) || size <= 0) {
+      return { err: `Give me a valid number of players, e.g. "${TRIGGER_PREFIX} create a poll for 2" (singles) or "${TRIGGER_PREFIX} create a poll for 8" (doubles), or leave size empty for a Yes/No poll.` };
+    }
+    if (size !== 2 && size % 4 !== 0) {
+      return { err: `Poll size needs to be 2 for singles or a multiple of 4 for doubles (e.g. 4, 8, 12) -- got ${size}.` };
+    }
+    if (size > 40) {
+      return { err: 'That\'s a lot of players for one poll -- try 40 or fewer.' };
+    }
   }
 
   const playAt = resolvePlayDateTime(dayWord, timeWord);
@@ -1118,15 +1138,27 @@ async function createMatchPoll(sock, remoteJid, size, when, dayWord, timeWord, c
     }
   }
 
-  const startIdx = shouldIncludeCreator ? 2 : 1;
-  const count = shouldIncludeCreator ? size - 1 : size;
-  const values = Array.from({ length: count }, (_, i) => `Player ${i + startIdx}`);
+  let values;
+  let titlePrefix;
+  let matchType;
 
-  const matchType = size === 2 ? 'Singles' : `${size} spots`;
+  if (isOptIn) {
+    values = ['Yes', 'No'];
+    matchType = 'Opt-in';
+    titlePrefix = shouldIncludeCreator && creatorName
+      ? `🎾 ${creatorName}'s match: Vote Yes/No to play!`
+      : '🎾 Vote Yes/No to play!';
+  } else {
+    const startIdx = shouldIncludeCreator ? 2 : 1;
+    const count = shouldIncludeCreator ? size - 1 : size;
+    values = Array.from({ length: count }, (_, i) => `Player ${i + startIdx}`);
+    matchType = size === 2 ? 'Singles' : `${size} spots`;
+    titlePrefix = shouldIncludeCreator && creatorName
+      ? `🎾 ${creatorName}'s match: Vote for a spot!`
+      : '🎾 Vote for a spot!';
+  }
+
   const suffix = when ? ` -- ${when}` : ' for today\'s matches';
-  const titlePrefix = shouldIncludeCreator && creatorName
-    ? `🎾 ${creatorName}'s match: Vote for a spot!`
-    : '🎾 Vote for a spot!';
 
   const sent = await sock.sendMessage(remoteJid, {
     poll: {
@@ -1141,7 +1173,8 @@ async function createMatchPoll(sock, remoteJid, size, when, dayWord, timeWord, c
   messageStore.set(storeKey(sent.key.remoteJid, pollId), sent.message);
   activePolls.set(pollId, {
     remoteJid,
-    size,
+    size: isOptIn ? null : size,
+    type: isOptIn ? 'opt_in' : 'fixed',
     when: when || null,
     playAt: playAt.toISOString(),
     status: 'active', // 'active' | 'resolved' | 'cancelled'
@@ -1152,15 +1185,16 @@ async function createMatchPoll(sock, remoteJid, size, when, dayWord, timeWord, c
   });
   latestPollIdByChat.set(remoteJid, pollId);
   persistPolls();
-  console.log(`[poll] Created poll ${pollId} for ${size} spots (${size === 2 ? 'singles' : 'doubles'}, creator: ${shouldIncludeCreator ? (creatorName || 'Player 1') : 'none (not included)'}) in ${remoteJid}${when ? ` (${when})` : ''}, play time ${playAt.toISOString()}`);
+  console.log(`[poll] Created poll ${pollId} (${isOptIn ? 'Yes/No opt-in' : `${size} spots`}, creator: ${shouldIncludeCreator ? (creatorName || 'Player 1') : 'none (not included)'}) in ${remoteJid}${when ? ` (${when})` : ''}, play time ${playAt.toISOString()}`);
 
-  return { err: null, includedCreator: shouldIncludeCreator, reason: excludedReason };
+  return { err: null, isOptIn, size, includedCreator: shouldIncludeCreator, reason: excludedReason };
 }
 
 /**
  * Handles an incoming poll vote (from either event path): decrypts it if
  * needed, merges it into our running tally for that poll, and if every slot
- * now has exactly one voter, posts matchups.
+ * now has exactly one voter (for fixed-slot polls), posts matchups.
+ * For Yes/No opt-in polls, updates vote tallies and waits for user command.
  */
 async function processPollVoteEvent(sock, pollMessageKey, rawPollUpdates) {
   const pollId = pollMessageKey.id;
@@ -1276,6 +1310,30 @@ async function processPollVoteEvent(sock, pollMessageKey, rawPollUpdates) {
     vote: normalizeVotePayload(u.vote)
   }));
 
+  // If this is a Yes/No opt-in poll, tally the votes and wait for user prompt
+  if (pollState.type === 'opt_in' || pollState.size === null) {
+    let aggregated;
+    try {
+      aggregated = getAggregateVotesInPollMessage(
+        {
+          message: pollCreationMessage,
+          pollUpdates: merged
+        },
+        mePn
+      );
+    } catch (err) {
+      console.error(`[poll] getAggregateVotesInPollMessage failed for poll ${pollId}:`, err.message);
+      return;
+    }
+    const yesOption = aggregated.find((o) => /^yes$/i.test(o.name.trim()));
+    const noOption = aggregated.find((o) => /^no$/i.test(o.name.trim()));
+    const yesCount = yesOption ? yesOption.voters.length : 0;
+    const noCount = noOption ? noOption.voters.length : 0;
+    console.log(`[poll] Opt-in poll ${pollId}: ${yesCount} Yes vote(s), ${noCount} No vote(s) recorded.`);
+    return;
+  }
+
+  // Fixed-size poll handling
   let aggregated;
   try {
     aggregated = getAggregateVotesInPollMessage(
@@ -1354,36 +1412,127 @@ async function processPollVoteEvent(sock, pollMessageKey, rawPollUpdates) {
   }
 }
 
-/** Regenerates and re-announces matchups from the latest poll's current votes. */
-async function regenerateMatchups(sock, chatId) {
+/**
+ * Generates and posts matchups for a poll:
+ * - For Yes/No opt-in polls: considers all players who voted Yes and generates matchups.
+ * - For fixed-size polls / rematches: regenerates matchups from the recorded player list.
+ */
+async function generateMatchupsFromPoll(sock, chatId) {
   let targetPollId = null;
   let targetPollState = null;
+
+  // 1. Look for active opt-in poll first
   for (const [pollId, pollState] of [...activePolls.entries()].reverse()) {
-    if (pollState.remoteJid === chatId && pollState.lastPlayers) {
+    if (pollState.remoteJid === chatId && pollState.status === 'active' && (pollState.type === 'opt_in' || pollState.size === null)) {
       targetPollId = pollId;
       targetPollState = pollState;
       break;
     }
   }
+
+  // 2. Look for any active poll with votes
+  if (!targetPollState) {
+    for (const [pollId, pollState] of [...activePolls.entries()].reverse()) {
+      if (pollState.remoteJid === chatId && pollState.status === 'active' && pollState.voteBuffer.size > 0) {
+        targetPollId = pollId;
+        targetPollState = pollState;
+        break;
+      }
+    }
+  }
+
+  // 3. Look for any poll with resolved players (for rematch)
+  if (!targetPollState) {
+    for (const [pollId, pollState] of [...activePolls.entries()].reverse()) {
+      if (pollState.remoteJid === chatId && pollState.lastPlayers) {
+        targetPollId = pollId;
+        targetPollState = pollState;
+        break;
+      }
+    }
+  }
+
   if (!targetPollState) {
     const pollId = latestPollIdByChat.get(chatId);
     targetPollState = pollId && activePolls.get(pollId);
     targetPollId = pollId;
   }
+
   if (!targetPollState) {
-    return `No poll to work from yet -- create one with "${TRIGGER_PREFIX} create a poll for <N>" first.`;
+    return `No poll found to generate matchups from -- create one with "${TRIGGER_PREFIX} create a poll" first.`;
   }
-  if (targetPollState.lastPlayers) {
-    ratings.ensureRated(targetPollState.lastPlayers);
-    const schedule = generateMatchups(targetPollState.lastPlayers);
+
+  const mePn = jidNormalizedUser(sock?.user?.id || sock?.authState?.creds?.me?.id || '');
+
+  // If this is a Yes/No opt-in poll, gather all "Yes" voters
+  if (targetPollState.type === 'opt_in' || targetPollState.size === null) {
+    let pollCreationMessage = messageStore.get(storeKey(targetPollState.remoteJid, targetPollId));
+    if (!pollCreationMessage) {
+      return 'Could not retrieve the poll creation message to decode votes.';
+    }
+
+    const merged = [...targetPollState.voteBuffer.values()].map((u) => ({
+      ...u,
+      vote: normalizeVotePayload(u.vote)
+    }));
+
+    let aggregated;
+    try {
+      aggregated = getAggregateVotesInPollMessage(
+        {
+          message: pollCreationMessage,
+          pollUpdates: merged
+        },
+        mePn
+      );
+    } catch (err) {
+      return `Failed to calculate poll votes: ${err.message}`;
+    }
+
+    const yesOption = aggregated.find((o) => /^yes$/i.test(o.name.trim()));
+    const yesVoters = yesOption ? yesOption.voters : [];
+    const players = yesVoters.map((v) => nameFor(v));
+
+    if (players.length === 0) {
+      return 'No one has voted "Yes" yet in the opt-in poll.';
+    }
+
+    if (players.length === 1) {
+      return `Only 1 player has voted "Yes" so far (${players[0]}). Need at least 2 for singles or 4 for doubles.`;
+    }
+
+    if (players.length !== 2 && players.length % 4 !== 0) {
+      return `Got ${players.length} players who voted Yes: ${players.join(', ')}.\nNeed 2 players for singles or a multiple of 4 (4, 8, 12, etc.) for doubles to generate standard matchups.`;
+    }
+
+    targetPollState.status = 'resolved';
+    targetPollState.lastPlayers = players;
+    persistPolls();
+
+    console.log(`[poll] Generating matchups for opt-in poll ${targetPollId} with ${players.length} Yes voter(s): ${players.join(', ')}`);
+
+    ratings.ensureRated(players);
+    const schedule = generateMatchups(players);
     const header = targetPollState.when ? `📅 ${targetPollState.when}\n\n` : '';
     await sock.sendMessage(targetPollState.remoteJid, { text: header + formatMatchups(schedule) });
-    // Replaces this poll's previous entry, so a rematch doesn't count twice.
     pairHistory.recordDraw(targetPollId, schedule);
     targetPollState.lastSchedule = summarizeSchedule(schedule);
     persistPolls();
     return null;
   }
+
+  // Fixed-size poll with lastPlayers
+  if (targetPollState.lastPlayers) {
+    ratings.ensureRated(targetPollState.lastPlayers);
+    const schedule = generateMatchups(targetPollState.lastPlayers);
+    const header = targetPollState.when ? `📅 ${targetPollState.when}\n\n` : '';
+    await sock.sendMessage(targetPollState.remoteJid, { text: header + formatMatchups(schedule) });
+    pairHistory.recordDraw(targetPollId, schedule);
+    targetPollState.lastSchedule = summarizeSchedule(schedule);
+    persistPolls();
+    return null;
+  }
+
   return 'That poll hasn\'t filled up yet, so there\'s nothing to generate matchups from.';
 }
 
@@ -1416,12 +1565,44 @@ function nameFor(jid) {
 function pollStatusText(chatId) {
   const chatPolls = [...activePolls.entries()].filter(([, state]) => state.remoteJid === chatId);
   if (chatPolls.length === 0) {
-    return 'No poll on record for this chat -- create one with "' + TRIGGER_PREFIX + ' create a poll for <N>".';
+    return 'No poll on record for this chat -- create one with "' + TRIGGER_PREFIX + ' create a poll".';
   }
 
+  const mePn = jidNormalizedUser(botSock?.user?.id || botSock?.authState?.creds?.me?.id || '');
+
   const sections = chatPolls.map(([pollId, pollState]) => {
-    const voters = [...pollState.voteBuffer.keys()].map(nameFor);
     const playAtLocal = pollState.playAt ? new Date(pollState.playAt).toLocaleString() : 'unknown';
+
+    if (pollState.type === 'opt_in' || pollState.size === null) {
+      let yesVoters = [];
+      let noVoters = [];
+      try {
+        const pollCreationMessage = messageStore.get(storeKey(pollState.remoteJid, pollId));
+        if (pollCreationMessage) {
+          const merged = [...pollState.voteBuffer.values()].map((u) => ({
+            ...u,
+            vote: normalizeVotePayload(u.vote)
+          }));
+          const aggregated = getAggregateVotesInPollMessage({ message: pollCreationMessage, pollUpdates: merged }, mePn);
+          const yesOpt = aggregated.find((o) => /^yes$/i.test(o.name.trim()));
+          const noOpt = aggregated.find((o) => /^no$/i.test(o.name.trim()));
+          yesVoters = yesOpt ? yesOpt.voters.map((v) => nameFor(v)) : [];
+          noVoters = noOpt ? noOpt.voters.map((v) => nameFor(v)) : [];
+        }
+      } catch (e) {}
+
+      const lines = [
+        `Poll ${pollId}${pollState.when ? ` (${pollState.when})` : ''}: Opt-in (Yes/No).`,
+        `Status: ${pollState.status}`,
+        `Play time: ${playAtLocal} (auto-deleted ${POLL_EXPIRY_GRACE_HOURS}h after this if not already gone)`,
+        `Yes votes (${yesVoters.length}): ${yesVoters.length ? yesVoters.join(', ') : '(none yet)'}`,
+        `No votes (${noVoters.length}): ${noVoters.length ? noVoters.join(', ') : '(none yet)'}`,
+        'Matchups: Waiting for user prompt (!matchups or "@tenbot generate matchups")'
+      ];
+      return lines.join('\n');
+    }
+
+    const voters = [...pollState.voteBuffer.keys()].map(nameFor);
     const neededVotes = pollState.creator ? pollState.size - 1 : pollState.size;
     const lines = [
       `Poll ${pollId}${pollState.when ? ` (${pollState.when})` : ''}: ${pollState.size} spots (${pollState.size === 2 ? 'Singles' : 'Doubles'}).`,
@@ -1460,13 +1641,43 @@ function buildContextBlurb(chatId) {
     ? recent.map((m) => `${m.winner} def ${m.loser} (${m.score})`).join('; ')
     : 'none';
 
+  const mePn = jidNormalizedUser(botSock?.user?.id || botSock?.authState?.creds?.me?.id || '');
   const chatPolls = [...activePolls.entries()].filter(([, state]) => state.remoteJid === chatId);
   let pollText = 'no active poll';
   if (chatPolls.length > 0) {
     const pollDescriptions = chatPolls.map(([id, pollState]) => {
+      const whenSuffix = pollState.when ? ` for ${pollState.when}` : '';
+      if (pollState.type === 'opt_in' || pollState.size === null) {
+        let yesCount = 0;
+        let noCount = 0;
+        let yesNames = [];
+        try {
+          const pollCreationMessage = messageStore.get(storeKey(pollState.remoteJid, id));
+          if (pollCreationMessage) {
+            const merged = [...pollState.voteBuffer.values()].map((u) => ({
+              ...u,
+              vote: normalizeVotePayload(u.vote)
+            }));
+            const aggregated = getAggregateVotesInPollMessage({ message: pollCreationMessage, pollUpdates: merged }, mePn);
+            const yesOpt = aggregated.find((o) => /^yes$/i.test(o.name.trim()));
+            const noOpt = aggregated.find((o) => /^no$/i.test(o.name.trim()));
+            yesCount = yesOpt ? yesOpt.voters.length : 0;
+            noCount = noOpt ? noOpt.voters.length : 0;
+            yesNames = yesOpt ? yesOpt.voters.map((v) => nameFor(v)) : [];
+          }
+        } catch (e) {}
+
+        if (pollState.status === 'resolved') {
+          return `[Poll ${id}] a Yes/No opt-in poll${whenSuffix} was resolved with ${yesCount} players (${yesNames.join(', ')}) and matchups were posted`;
+        } else if (pollState.status === 'cancelled') {
+          return `[Poll ${id}] a Yes/No opt-in poll${whenSuffix} was cancelled`;
+        } else {
+          return `[Poll ${id}] a Yes/No opt-in poll${whenSuffix} is active with ${yesCount} "Yes" vote(s) (${yesNames.join(', ') || 'none yet'}) and ${noCount} "No" vote(s). Waiting for user prompt to generate matchups`;
+        }
+      }
+
       const filledCount = pollState.voteBuffer?.size || 0;
       const neededVotes = pollState.creator ? pollState.size - 1 : pollState.size;
-      const whenSuffix = pollState.when ? ` for ${pollState.when}` : '';
       const creatorSuffix = pollState.creator ? ` (created by ${pollState.creator.name || 'Player 1'}, who is Player 1)` : ' (all spots open)';
       if (pollState.status === 'resolved') {
         return `[Poll ${id}] a ${pollState.size}-spot poll${whenSuffix} filled up and matchups were posted`;
