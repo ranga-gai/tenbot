@@ -54,8 +54,8 @@ const { resolvePlayDateTime } = require('./lib/pollTime');
 // Set this to the exact group name (subject) you want the bot to listen to.
 // Leave as null to have the bot log every group name/ID it sees, so you can
 // find the right one.
-const TARGET_GROUP_NAME = 'SCVCC Early Morning Tennis Group (that usually plays in the evenings!)';
-//const TARGET_GROUP_NAME = 'Bot-testing';
+//const TARGET_GROUP_NAME = 'SCVCC Early Morning Tennis Group (that usually plays in the evenings!)';
+const TARGET_GROUP_NAME = 'Bot-testing';
 
 // Only call the LLM when the bot is directly addressed (recommended for
 // groups, otherwise it'll try to reply to every single message). Structured
@@ -578,7 +578,7 @@ async function executeTool(sock, chatId, sender, toolUse, msg) {
       return `Failed to create poll: ${err}`;
     }
     const needed = includeCreator ? size - 1 : size;
-    return `Poll for ${size} spots (${size === 2 ? 'Singles' : 'Doubles'}${when ? ` -- ${when}` : ''}) created with ${creatorName} as Player 1 (${needed} spot(s) to vote on: slots ${includeCreator ? `2..${size}` : `1..${size}`}).`;
+    return `Poll for ${size} spots (${size === 2 ? 'Singles' : 'Doubles'}${when ? ` -- ${when}` : ''}) created with ${creatorName} as Player 1 (${needed} spot(s) to vote on: ${includeCreator ? `Player 2..Player ${size}` : `Player 1..Player ${size}`}).`;
   }
   if (name === 'get_weather') {
     const location = input.location || DEFAULT_LOCATION;
@@ -764,7 +764,7 @@ function handleScoreCommand(text) {
  * Creates and sends a WhatsApp poll with numbered slots, and starts tracking
  * it so we can auto-generate matchups once it fills up.
  * If includeCreator is true, creatorName is Player 1, and options are labeled
- * starting from 2 up to size.
+ * "Player 2" .. "Player <size>".
  */
 async function createMatchPoll(sock, remoteJid, size, when, dayWord, timeWord, creatorName = null, creatorJid = null, includeCreator = true) {
   if (!Number.isInteger(size) || size <= 0) {
@@ -779,7 +779,7 @@ async function createMatchPoll(sock, remoteJid, size, when, dayWord, timeWord, c
 
   const startIdx = includeCreator ? 2 : 1;
   const count = includeCreator ? size - 1 : size;
-  const values = Array.from({ length: count }, (_, i) => `${i + startIdx}`);
+  const values = Array.from({ length: count }, (_, i) => `Player ${i + startIdx}`);
 
   const matchType = size === 2 ? 'Singles' : `${size} spots`;
   const suffix = when ? ` -- ${when}` : ' for today\'s matches';
@@ -966,7 +966,7 @@ async function processPollVoteEvent(sock, pollMessageKey, rawPollUpdates) {
       persistPolls();
       const lines = conflicts.map((c) => {
         const names = c.voters.map((v) => nameFor(v)).join(', ');
-        return `Slot ${c.name}: ${names}`;
+        return `${c.name}: ${names}`;
       });
       await sock.sendMessage(pollState.remoteJid, {
         text: `⚠️ A couple of slots have more than one vote -- one person should switch to an open slot:\n${lines.join('\n')}`
