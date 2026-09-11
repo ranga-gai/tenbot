@@ -47,6 +47,8 @@ const pino = require('pino');
 const storage = require('./lib/storage');
 const weather = require('./lib/weather');
 const { generateMatchups, formatMatchups } = require('./lib/matchups');
+const pairHistory = require('./lib/pairHistory');
+const ratings = require('./lib/ratings');
 const pollStore = require('./lib/pollStore');
 const { resolvePlayDateTime } = require('./lib/pollTime');
 
@@ -648,6 +650,10 @@ async function getResponse(sock, text, chatId, sender, msg) {
     return formatLeaderboard();
   }
 
+  if (lower === '!ratings') {
+    return formatRatings();
+  }
+
   // --- Weather ---
   if (lower.startsWith('!weather')) {
     const location = text.slice('!weather'.length).trim() || DEFAULT_LOCATION;
@@ -711,8 +717,9 @@ function helpText() {
     '!free – show who\'s free and when',
     '!notfree – remove yourself from the availability list',
     '!clearfree – clear the whole availability list',
-    '!score <winner> def <loser> <score> – record a match, e.g. "!score Mike def John 6-4 6-2"',
+    '!score <winner> def <loser> <score> – record a match and update ratings, e.g. "!score Mike & Sara def John & Alex 6-4 6-2"',
     '!leaderboard – show the win/loss leaderboard',
+    '!ratings – show player ratings used to balance the courts',
     '!weather [location] – forecast for outdoor play (defaults to ' + DEFAULT_LOCATION + ')',
     `${TRIGGER_PREFIX} create a poll for <N> – post a match poll with N spots (2 for singles, 4/8/12 for doubles); creator is Player 1 by default`,
     '!cancelpoll – stop the current poll from auto-generating matchups',
@@ -744,18 +751,58 @@ function formatLeaderboard() {
   return `🏆 Leaderboard:\n${lines.join('\n')}`;
 }
 
+/** Splits a side into its players: "Mike & Sara", "Mike and Sara", "Mike". */
+function parseSide(side) {
+  return side
+    .split(/\s*(?:&|\+|\band\b)\s*/i)
+    .map((name) => name.trim())
+    .filter(Boolean);
+}
+
 /**
  * Parses "!score <winner> def <loser> <score>", e.g.
- * "!score Mike def John 6-4 6-2"
+ * "!score Mike def John 6-4 6-2" or "!score Mike & Sara def John & Alex 6-4 4-6 7-5"
  */
 function handleScoreCommand(text) {
-  const match = text.match(/^!score\s+(.+?)\s+def\s+(.+?)\s+((?:\d+-\\d+\s*)+)$/i);
+  const match = text.match(/^!score\s+(.+?)\s+def\s+(.+?)\s+((?:\d+\s*-\s*\d+[\s,]*)+)$/i);
   if (!match) {
-    return 'Couldn\'t parse that. Use: !score <winner> def <loser> <score>\ne.g. "!score Mike def John 6-4 6-2"';
+    return 'Couldn\'t parse that. Use: !score <winner> def <loser> <score>\ne.g. "!score Mike def John 6-4 6-2" or "!score Mike & Sara def John & Alex 6-4 6-2"';
   }
+
   const [, winner, loser, score] = match;
+  const winners = parseSide(winner);
+  const losers = parseSide(loser);
+  const sets = score.trim().split(/[\s,]+/).map((s) => s.split('-').map(Number));
+
+  if (winners.length !== losers.length) {
+    return `Both sides need the same number of players -- got ${winners.length} vs ${losers.length}.`;
+  }
+
   storage.recordMatch(winner.trim(), loser.trim(), score.trim());
-  return `Recorded: ${winner.trim()} def ${loser.trim()} (${score.trim()}). Check "!leaderboard" for standings.`;
+  const { sets: rated, changes } = ratings.applyResult(winners, losers, sets);
+
+  const lines = [`Recorded: ${winner.trim()} def ${loser.trim()} (${score.trim()}).`];
+  const upsets = rated.filter((s) => s.upset).length;
+  if (upsets > 0) {
+    lines.push(`${upsets === rated.length ? 'Upset' : `${upsets} upset set(s)`} -- the lower-rated pairing came through.`);
+  }
+  lines.push(...changes.map((c) => {
+    const move = c.to === c.from ? 'no change' : `${c.to > c.from ? '▲' : '▼'} ${ratings.formatRating(Math.abs(c.to - c.from))}`;
+    return `  ${c.name}: ${ratings.formatRating(c.from)} → ${ratings.formatRating(c.to)} (${move})`;
+  }));
+  lines.push('Check "!leaderboard" for standings, "!ratings" for ratings.');
+
+  return lines.join('\n');
+}
+
+/** Lists current player ratings, strongest first. */
+function formatRatings() {
+  const board = ratings.getAllRatings();
+  if (board.length === 0) {
+    return `Nobody's rated yet -- everyone starts at ${ratings.formatRating(ratings.INITIAL_RATING)} once they play a poll or a score is recorded.`;
+  }
+  const lines = board.map((p, i) => `${i + 1}. ${p.name} — ${ratings.formatRating(p.rating)}`);
+  return `📊 Player ratings (${ratings.formatRating(ratings.MIN_RATING)}–${ratings.formatRating(ratings.MAX_RATING)}):\n${lines.join('\n')}`;
 }
 
 // ---- Poll creation & vote handling ----
@@ -1002,9 +1049,11 @@ async function processPollVoteEvent(sock, pollMessageKey, rawPollUpdates) {
 
     console.log(`[poll] Poll ${pollId} filled -- posting matchups for: ${players.join(', ')}`);
 
-    const courts = generateMatchups(players);
+    ratings.ensureRated(players);
+    const schedule = generateMatchups(players);
     const header = pollState.when ? `📅 ${pollState.when}\n\n` : '';
-    await sock.sendMessage(pollState.remoteJid, { text: header + formatMatchups(courts) });
+    await sock.sendMessage(pollState.remoteJid, { text: header + formatMatchups(schedule) });
+    pairHistory.recordDraw(pollId, schedule);
   }
 }
 
@@ -1016,9 +1065,12 @@ async function regenerateMatchups(sock, chatId) {
     return `No poll to work from yet -- create one with "${TRIGGER_PREFIX} create a poll for <N>" first.`;
   }
   if (pollState.lastPlayers) {
-    const courts = generateMatchups(pollState.lastPlayers);
+    ratings.ensureRated(pollState.lastPlayers);
+    const schedule = generateMatchups(pollState.lastPlayers);
     const header = pollState.when ? `📅 ${pollState.when}\n\n` : '';
-    await sock.sendMessage(pollState.remoteJid, { text: header + formatMatchups(courts) });
+    await sock.sendMessage(pollState.remoteJid, { text: header + formatMatchups(schedule) });
+    // Replaces this poll's previous entry, so a rematch doesn't count twice.
+    pairHistory.recordDraw(pollId, schedule);
     return null;
   }
   return 'That poll hasn\'t filled up yet, so there\'s nothing to generate matchups from.';
@@ -1111,10 +1163,16 @@ function buildContextBlurb(chatId) {
     }
   }
 
+  const rated = ratings.getAllRatings();
+  const ratingsText = rated.length
+    ? rated.map((p) => `${p.name}: ${ratings.formatRating(p.rating)}`).join(', ')
+    : 'nobody rated yet';
+
   return (
     `Current availability: ${availabilityText}\n` +
     `Leaderboard (top 5): ${leaderboardText}\n` +
     `Recent matches: ${recentText}\n` +
+    `Player ratings (${ratings.formatRating(ratings.MIN_RATING)}-${ratings.formatRating(ratings.MAX_RATING)}, a pairing's rating is the sum of its two players'): ${ratingsText}\n` +
     `Active poll: ${pollText}`
   );
 }
