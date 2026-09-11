@@ -46,7 +46,13 @@ const pino = require('pino');
 
 const storage = require('./lib/storage');
 const weather = require('./lib/weather');
-const { generateMatchups, formatMatchups } = require('./lib/matchups');
+const {
+  generateMatchups,
+  formatMatchups,
+  summarizeSchedule,
+  findMatchupFor
+} = require('./lib/matchups');
+const { parseScoreReport } = require('./lib/scoreReport');
 const pairHistory = require('./lib/pairHistory');
 const ratings = require('./lib/ratings');
 const pollStore = require('./lib/pollStore');
@@ -84,7 +90,9 @@ const SYSTEM_PROMPT =
   'conversational (1-3 sentences) unless asked for more detail. You have ' +
   "access to tools to create match polls (2 spots for singles, or 4/8/12 spots for doubles), " +
   "check weather, cancel polls, and access the group's availability list, win/loss leaderboard, " +
-  'and active polls (given below). By default, the user asking to create the poll is Player 1 ' +
+  'and active polls (given below). Results can be reported to you in plain words ("Mike & Sara ' +
+  'beat John & Alex 6-4", or "we won" right after a draw) and are logged automatically before ' +
+  "you see the message, so don't claim you can't record scores. By default, the user asking to create the poll is Player 1 " +
   'unless they explicitly state they are not playing. When a message contains a request to create ' +
   'a poll alongside other questions, call the create_poll tool and answer the other questions naturally.';
 
@@ -175,6 +183,14 @@ const pnToLid = new Map();
 // Poll votes only carry a JID, not a name, so this is how we label voters.
 const knownNames = new Map();
 
+// Last free-form result recorded per chat: chatId -> { signature, at }.
+// Unlike "!score", saying a result in words isn't a deliberate act of logging,
+// so an identical one arriving again within the window below is treated as the
+// same result being restated rather than a second set with the same score.
+// In memory only -- a restart just reopens the window.
+const recentFreeformScores = new Map();
+const FREEFORM_DUPLICATE_WINDOW_MS = 10 * 60 * 1000;
+
 // Active WhatsApp socket reference
 let botSock = null;
 
@@ -230,6 +246,20 @@ function isAddressedToBot(text, msg, botJids, triggerPrefix = TRIGGER_PREFIX) {
   }
 
   return { addressed: false, promptText: text };
+}
+
+/**
+ * Removes a leading TRIGGER_PREFIX and nothing else, so "@tenbot Mike beat
+ * John 6-4" can be read as a result while an occurrence further in stays put.
+ *
+ * That distinction matters here because a player is named "tenbot":
+ * isAddressedToBot strips the trigger wherever it appears, which is right for
+ * a question but would quietly delete a player from a result.
+ */
+function stripLeadingTrigger(text) {
+  if (!TRIGGER_PREFIX) return text;
+  const baseName = escapeRegex(TRIGGER_PREFIX.replace(/^@/, ''));
+  return text.replace(new RegExp(`^@?${baseName}[:,]?\\s*`, 'i'), '').trim();
 }
 
 /**
@@ -701,6 +731,20 @@ async function getResponse(sock, text, chatId, sender, msg) {
   }
   if (!promptText) return null;
 
+  // --- Free-form score reports ---
+  // A result can be announced with "!score" (handled further up) or in plain
+  // words to the bot ("@tenbot Mike & Sara beat John & Alex 6-4"), so this sits
+  // behind the trigger check and ahead of the LLM: results are recorded rather
+  // than chatted about, but only when the message is unmistakably a result --
+  // see lib/scoreReport.js. Group chatter the bot isn't addressed in has
+  // already returned above and is never read as a score.
+  const freeformScore = handleFreeformScore(
+    [text, stripLeadingTrigger(text), promptText],
+    chatId,
+    sender
+  );
+  if (freeformScore) return freeformScore;
+
   // --- LLM (handles free-form queries, poll creation, weather, Q&A, etc.) ---
   try {
     return await callClaude(sock, chatId, sender, promptText, msg);
@@ -718,6 +762,7 @@ function helpText() {
     '!notfree – remove yourself from the availability list',
     '!clearfree – clear the whole availability list',
     '!score <winner> def <loser> <score> – record a match and update ratings, e.g. "!score Mike & Sara def John & Alex 6-4 6-2"',
+    `  (or tell me in words: "${TRIGGER_PREFIX} Mike & Sara beat John & Alex 6-4", or "${TRIGGER_PREFIX} we won" after a draw – no score means 6-3)`,
     '!leaderboard – show the win/loss leaderboard',
     '!ratings – show player ratings used to balance the courts',
     '!weather [location] – forecast for outdoor play (defaults to ' + DEFAULT_LOCATION + ')',
@@ -759,9 +804,50 @@ function parseSide(side) {
     .filter(Boolean);
 }
 
+const formatSide = (names) => names.join(' & ');
+const formatSets = (sets) => sets.map(([a, b]) => `${a}-${b}`).join(' ');
+
+/**
+ * Records an understood result: the match against the leaderboard, each set
+ * against the ratings, and a reply saying what moved. Shared by "!score" and
+ * free-form reports so both behave identically once parsed.
+ */
+function applyScoreReport({ winners, losers, sets, assumedScore = false, inferredOpponents = false }) {
+  const winnerText = formatSide(winners);
+  const loserText = formatSide(losers);
+  const scoreText = formatSets(sets);
+
+  storage.recordMatch(winnerText, loserText, scoreText);
+  const { sets: rated, changes } = ratings.applyResult(winners, losers, sets);
+
+  const lines = [`Recorded: ${winnerText} def ${loserText} (${scoreText}).`];
+
+  const notes = [];
+  if (assumedScore) notes.push(`no score given, so I assumed ${scoreText}`);
+  if (inferredOpponents) notes.push("opponents from today's draw");
+  if (notes.length > 0) lines.push(`(${notes.join('; ')})`);
+
+  const upsets = rated.filter((s) => s.upset).length;
+  if (upsets > 0) {
+    lines.push(`${upsets === rated.length ? 'Upset' : `${upsets} upset set(s)`} -- the lower-rated pairing came through.`);
+  }
+
+  lines.push(...changes.map((c) => {
+    const move = c.to === c.from ? 'no change' : `${c.to > c.from ? '▲' : '▼'} ${ratings.formatRating(Math.abs(c.to - c.from))}`;
+    return `  ${c.name}: ${ratings.formatRating(c.from)} → ${ratings.formatRating(c.to)} (${move})`;
+  }));
+  lines.push('Check "!leaderboard" for standings, "!ratings" for ratings.');
+
+  return lines.join('\n');
+}
+
 /**
  * Parses "!score <winner> def <loser> <score>", e.g.
  * "!score Mike def John 6-4 6-2" or "!score Mike & Sara def John & Alex 6-4 4-6 7-5"
+ *
+ * Unlike free-form reports, the command takes names as given rather than
+ * insisting it already knows them -- asking for a score explicitly is enough
+ * to mean it, and it's how a new player gets their first result logged.
  */
 function handleScoreCommand(text) {
   const match = text.match(/^!score\s+(.+?)\s+def\s+(.+?)\s+((?:\d+\s*-\s*\d+[\s,]*)+)$/i);
@@ -778,21 +864,95 @@ function handleScoreCommand(text) {
     return `Both sides need the same number of players -- got ${winners.length} vs ${losers.length}.`;
   }
 
-  storage.recordMatch(winner.trim(), loser.trim(), score.trim());
-  const { sets: rated, changes } = ratings.applyResult(winners, losers, sets);
+  return applyScoreReport({ winners, losers, sets });
+}
 
-  const lines = [`Recorded: ${winner.trim()} def ${loser.trim()} (${score.trim()}).`];
-  const upsets = rated.filter((s) => s.upset).length;
-  if (upsets > 0) {
-    lines.push(`${upsets === rated.length ? 'Upset' : `${upsets} upset set(s)`} -- the lower-rated pairing came through.`);
+/**
+ * Every player the bot already knows, mapped from lowercased name to the
+ * canonical spelling. Free-form parsing checks names against this so ordinary
+ * chatter can't be mistaken for a result -- see lib/scoreReport.js.
+ */
+function knownPlayers(chatId) {
+  const byKey = new Map();
+  const add = (name) => {
+    const key = ratings.keyFor(name);
+    if (key && !byKey.has(key)) byKey.set(key, String(name).trim());
+  };
+
+  for (const p of ratings.getAllRatings()) add(p.name);
+  for (const p of storage.getLeaderboard()) add(p.name);
+  for (const a of storage.getAvailability()) add(a.player);
+
+  const pollState = lastPollStateFor(chatId);
+  for (const name of pollState?.lastPlayers || []) add(name);
+
+  return byKey;
+}
+
+/** The most recent poll state for a chat, if there is one. */
+function lastPollStateFor(chatId) {
+  const pollId = latestPollIdByChat.get(chatId);
+  return (pollId && activePolls.get(pollId)) || null;
+}
+
+// First-person stand-ins for whoever sent the message. These resolve to just
+// that player; when the draw shows they were playing doubles, findMatchupFor
+// fills in the partner, so "we won" still credits the pairing.
+const SELF_WORDS = new Set(['i', 'me', 'myself', 'we', 'us', 'my team', 'our team']);
+
+/**
+ * Handles a result told to the bot in plain words rather than via "!score",
+ * e.g. "@tenbot Mike & Sara beat John & Alex 6-4" or "@tenbot we won" after a
+ * draw. Returns null when the message isn't a result report, so the caller can
+ * pass it on to the LLM as an ordinary question.
+ */
+function handleFreeformScore(candidates, chatId, sender) {
+  const roster = knownPlayers(chatId);
+  const lastSchedule = lastPollStateFor(chatId)?.lastSchedule;
+
+  const self = roster.get(ratings.keyFor(sender)) || null;
+
+  const options = {
+    resolveName: (raw) => {
+      const key = ratings.keyFor(raw);
+      if (SELF_WORDS.has(key)) return self;
+      return roster.get(key) || null;
+    },
+    findMatchup: (names, versus) => findMatchupFor(lastSchedule, names, versus)
+  };
+
+  // The same message with the bot's name removed to varying degrees, least
+  // edited first. The bot can be addressed with a prefix or an @-mention, and a
+  // player here is called "tenbot" -- so the reading that survives the fewest
+  // edits is the one to trust.
+  let report = null;
+  for (const candidate of new Set(candidates.filter(Boolean))) {
+    report = parseScoreReport(candidate, options);
+    if (report) break;
   }
-  lines.push(...changes.map((c) => {
-    const move = c.to === c.from ? 'no change' : `${c.to > c.from ? '▲' : '▼'} ${ratings.formatRating(Math.abs(c.to - c.from))}`;
-    return `  ${c.name}: ${ratings.formatRating(c.from)} → ${ratings.formatRating(c.to)} (${move})`;
-  }));
-  lines.push('Check "!leaderboard" for standings, "!ratings" for ratings.');
 
-  return lines.join('\n');
+  if (!report) return null;
+
+  const signature = [
+    formatSide(report.winners),
+    formatSide(report.losers),
+    formatSets(report.sets)
+  ].join('|').toLowerCase();
+
+  const previous = recentFreeformScores.get(chatId);
+  if (previous?.signature === signature && Date.now() - previous.at < FREEFORM_DUPLICATE_WINDOW_MS) {
+    console.log(`[score] Ignoring repeat free-form result: ${signature}`);
+    return null;
+  }
+  recentFreeformScores.set(chatId, { signature, at: Date.now() });
+
+  console.log(
+    `[score] Free-form result understood: ${formatSide(report.winners)} def ` +
+    `${formatSide(report.losers)} (${formatSets(report.sets)})` +
+    `${report.assumedScore ? ' [assumed score]' : ''}${report.inferredOpponents ? ' [inferred opponents]' : ''}`
+  );
+
+  return applyScoreReport(report);
 }
 
 /** Lists current player ratings, strongest first. */
@@ -1054,6 +1214,10 @@ async function processPollVoteEvent(sock, pollMessageKey, rawPollUpdates) {
     const header = pollState.when ? `📅 ${pollState.when}\n\n` : '';
     await sock.sendMessage(pollState.remoteJid, { text: header + formatMatchups(schedule) });
     pairHistory.recordDraw(pollId, schedule);
+
+    // Kept so "we won" reports can work out who the opponents were.
+    pollState.lastSchedule = summarizeSchedule(schedule);
+    persistPolls();
   }
 }
 
@@ -1071,6 +1235,8 @@ async function regenerateMatchups(sock, chatId) {
     await sock.sendMessage(pollState.remoteJid, { text: header + formatMatchups(schedule) });
     // Replaces this poll's previous entry, so a rematch doesn't count twice.
     pairHistory.recordDraw(pollId, schedule);
+    pollState.lastSchedule = summarizeSchedule(schedule);
+    persistPolls();
     return null;
   }
   return 'That poll hasn\'t filled up yet, so there\'s nothing to generate matchups from.';

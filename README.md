@@ -50,20 +50,18 @@ Once every slot has exactly one vote, the bot automatically posts doubles matchu
 🎾 All spots filled! Here are today's matchups:
 
 Set 1:
-  Court 1: Mike & Sara (6.98) vs John & Alex (6.98)
-  Court 2: Priya & Ben (7.02) vs Tom & Lisa (7.00)
+  Court 1: Mike & Sara vs John & Alex
+  Court 2: Priya & Ben vs Tom & Lisa
 
 Set 2:
-  Court 1: Mike & Ben (6.90) vs Tom & Alex (7.10)
-  Court 2: Priya & John (7.04) vs Sara & Lisa (6.96)
-
-(numbers are pairing ratings -- the sum of both players' ratings)
+  Court 1: Mike & Ben vs Tom & Alex
+  Court 2: Priya & John vs Sara & Lisa
 ```
 
 - **Courts**: players are split four to a court, so an 8-person poll makes 2 courts, a 4-person poll makes 1, a 12-person poll makes 3, etc. Matchups are listed by set, not by court, because the whole group is re-drawn for each set — you move courts as well as partners.
 - **Rotation**: each set is scored on the pairings it repeats, and the lowest-repeat draw wins. Within a session nobody partners the same person twice, and where the court count allows it you don't face the same opponents twice either. With 2 courts a complete swap would just put the same four people back together, so half the players stay put and the foursomes reshuffle instead.
 - **Freshness across weeks**: partners and opponents from the last 3 weeks are remembered in `pair-history.json` and counted against repeat pairings, weighted so last week's pairing matters about twice as much as one from two weeks ago. Over six weekly 8-person polls this typically uses all 28 possible partnerships before repeating any of them. Deleting the file is harmless — draws just go back to being unbiased.
-- **Even courts**: the draw also tries to keep the two pairing ratings on a court within **0.49** of each other (see [Player ratings](#player-ratings)). With 8 or more players this essentially always succeeds while still avoiding every repeat pairing.
+- **Even courts**: the draw also tries to keep the two pairing ratings on a court within **0.49** of each other (see [Player ratings](#player-ratings)). With 8 or more players this essentially always succeeds while still avoiding every repeat pairing. The ratings themselves aren't printed with the matchups — use `!ratings` to see them.
 - **Conflicts**: if two people vote for the same numbered slot, the bot posts a heads-up naming who needs to switch, and won't generate matchups until every slot has exactly one voter.
 
 Related commands:
@@ -80,7 +78,7 @@ Related commands:
 | `!free` | Shows everyone currently marked as free |
 | `!notfree` | Removes you from the availability list |
 | `!clearfree` | Clears the whole availability list |
-| `!score <winner> def <loser> <score>` | Records a match and updates ratings, e.g. `!score Mike & Sara def John & Alex 6-4 6-2` |
+| `!score <winner> def <loser> <score>` | Records a match and updates ratings, e.g. `!score Mike & Sara def John & Alex 6-4 6-2`. You can also [tell the bot in words](#reporting-results-in-plain-words) instead of using the command |
 | `!leaderboard` | Shows the win/loss leaderboard |
 | `!ratings` | Shows player ratings, strongest first |
 | `!weather [location]` | 3-day forecast; defaults to `DEFAULT_LOCATION` if you don't specify one |
@@ -94,7 +92,7 @@ The `@tenbot` prefix keeps the bot from replying to every single message. Change
 
 Every player carries a rating between **2.50 and 4.50**, to two decimals, starting at **3.49**. A **pairing's rating is the sum of its two players'**, so two fresh players pair at 6.98. Ratings are stored in `ratings.json` and shown by `!ratings`; a player is seeded at the starting rating the first time a poll they're in fills up.
 
-Ratings do two things: they balance the draw (courts aim to be within 0.49, see above), and they move when you record a set with `!score`.
+Ratings do two things: they balance the draw (courts aim to be within 0.49, see above), and they move when a result is recorded — either with `!score` or by [telling the bot in words](#reporting-results-in-plain-words).
 
 **How a set moves ratings** — each set in a recorded score is applied in order, and what happens depends on the pairing ratings going into that set:
 
@@ -106,6 +104,32 @@ Ratings do two things: they balance the draw (courts aim to be within 0.49, see 
 So a 6-4 win by the favourites moves everyone 0.02. The same 6-4 as an upset, with a 0.40 gap between the pairings, moves everyone `0.40 × 2/12 = 0.07` — beating a stronger pairing is worth more, and worth most when you beat them convincingly. Deltas are rounded to the nearest 0.01 and every rating is capped to the 2.50–4.50 band. Equal pairing ratings count as a favourite win, since there'd be no gap for the upset formula to divide up. A tied set (e.g. `6-6`) moves nobody.
 
 Multi-set scores are applied set by set, each seeing the ratings the previous set left behind — so the favourite can change partway through a match, as in `!score Mike & Sara def John & Alex 4-6 6-2`.
+
+## Reporting results in plain words
+
+Results don't have to go through `!score`. Tell the bot in ordinary language and it records the same thing — it just has to be addressed to the bot, like anything else it acts on:
+
+```
+@tenbot Mike & Sara beat John & Alex 6-4 6-2   → recorded as written
+@tenbot John & Alex lost to Mike & Sara 6-4    → same result, sides swapped
+@tenbot Mike & Sara vs John & Alex 4-6 6-3     → neutral, so the score says who won
+@tenbot Mike beat John                         → no score given, so 6-3 is assumed
+@tenbot Mike & Sara won                        → opponents filled in from today's draw
+@tenbot we beat John & Alex 6-1                → "we" is the sender and their partner
+@tenbot Great match! Mike & Sara beat John & Alex 6-4
+```
+
+**A message with no score at all counts as a 6-3 set** — the shorthand for "we played a set and this is who won". The bot says which parts it filled in when it replies.
+
+Results said to the group without addressing the bot are **not** recorded. That's deliberate: the bot stays out of ordinary chatter, and nothing moves anyone's rating unless someone asked for it.
+
+Within an addressed message it's still strict about what counts as a result, so `@tenbot` questions and requests aren't mistaken for one. It ignores anything containing a `?`, so `@tenbot did Mike beat John?` gets answered rather than recorded. Every name has to be someone it already knows — a rated player, someone in the current poll, or someone on the availability list — so `@tenbot Mike won the lottery` and `@tenbot Bob beat Charlie 6-4` (Bob being nobody in the group) fall through to a normal reply. Anything left over after the names has to be filler like "in the first set", not arbitrary text. And an identical result restated within 10 minutes is treated as the same set, not a second one.
+
+Two forms only work when the draw settles them. `Mike & Sara won` needs that exact pairing in the current session to know who they beat. A lone player (`Mike won`, `we won`) has to belong to exactly one pairing in the draw — in a normal two-set session a player has two different partners, so the bot stays quiet rather than guess which set you meant. Naming the opponents resolves it (`we beat John & Alex 6-1`), and so does naming the pairing.
+
+`!score` stays the explicit route and is looser about names: it takes whatever you give it, which is how a player who's never been in a poll gets their first result logged. It also works without the `@tenbot` prefix, like every other `!` command.
+
+**One wrinkle worth knowing if you change `TRIGGER_PREFIX`**: this group has a player called *tenbot*, the same word as the trigger. The bot strips its own name from a message wherever it appears, which would delete that player from a result — so result parsing tries the message untouched first, then with just a leading `@tenbot` removed, taking the least-edited reading that makes sense. `@tenbot PI & tenbot beat Latha & Prasanna 6-4` records correctly. (A side effect of the same trigger matching: a message naming that player counts as addressing the bot, so `PI & tenbot beat Latha & Prasanna 6-4` is recorded even without the prefix.)
 
 ## How data is stored
 
@@ -132,6 +156,7 @@ The bot uses `useMultiFileAuthState`, saving your login session to a local `auth
 - **Bot not responding in group**: double check `TARGET_GROUP_NAME` matches the group name exactly (case-sensitive — currently `"Bot-testing"`), and that your message uses a valid command or starts with `@tenbot`.
 - **`!score` says it couldn't parse the message**: the format is strict — `!score <winner> def <loser> <score>`, with scores as space-separated `N-N` pairs (e.g. `6-4 6-2`).
 - **Weather lookup fails**: usually means the location name didn't match anything in the geocoding lookup — try a more specific or differently-spelled name.
+- **A result told to the bot in words wasn't picked up**: first check it was addressed to the bot — results said to the group without `@tenbot` are ignored on purpose. Otherwise the console logs every report it understands, so look there next. The usual causes are a name the bot doesn't know yet (it only trusts rated players, poll players and the availability list), a `?` somewhere in the message, extra words it can't account for, or a lone-player report like `we won` that the current draw doesn't pin down — see [Reporting results in plain words](#reporting-results-in-plain-words). `!score` always works as the fallback.
 - **Poll doesn't trigger matchups even though it looks full**: check the console log for a conflict warning — if two people picked the same number, the bot is waiting for one of them to switch before it'll generate matchups. Also confirm the poll size was a multiple of 4 when created.
 - **Voter shows up as "Player (1234)" instead of their name**: the bot labels voters using names it's seen from their regular text messages in the group. If someone votes in a poll without ever having sent a text message the bot saw, it won't have a name for them yet — ask them to send any message in the group once, and future polls will show their name correctly.
 
