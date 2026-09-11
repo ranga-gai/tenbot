@@ -6,7 +6,8 @@
  *   - Tracking match results / a simple leaderboard (!score, !leaderboard)
  *   - Weather checks for outdoor play (!weather)
  *   - Scheduling matches via WhatsApp polls: "@tenbot create a poll for 2" (singles)
- *     or "@tenbot create a poll for 8" (doubles). Once every slot has exactly one voter,
+ *     or "@tenbot create a poll for 8" (doubles). The creator is automatically Player 1
+ *     (unless specified otherwise), with votes starting from Player 2. Once all spots fill,
  *     the bot automatically posts singles/doubles matchups with rotations.
  *   - General questions, answered by Claude with live group context (@tenbot ...)
  *
@@ -81,20 +82,21 @@ const SYSTEM_PROMPT =
   'conversational (1-3 sentences) unless asked for more detail. You have ' +
   "access to tools to create match polls (2 spots for singles, or 4/8/12 spots for doubles), " +
   "check weather, cancel polls, and access the group's availability list, win/loss leaderboard, " +
-  'and active polls (given below). When a message contains a request to create a poll alongside ' +
-  'other questions, call the create_poll tool and answer the other questions naturally in your reply.';
+  'and active polls (given below). By default, the user asking to create the poll is Player 1 ' +
+  'unless they explicitly state they are not playing. When a message contains a request to create ' +
+  'a poll alongside other questions, call the create_poll tool and answer the other questions naturally.';
 
 // Tools exposed to Claude for handling natural language requests
 const CLAUDE_TOOLS = [
   {
     name: 'create_poll',
-    description: 'Creates and sends a WhatsApp poll with numbered spots (1..N) for organizing a tennis match in the group. Supports singles (2 spots) and doubles (4, 8, 12, etc.). Use this whenever the user wants to create a poll, organize singles or doubles, set up spots for tennis, etc.',
+    description: 'Creates and sends a WhatsApp poll with numbered spots for organizing a tennis match in the group. Supports singles (2 spots) and doubles (4, 8, 12, etc.). The user asking to create the poll is automatically included as Player 1 unless they explicitly state they are not playing.',
     input_schema: {
       type: 'object',
       properties: {
         size: {
           type: 'integer',
-          description: 'Number of spots in the poll. Must be 2 (for singles) or a positive multiple of 4 (e.g. 4, 8, 12, 16 for doubles).'
+          description: 'Total number of players for the match. Must be 2 (for singles) or a positive multiple of 4 (e.g. 4, 8, 12, 16 for doubles).'
         },
         when: {
           type: 'string',
@@ -107,6 +109,10 @@ const CLAUDE_TOOLS = [
         timeWord: {
           type: 'string',
           description: 'Time word mentioned in the request (e.g. "9am", "6:30pm", "7pm").'
+        },
+        includeCreator: {
+          type: 'boolean',
+          description: 'Whether the user requesting the poll is playing in it. Defaults to true unless the user explicitly mentions they are not playing.'
         }
       },
       required: ['size']
@@ -175,7 +181,7 @@ let botSock = null;
 // the in-memory maps and as the persisted key format.
 const {
   messageStore,   // `${remoteJid}:${id}` -> stored WAMessage content, needed for getMessage() and vote decoding
-  activePolls,    // pollId -> { remoteJid, size, when, playAt, status, lastConflictSignature, voteBuffer, lastPlayers }
+  activePolls,    // pollId -> { remoteJid, size, when, playAt, status, creator, lastConflictSignature, voteBuffer, lastPlayers }
   latestPollIdByChat // chatId -> pollId, so "!cancelpoll"/"!rematch"/"!pollstatus" know which poll to act on
 } = pollStore.load();
 
@@ -365,7 +371,11 @@ function cleanupExpiredPolls() {
     if (Number.isNaN(playAtMs)) continue;
     if (now > playAtMs + graceMs) {
       activePolls.delete(pollId);
-      messageStore.delete(storeKey(pollState.remoteJid, pollId));
+      for (const key of messageStore.keys()) {
+        if (key.endsWith(`:${pollId}`)) {
+          messageStore.delete(key);
+        }
+      }
       for (const [chatId, latestId] of latestPollIdByChat.entries()) {
         if (latestId === pollId) latestPollIdByChat.delete(chatId);
       }
@@ -552,18 +562,23 @@ function extractText(message) {
 /**
  * Executes a tool called by Claude and returns the result string.
  */
-async function executeTool(sock, chatId, sender, toolUse) {
+async function executeTool(sock, chatId, sender, toolUse, msg) {
   const { name, input } = toolUse;
   if (name === 'create_poll') {
     const size = input.size;
     const when = input.when || null;
     const dayWord = input.dayWord || null;
     const timeWord = input.timeWord || null;
-    const err = await createMatchPoll(sock, chatId, size, when, dayWord, timeWord);
+    const includeCreator = input.includeCreator !== false;
+    const creatorName = sender !== 'Someone' ? sender : (msg?.key?.participant ? nameFor(msg.key.participant) : 'Player 1');
+    const creatorJid = msg?.key?.participant || msg?.key?.remoteJid || null;
+
+    const err = await createMatchPoll(sock, chatId, size, when, dayWord, timeWord, creatorName, creatorJid, includeCreator);
     if (err) {
       return `Failed to create poll: ${err}`;
     }
-    return `Poll for ${size} spots (${size === 2 ? 'Singles' : 'Doubles'}${when ? ` -- ${when}` : ''}) created and posted to the group.`;
+    const needed = includeCreator ? size - 1 : size;
+    return `Poll for ${size} spots (${size === 2 ? 'Singles' : 'Doubles'}${when ? ` -- ${when}` : ''}) created with ${creatorName} as Player 1 (${needed} spot(s) to vote on: slots ${includeCreator ? `2..${size}` : `1..${size}`}).`;
   }
   if (name === 'get_weather') {
     const location = input.location || DEFAULT_LOCATION;
@@ -682,7 +697,7 @@ async function getResponse(sock, text, chatId, sender, msg) {
 
   // --- LLM (handles free-form queries, poll creation, weather, Q&A, etc.) ---
   try {
-    return await callClaude(sock, chatId, sender, promptText);
+    return await callClaude(sock, chatId, sender, promptText, msg);
   } catch (err) {
     console.error('LLM call failed:', err);
     return "Sorry, I couldn't come up with a reply just now.";
@@ -699,7 +714,7 @@ function helpText() {
     '!score <winner> def <loser> <score> – record a match, e.g. "!score Mike def John 6-4 6-2"',
     '!leaderboard – show the win/loss leaderboard',
     '!weather [location] – forecast for outdoor play (defaults to ' + DEFAULT_LOCATION + ')',
-    `${TRIGGER_PREFIX} create a poll for <N> – post a poll with N spots (2 for singles, 4/8/12 for doubles); once everyone's voted in, matchups post automatically`,
+    `${TRIGGER_PREFIX} create a poll for <N> – post a match poll with N spots (2 for singles, 4/8/12 for doubles); creator is Player 1 by default`,
     '!cancelpoll – stop the current poll from auto-generating matchups',
     '!pollstatus – debug: show raw vote count and voters for the current poll',
     '!rematch – regenerate matchups from the current poll\'s votes',
@@ -746,13 +761,12 @@ function handleScoreCommand(text) {
 // ---- Poll creation & vote handling ----
 
 /**
- * Creates and sends a WhatsApp poll with numbered slots 1..size, and starts
- * tracking it so we can auto-generate matchups once it fills up. `when` is
- * an optional day/time phrase (e.g. "Saturday 9am") echoed in the poll title;
- * `dayWord`/`timeWord` are the raw matches used to compute an absolute play
- * time for expiry purposes. Supports size=2 (singles) or multiples of 4 (doubles).
+ * Creates and sends a WhatsApp poll with numbered slots, and starts tracking
+ * it so we can auto-generate matchups once it fills up.
+ * If includeCreator is true, creatorName is Player 1, and options are labeled
+ * starting from 2 up to size.
  */
-async function createMatchPoll(sock, remoteJid, size, when, dayWord, timeWord) {
+async function createMatchPoll(sock, remoteJid, size, when, dayWord, timeWord, creatorName = null, creatorJid = null, includeCreator = true) {
   if (!Number.isInteger(size) || size <= 0) {
     return `Give me a valid number of players, e.g. "${TRIGGER_PREFIX} create a poll for 2" (singles) or "${TRIGGER_PREFIX} create a poll for 8" (doubles).`;
   }
@@ -763,13 +777,19 @@ async function createMatchPoll(sock, remoteJid, size, when, dayWord, timeWord) {
     return 'That\'s a lot of players for one poll -- try 40 or fewer.';
   }
 
-  const values = Array.from({ length: size }, (_, i) => `${i + 1}`);
+  const startIdx = includeCreator ? 2 : 1;
+  const count = includeCreator ? size - 1 : size;
+  const values = Array.from({ length: count }, (_, i) => `${i + startIdx}`);
+
   const matchType = size === 2 ? 'Singles' : `${size} spots`;
   const suffix = when ? ` -- ${when}` : ' for today\'s matches';
+  const titlePrefix = includeCreator && creatorName
+    ? `🎾 ${creatorName}'s match: Vote for a spot!`
+    : '🎾 Vote for a spot!';
 
   const sent = await sock.sendMessage(remoteJid, {
     poll: {
-      name: `🎾 Vote for a spot! (${matchType}${suffix})`,
+      name: `${titlePrefix} (${matchType}${suffix})`,
       values,
       selectableCount: 1
     }
@@ -785,13 +805,14 @@ async function createMatchPoll(sock, remoteJid, size, when, dayWord, timeWord) {
     when: when || null,
     playAt: playAt.toISOString(),
     status: 'active', // 'active' | 'resolved' | 'cancelled'
+    creator: includeCreator ? { name: creatorName || 'Player 1', jid: creatorJid || null } : null,
     lastConflictSignature: null,
     voteBuffer: new Map(), // voterJid -> raw pollUpdate entry
     lastPlayers: null
   });
   latestPollIdByChat.set(remoteJid, pollId);
   persistPolls();
-  console.log(`[poll] Created poll ${pollId} for ${size} spots (${size === 2 ? 'singles' : 'doubles'}) in ${remoteJid}${when ? ` (${when})` : ''}, play time ${playAt.toISOString()}`);
+  console.log(`[poll] Created poll ${pollId} for ${size} spots (${size === 2 ? 'singles' : 'doubles'}, creator: ${creatorName || 'none'}) in ${remoteJid}${when ? ` (${when})` : ''}, play time ${playAt.toISOString()}`);
 
   return null; // the poll message itself is the response; no extra text needed
 }
@@ -931,9 +952,10 @@ async function processPollVoteEvent(sock, pollMessageKey, rawPollUpdates) {
 
   const filled = aggregated.filter((o) => o.voters.length > 0);
   const conflicts = aggregated.filter((o) => o.voters.length > 1);
+  const neededVotes = pollState.creator ? pollState.size - 1 : pollState.size;
 
   console.log(
-    `[poll] Poll ${pollId}: ${filled.length}/${pollState.size} slot(s) filled, ` +
+    `[poll] Poll ${pollId}: ${filled.length}/${neededVotes} slot(s) filled (${pollState.size} players total), ` +
     `${conflicts.length} conflicting slot(s), ${pollState.voteBuffer.size} raw vote(s) buffered.`
   );
 
@@ -955,13 +977,23 @@ async function processPollVoteEvent(sock, pollMessageKey, rawPollUpdates) {
 
   if (pollState.status !== 'active') return;
 
-  if (filled.length === pollState.size) {
-    // Every slot has exactly one voter -- build the player list in slot order.
+  if (filled.length === neededVotes) {
+    // Build the player list in slot order.
     const bySlot = new Map(aggregated.map((o) => [o.name, o.voters[0]]));
     const players = [];
-    for (let i = 1; i <= pollState.size; i++) {
-      const voterJid = bySlot.get(`${i}`);
-      players.push(voterJid ? nameFor(voterJid) : `Slot ${i}`);
+
+    if (pollState.creator) {
+      const creatorDisplayName = pollState.creator.name || (pollState.creator.jid ? nameFor(pollState.creator.jid) : 'Player 1');
+      players.push(creatorDisplayName);
+      for (let i = 2; i <= pollState.size; i++) {
+        const voterJid = bySlot.get(`${i}`) || bySlot.get(`Player ${i}`);
+        players.push(voterJid ? nameFor(voterJid) : `Player ${i}`);
+      }
+    } else {
+      for (let i = 1; i <= pollState.size; i++) {
+        const voterJid = bySlot.get(`${i}`) || bySlot.get(`Player ${i}`);
+        players.push(voterJid ? nameFor(voterJid) : `Player ${i}`);
+      }
     }
 
     pollState.status = 'resolved';
@@ -1027,13 +1059,16 @@ function pollStatusText(chatId) {
   }
   const voters = [...pollState.voteBuffer.keys()].map(nameFor);
   const playAtLocal = pollState.playAt ? new Date(pollState.playAt).toLocaleString() : 'unknown';
-  return [
-    `Poll ${pollId}${pollState.when ? ` (${pollState.when})` : ''}: ${pollState.size} spots.`,
+  const neededVotes = pollState.creator ? pollState.size - 1 : pollState.size;
+  const lines = [
+    `Poll ${pollId}${pollState.when ? ` (${pollState.when})` : ''}: ${pollState.size} spots (${pollState.size === 2 ? 'Singles' : 'Doubles'}).`,
+    pollState.creator ? `Creator (Player 1): ${pollState.creator.name || 'Player 1'}` : null,
     `Status: ${pollState.status}`,
     `Play time: ${playAtLocal} (auto-deleted ${POLL_EXPIRY_GRACE_HOURS}h after this if not already gone)`,
-    `Raw votes recorded: ${pollState.voteBuffer.size}`,
+    `Raw votes recorded: ${pollState.voteBuffer.size}/${neededVotes} needed`,
     `Voters seen so far: ${voters.length ? voters.join(', ') : '(none yet)'}`
-  ].join('\n');
+  ].filter(Boolean);
+  return lines.join('\n');
 }
 
 // ---- LLM Q&A ----
@@ -1064,13 +1099,15 @@ function buildContextBlurb(chatId) {
   let pollText = 'no active poll';
   if (pollState) {
     const filledCount = pollState.voteBuffer.size;
+    const neededVotes = pollState.creator ? pollState.size - 1 : pollState.size;
     const whenSuffix = pollState.when ? ` for ${pollState.when}` : '';
+    const creatorSuffix = pollState.creator ? ` (created by ${pollState.creator.name || 'Player 1'}, who is Player 1)` : '';
     if (pollState.status === 'resolved') {
       pollText = `a ${pollState.size}-spot poll${whenSuffix} just filled up and matchups were posted`;
     } else if (pollState.status === 'cancelled') {
       pollText = `a ${pollState.size}-spot poll${whenSuffix} was cancelled`;
     } else {
-      pollText = `a ${pollState.size}-spot poll${whenSuffix} is active with ${filledCount}/${pollState.size} votes so far`;
+      pollText = `a ${pollState.size}-spot poll${whenSuffix}${creatorSuffix} is active with ${filledCount}/${neededVotes} votes needed so far`;
     }
   }
 
@@ -1087,7 +1124,7 @@ function buildContextBlurb(chatId) {
  * Enables Claude to handle free-form poll creation requests while answering
  * any other questions in the same message.
  */
-async function callClaude(sock, chatId, sender, promptText) {
+async function callClaude(sock, chatId, sender, promptText, msg) {
   const history = chatHistories.get(chatId) || [];
 
   const userMessage = { role: 'user', content: `${sender}: ${promptText}` };
@@ -1126,7 +1163,7 @@ async function callClaude(sock, chatId, sender, promptText) {
   if (toolUseBlocks.length > 0) {
     const toolResults = [];
     for (const toolUse of toolUseBlocks) {
-      const result = await executeTool(sock, chatId, sender, toolUse);
+      const result = await executeTool(sock, chatId, sender, toolUse, msg);
       toolResults.push({
         type: 'tool_result',
         tool_use_id: toolUse.id,
