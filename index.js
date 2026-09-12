@@ -4,6 +4,7 @@
  * Listens for messages in a WhatsApp tennis group and helps with:
  *   - Coordinating who's free to play (!free, !notfree)
  *   - Tracking match results / a simple leaderboard (!score, !leaderboard)
+ *   - Player ratings from TennisRecord.com, adjustable by users (@tenbot set my rating to 4.0, !setrating)
  *   - Weather checks for outdoor play (!weather)
  *   - Scheduling matches via WhatsApp polls:
  *       - Fixed spots: "@tenbot create a poll for 2" (singles) or "@tenbot create a poll for 8" (doubles).
@@ -94,17 +95,20 @@ const SYSTEM_PROMPT =
   'conversational (1-3 sentences) unless asked for more detail. You have ' +
   "access to tools to create match polls (fixed-spot polls for 2 singles or 4/8/12 doubles, " +
   "or Yes/No opt-in polls when no number of players is specified), generate matchups from poll votes, " +
-  "check weather, cancel polls, and access the group's availability list, win/loss leaderboard, " +
+  "set/update player ratings, check weather, cancel polls, and access the group's availability list, win/loss leaderboard, " +
   'and active polls (given below). Multiple polls can be created for different times or by different users. ' +
   'Results can be reported to you in plain words ("Mike & Sara ' +
   'beat John & Alex 6-4", or "we won" right after a draw) and are logged automatically before ' +
   "you see the message, so don't claim you can't record scores. " +
+  'Initial ratings for new players are looked up from TennisRecord.com (defaulting to 3.49 if not found). ' +
+  'Users can also change their own rating by addressing you (e.g. "@tenbot my rating is 4.0" or "@tenbot set my rating to 3.5") -- ' +
+  'call the set_rating tool to update it. ' +
   'If the user asks to create a poll without specifying the number of players (e.g. "create a poll for tomorrow 9am"), ' +
   'call create_poll without size to create a Yes/No opt-in poll. For Yes/No polls, matchups are created when ' +
   'the user prompts to create/generate matchups (using generate_matchups). ' +
   'For fixed-spot polls, by default the user asking to create the poll is Player 1 ' +
   'unless they explicitly state they are not playing or they already have another match poll scheduled within 1 hour. ' +
-  'When a message contains a request to create a poll alongside other questions, call the create_poll tool and answer the other questions naturally.';
+  'When a message contains a request alongside other questions, execute the appropriate tools and answer naturally.';
 
 // Tools exposed to Claude for handling natural language requests
 const CLAUDE_TOOLS = [
@@ -143,6 +147,24 @@ const CLAUDE_TOOLS = [
     input_schema: {
       type: 'object',
       properties: {}
+    }
+  },
+  {
+    name: 'set_rating',
+    description: 'Sets or updates the rating for the user who sent the message (or for a named player if specified). Rating must be a number between 2.5 and 4.5.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        rating: {
+          type: 'number',
+          description: 'The rating value to set (between 2.5 and 4.5, e.g. 3.0, 3.5, 4.0, 4.25).'
+        },
+        player: {
+          type: 'string',
+          description: 'Optional player name. If omitted, updates the sender\'s rating.'
+        }
+      },
+      required: ['rating']
     }
   },
   {
@@ -706,6 +728,16 @@ async function executeTool(sock, chatId, sender, toolUse, msg) {
     const res = await generateMatchupsFromPoll(sock, chatId);
     return res || 'Matchups generated and posted.';
   }
+  if (name === 'set_rating') {
+    const newRating = input.rating;
+    const targetPlayer = input.player || (sender !== 'Someone' ? sender : (msg?.key?.participant ? nameFor(msg.key.participant) : null));
+    if (!targetPlayer) return 'Could not identify player to update rating for.';
+    if (typeof newRating !== 'number' || newRating < ratings.MIN_RATING || newRating > ratings.MAX_RATING) {
+      return `Rating must be a number between ${ratings.MIN_RATING} and ${ratings.MAX_RATING}.`;
+    }
+    const updated = ratings.setRating(targetPlayer, newRating);
+    return `Updated rating for ${targetPlayer} to ${ratings.formatRating(updated)}.`;
+  }
   if (name === 'get_weather') {
     const location = input.location || DEFAULT_LOCATION;
     try {
@@ -777,6 +809,18 @@ async function getResponse(sock, text, chatId, sender, msg) {
 
   if (lower === '!leaderboard') {
     return formatLeaderboard();
+  }
+
+  // --- Ratings & manual rating updates ---
+  if (lower.startsWith('!myrating') || lower.startsWith('!setrating')) {
+    const valStr = text.replace(/^!(?:myrating|setrating)\s*/i, '').trim();
+    const val = parseFloat(valStr);
+    if (Number.isNaN(val) || val < ratings.MIN_RATING || val > ratings.MAX_RATING) {
+      return `Please provide a valid rating between ${ratings.MIN_RATING} and ${ratings.MAX_RATING}, e.g. "!setrating 3.5" or "${TRIGGER_PREFIX} set my rating to 4.0".`;
+    }
+    const targetPlayer = sender !== 'Someone' ? sender : (msg?.key?.participant ? nameFor(msg.key.participant) : 'Player');
+    const updated = ratings.setRating(targetPlayer, val);
+    return `Updated rating for ${targetPlayer} to ${ratings.formatRating(updated)}.`;
   }
 
   if (lower === '!ratings') {
@@ -873,6 +917,7 @@ function helpText() {
     `  (or tell me in words: "${TRIGGER_PREFIX} Mike & Sara beat John & Alex 6-4", or "${TRIGGER_PREFIX} we won" after a draw – no score means 6-3)`,
     '!leaderboard – show the win/loss leaderboard',
     '!ratings – show player ratings used to balance the courts',
+    `!setrating <rating> (or ${TRIGGER_PREFIX} my rating is <rating>) – set or update your rating (${ratings.MIN_RATING}–${ratings.MAX_RATING})`,
     '!weather [location] – forecast for outdoor play (defaults to ' + DEFAULT_LOCATION + ')',
     `${TRIGGER_PREFIX} create a poll [for <N>] – post a match poll (N spots for singles/doubles, or Yes/No opt-in if N is omitted)`,
     '!matchups (or !draw, !rematch) – generate matchups from Yes votes in an opt-in poll, or re-draw a completed poll',
@@ -880,7 +925,7 @@ function helpText() {
     '!pollstatus – debug: show raw vote count and voters for active poll(s)',
     '!cleanuppolls – debug: force a sweep that deletes expired/completed polls now',
     '!reset – clear the bot\'s conversation memory',
-    TRIGGER_PREFIX ? `${TRIGGER_PREFIX} <question> – ask the bot anything (including free-form poll creation and questions)` : '(bot also responds to any message)'
+    TRIGGER_PREFIX ? `${TRIGGER_PREFIX} <question> – ask the bot anything (including setting rating, poll creation, and questions)` : '(bot also responds to any message)'
   ].join('\n');
 }
 
@@ -1079,7 +1124,7 @@ function handleFreeformScore(candidates, chatId, sender) {
 function formatRatings() {
   const board = ratings.getAllRatings();
   if (board.length === 0) {
-    return `Nobody's rated yet -- everyone starts at ${ratings.formatRating(ratings.INITIAL_RATING)} once they play a poll or a score is recorded.`;
+    return `Nobody's rated yet -- everyone starts from their TennisRecord rating (or ${ratings.formatRating(ratings.INITIAL_RATING)}) once they play a poll or set their rating.`;
   }
   const lines = board.map((p, i) => `${i + 1}. ${p.name} — ${ratings.formatRating(p.rating)}`);
   return `📊 Player ratings (${ratings.formatRating(ratings.MIN_RATING)}–${ratings.formatRating(ratings.MAX_RATING)}):\n${lines.join('\n')}`;
@@ -1400,7 +1445,7 @@ async function processPollVoteEvent(sock, pollMessageKey, rawPollUpdates) {
 
     console.log(`[poll] Poll ${pollId} filled -- posting matchups for: ${players.join(', ')}`);
 
-    ratings.ensureRated(players);
+    await ratings.ensureRated(players);
     const schedule = generateMatchups(players);
     const header = pollState.when ? `📅 ${pollState.when}\n\n` : '';
     await sock.sendMessage(pollState.remoteJid, { text: header + formatMatchups(schedule) });
@@ -1511,7 +1556,7 @@ async function generateMatchupsFromPoll(sock, chatId) {
 
     console.log(`[poll] Generating matchups for opt-in poll ${targetPollId} with ${players.length} Yes voter(s): ${players.join(', ')}`);
 
-    ratings.ensureRated(players);
+    await ratings.ensureRated(players);
     const schedule = generateMatchups(players);
     const header = targetPollState.when ? `📅 ${targetPollState.when}\n\n` : '';
     await sock.sendMessage(targetPollState.remoteJid, { text: header + formatMatchups(schedule) });
@@ -1523,7 +1568,7 @@ async function generateMatchupsFromPoll(sock, chatId) {
 
   // Fixed-size poll with lastPlayers
   if (targetPollState.lastPlayers) {
-    ratings.ensureRated(targetPollState.lastPlayers);
+    await ratings.ensureRated(targetPollState.lastPlayers);
     const schedule = generateMatchups(targetPollState.lastPlayers);
     const header = targetPollState.when ? `📅 ${targetPollState.when}\n\n` : '';
     await sock.sendMessage(targetPollState.remoteJid, { text: header + formatMatchups(schedule) });

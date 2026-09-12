@@ -1,10 +1,10 @@
-# Tennis Group Bot (Baileys edition)
+# Tennis Group Bot
 
-A WhatsApp bot for a tennis group, built with [Baileys](https://github.com/WhiskeySockets/Baileys). It coordinates who's free to play, schedules daily matches with a WhatsApp poll (auto-generating doubles matchups once it fills up), tracks match results and a leaderboard, checks weather for outdoor play, and answers general questions using Claude.
+A WhatsApp bot for a tennis group. It coordinates who's free to play, schedules daily matches with a WhatsApp poll (auto-generating doubles matchups once it fills up), tracks match results and a leaderboard, checks weather for outdoor play, and answers general questions using Claude. It uses [Baileys](https://github.com/WhiskeySockets/Baileys) for WhatsApp integration.
 
-## Why Baileys instead of whatsapp-web.js
+# Development
 
-Baileys connects to WhatsApp directly over a WebSocket — no headless browser or Puppeteer involved — so it doesn't depend on scraping WhatsApp Web's internal (frequently-changing) JavaScript the way `whatsapp-web.js` does. It's still an **unofficial** client, so the usual caveat applies: you're automating a real personal WhatsApp account, which is against WhatsApp's Terms of Service. Fine for light personal/group use, but avoid high-volume/spammy behavior.
+Directed by Pramod Immaneni with AI actors Antigravity & Claude and supporting crew SCVCC Early Morning Tennis Group.
 
 ## Setup
 
