@@ -6,9 +6,8 @@ A WhatsApp bot for a tennis group. It coordinates who's free to play, schedules 
 
 Authors:
 
-Pramod Immaneni <pramod.immaneni@gmail.com>
-Google Antigravity
-Anthropic Claude
+* Pramod Immaneni <pramod.immaneni@gmail.com>
+* Google Antigravity, Anthropic Claude
 
 ## Setup
 
@@ -28,7 +27,7 @@ Anthropic Claude
    - Time resolution is anchored to San Jose, CA (`America/Los_Angeles` / Pacific Time).
 
 4. **Confirm your target group name**
-   - `TARGET_GROUP_NAME` in `index.js` is set to `"Bot-testing"` (or your group name in production) — the bot only listens in a group with that exact name.
+   - `TARGET_GROUP_NAME` in `index.js` is set to `"SCVCC Early Morning Tennis Group (that usually plays in the evenings!)"` (or your group name in production) — the bot only listens in a group with that exact name.
    - Scan the QR code that appears in your terminal (WhatsApp app → Settings → Linked Devices → Link a Device).
    - If you rename the group or want to point at a different one, set `TARGET_GROUP_NAME` to `null`, restart, and send any message in the group you want — its name prints to the console — then copy that exact name back into `index.js`.
 
@@ -78,6 +77,13 @@ You can include a day and/or time in your request:
 
 Multiple polls can be created concurrently for different times or by different members.
 * **1-Hour Window Check**: If an active match poll already exists within **1 hour** of a new poll's start time that includes the creator, the bot creates the new poll with **all slots open** (`Player 1` .. `Player <N>`) rather than auto-assigning the creator as Player 1.
+
+---
+
+## Poll Deletion & Modifications on WhatsApp
+
+* **Cancelling / Deleting Polls**: When a poll is cancelled via `!cancelpoll` / `!deletepoll` or by asking `@tenbot cancel the poll` / `@tenbot delete the poll`, the bot cancels the poll internally and **deletes the poll message directly from WhatsApp**.
+* **Modifying Polls**: If a user requests changes to an existing poll (e.g. changing the number of spots, day, or time), the bot creates the updated poll and automatically **deletes the older poll message from WhatsApp**.
 
 ---
 
@@ -147,7 +153,7 @@ Results can be logged using `!score` or in plain conversational text addressed t
 | `!ratings` | Shows all player ratings, strongest first |
 | `!setrating <rating>` | Sets or updates your player rating (`2.50`–`4.50`), e.g. `!setrating 4.0` |
 | `!matchups` / `!draw` / `!rematch` | Generates matchups from Yes votes in an opt-in poll, or re-draws an existing match |
-| `!cancelpoll` | Cancels the active poll |
+| `!cancelpoll` / `!deletepoll` | Cancels the active poll and deletes the poll message from WhatsApp |
 | `!pollstatus` | Debug: shows raw vote tallies and voter lists for active polls |
 | `!cleanuppolls` | Debug: removes expired/completed polls |
 | `!weather [location]` | 3-day forecast for outdoor play (defaults to San Jose, CA) |

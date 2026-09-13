@@ -14,6 +14,8 @@
  *       - Opt-in (Yes/No): "@tenbot create a poll for tomorrow 9am" (no size specified). Creates a
  *         Yes/No poll. The bot waits for a user prompt ("@tenbot generate matchups" or "!matchups")
  *         to create matchups for players who voted Yes.
+ *       - Poll deletions & modifications: When cancelling/deleting a poll or modifying/replacing a poll,
+ *         the bot also deletes the older poll message directly from WhatsApp.
  *   - General questions, answered by Claude with live group context (@tenbot ...)
  *
  * Setup:
@@ -95,7 +97,7 @@ const SYSTEM_PROMPT =
   'conversational (1-3 sentences) unless asked for more detail. You have ' +
   "access to tools to create match polls (fixed-spot polls for 2 singles or 4/8/12 doubles, " +
   "or Yes/No opt-in polls when no number of players is specified), generate matchups from poll votes, " +
-  "set/update player ratings, check weather, cancel polls, and access the group's availability list, win/loss leaderboard, " +
+  "set/update player ratings, check weather, cancel/delete polls, and access the group's availability list, win/loss leaderboard, " +
   'and active polls (given below). Multiple polls can be created for different times or by different users. ' +
   'Results can be reported to you in plain words ("Mike & Sara ' +
   'beat John & Alex 6-4", or "we won" right after a draw) and are logged automatically before ' +
@@ -110,6 +112,10 @@ const SYSTEM_PROMPT =
   'If the user asks to create a poll without specifying the number of players (e.g. "create a poll for tomorrow 9am"), ' +
   'call create_poll without size to create a Yes/No opt-in poll. For Yes/No polls, matchups are created when ' +
   'the user prompts to create/generate matchups (using generate_matchups). ' +
+  'When cancelling or deleting a poll upon user request (e.g. "@tenbot cancel poll" or "@tenbot delete poll"), ' +
+  'call cancel_poll, which will also delete the poll message from WhatsApp. ' +
+  'If the user requests changes to an existing poll (e.g. changing the time, number of players, or day) and a new poll is created, ' +
+  'set cancelExisting: true (or pass replacePollId) in create_poll so the older poll is automatically deleted from WhatsApp and replaced. ' +
   'For fixed-spot polls, by default the user asking to create the poll is Player 1 ' +
   'unless they explicitly state they are not playing or they already have another match poll scheduled within 1 hour. ' +
   'When a message contains a request alongside other questions, execute the appropriate tools and answer naturally.';
@@ -118,7 +124,7 @@ const SYSTEM_PROMPT =
 const CLAUDE_TOOLS = [
   {
     name: 'create_poll',
-    description: 'Creates and sends a WhatsApp poll for organizing a tennis match in the group. If size is specified (2 for singles, 4/8/12 for doubles), creates numbered slot spots where creator is Player 1 by default. If size is omitted or not specified, creates an opt-in poll with only two options (Yes and No) where players vote Yes to opt in. Note: users are in San Jose, CA (Pacific Time). If both day and time are given and in the past, poll creation is rejected. If only a time in the past is given without a day, the match is scheduled for tomorrow at that time.',
+    description: 'Creates and sends a WhatsApp poll for organizing a tennis match in the group. If size is specified (2 for singles, 4/8/12 for doubles), creates numbered slot spots where creator is Player 1 by default. If size is omitted or not specified, creates an opt-in poll with only two options (Yes and No) where players vote Yes to opt in. Note: users are in San Jose, CA (Pacific Time). If both day and time are given and in the past, poll creation is rejected. If only a time in the past is given without a day, the match is scheduled for tomorrow at that time. If modifying/replacing an existing poll, set cancelExisting to true to delete the older poll from WhatsApp.',
     input_schema: {
       type: 'object',
       properties: {
@@ -141,6 +147,14 @@ const CLAUDE_TOOLS = [
         includeCreator: {
           type: 'boolean',
           description: 'Whether the user requesting the fixed-spot poll is playing in it. Defaults to true unless the user explicitly mentions they are not playing.'
+        },
+        cancelExisting: {
+          type: 'boolean',
+          description: 'Set to true if user requested changes to the current poll or is replacing an existing active poll. Deletes the older poll from WhatsApp.'
+        },
+        replacePollId: {
+          type: 'string',
+          description: 'Optional poll ID of an older/existing poll to cancel and delete from WhatsApp when creating this new poll.'
         }
       }
     }
@@ -186,10 +200,15 @@ const CLAUDE_TOOLS = [
   },
   {
     name: 'cancel_poll',
-    description: 'Cancels the active match poll so the bot stops tracking and auto-generating matchups.',
+    description: 'Cancels the active match poll and deletes the poll message from WhatsApp.',
     input_schema: {
       type: 'object',
-      properties: {}
+      properties: {
+        pollId: {
+          type: 'string',
+          description: 'Optional specific poll ID to cancel and delete. If omitted, cancels the most recent active poll in this chat.'
+        }
+      }
     }
   },
   {
@@ -495,6 +514,37 @@ function safeDecryptPollVote(votePayload, pollMsgId, pollEncKey, pollCreatorCand
 }
 
 /**
+ * Deletes a poll message directly from WhatsApp for everyone in the chat.
+ */
+async function deletePollFromWhatsApp(sock, remoteJid, pollId) {
+  if (!sock || !remoteJid || !pollId) return;
+  try {
+    const key = {
+      remoteJid,
+      fromMe: true,
+      id: pollId
+    };
+    await sock.sendMessage(remoteJid, { delete: key });
+    console.log(`[poll] Deleted poll message ${pollId} from WhatsApp chat ${remoteJid}`);
+  } catch (err) {
+    console.error(`[poll] Failed to delete poll message ${pollId} from WhatsApp:`, err.message);
+  }
+}
+
+/**
+ * Cancels a poll internally and deletes the poll message from WhatsApp.
+ */
+async function cancelOrDeletePoll(sock, remoteJid, pollId) {
+  if (!pollId) return;
+  const pollState = activePolls.get(pollId);
+  if (pollState) {
+    pollState.status = 'cancelled';
+    persistPolls();
+  }
+  await deletePollFromWhatsApp(sock, remoteJid, pollId);
+}
+
+/**
  * Deletes any poll whose scheduled play time (plus grace period) has
  * passed, regardless of whether it ended up resolved, cancelled, or just
  * never filled up. Runs once at startup (to clear anything stale from
@@ -710,23 +760,26 @@ async function executeTool(sock, chatId, sender, toolUse, msg) {
     const dayWord = input.dayWord || null;
     const timeWord = input.timeWord || null;
     const includeCreator = input.includeCreator !== false;
+    const cancelExisting = input.cancelExisting === true;
+    const replacePollId = input.replacePollId || null;
     const creatorName = sender !== 'Someone' ? sender : (msg?.key?.participant ? nameFor(msg.key.participant) : 'Player 1');
     const creatorJid = msg?.key?.participant || msg?.key?.remoteJid || null;
 
-    const res = await createMatchPoll(sock, chatId, size, when, dayWord, timeWord, creatorName, creatorJid, includeCreator);
+    const res = await createMatchPoll(sock, chatId, size, when, dayWord, timeWord, creatorName, creatorJid, includeCreator, replacePollId, cancelExisting);
     if (res?.err) {
       return `Could not create poll: ${res.err}`;
     }
     const resolvedWhen = res?.when ? ` for ${res.when}` : (when ? ` for ${when}` : '');
+    const replacedNote = res?.replacedOldPoll ? ' (older poll deleted from WhatsApp)' : '';
     if (res?.isOptIn) {
-      return `Opt-in poll created with "Yes" and "No" options${resolvedWhen}. Players can vote "Yes" to opt in. When ready, ask me to generate the matchups!`;
+      return `Opt-in poll created with "Yes" and "No" options${resolvedWhen}${replacedNote}. Players can vote "Yes" to opt in. When ready, ask me to generate the matchups!`;
     }
     if (res?.includedCreator) {
       const needed = size - 1;
-      return `Poll for ${size} spots (${size === 2 ? 'Singles' : 'Doubles'}${resolvedWhen}) created with ${creatorName} as Player 1 (${needed} spot(s) to vote on: Player 2..Player ${size}).`;
+      return `Poll for ${size} spots (${size === 2 ? 'Singles' : 'Doubles'}${resolvedWhen}${replacedNote}) created with ${creatorName} as Player 1 (${needed} spot(s) to vote on: Player 2..Player ${size}).`;
     } else {
       const note = res?.reason ? ` (${res.reason}, so not automatically added as Player 1)` : '';
-      return `Poll for ${size} spots (${size === 2 ? 'Singles' : 'Doubles'}${resolvedWhen}) created with all ${size} spot(s) open to vote on: Player 1..Player ${size}${note}.`;
+      return `Poll for ${size} spots (${size === 2 ? 'Singles' : 'Doubles'}${resolvedWhen}${replacedNote}) created with all ${size} spot(s) open to vote on: Player 1..Player ${size}${note}.`;
     }
   }
   if (name === 'generate_matchups' || name === 'rematch') {
@@ -753,20 +806,21 @@ async function executeTool(sock, chatId, sender, toolUse, msg) {
     }
   }
   if (name === 'cancel_poll') {
-    let targetPollId = null;
-    for (const [pollId, pollState] of [...activePolls.entries()].reverse()) {
-      if (pollState.remoteJid === chatId && pollState.status === 'active') {
-        targetPollId = pollId;
-        break;
+    let targetPollId = input.pollId || null;
+    if (!targetPollId) {
+      for (const [pollId, pollState] of [...activePolls.entries()].reverse()) {
+        if (pollState.remoteJid === chatId && pollState.status === 'active') {
+          targetPollId = pollId;
+          break;
+        }
       }
     }
     if (!targetPollId) {
       targetPollId = latestPollIdByChat.get(chatId);
     }
     if (!targetPollId || !activePolls.has(targetPollId)) return 'No active poll to cancel.';
-    activePolls.get(targetPollId).status = 'cancelled';
-    persistPolls();
-    return 'Poll cancelled successfully.';
+    await cancelOrDeletePoll(sock, chatId, targetPollId);
+    return 'Poll cancelled and deleted from WhatsApp successfully.';
   }
   return `Unknown tool ${name}`;
 }
@@ -845,7 +899,7 @@ async function getResponse(sock, text, chatId, sender, msg) {
   }
 
   // --- Poll management ---
-  if (lower === '!cancelpoll') {
+  if (lower === '!cancelpoll' || lower === '!deletepoll') {
     let targetPollId = null;
     for (const [pollId, pollState] of [...activePolls.entries()].reverse()) {
       if (pollState.remoteJid === chatId && pollState.status === 'active') {
@@ -857,9 +911,8 @@ async function getResponse(sock, text, chatId, sender, msg) {
       targetPollId = latestPollIdByChat.get(chatId);
     }
     if (!targetPollId || !activePolls.has(targetPollId)) return 'No active poll to cancel.';
-    activePolls.get(targetPollId).status = 'cancelled';
-    persistPolls();
-    return 'Poll cancelled -- I won\'t auto-generate matchups from it anymore.';
+    await cancelOrDeletePoll(sock, chatId, targetPollId);
+    return 'Poll cancelled and deleted from WhatsApp -- I won\'t auto-generate matchups from it anymore.';
   }
 
   if (lower === '!rematch' || lower === '!matchups' || lower === '!draw') {
@@ -926,7 +979,7 @@ function helpText() {
     '!weather [location] – forecast for outdoor play (defaults to ' + DEFAULT_LOCATION + ')',
     `${TRIGGER_PREFIX} create a poll [for <N>] – post a match poll (N spots for singles/doubles, or Yes/No opt-in if N is omitted)`,
     '!matchups (or !draw, !rematch) – generate matchups from Yes votes in an opt-in poll, or re-draw a completed poll',
-    '!cancelpoll – stop the current poll from auto-generating matchups',
+    '!cancelpoll (or !deletepoll) – stop and delete the active poll from WhatsApp',
     '!pollstatus – debug: show raw vote count and voters for active poll(s)',
     '!cleanuppolls – debug: force a sweep that deletes expired/completed polls now',
     '!reset – clear the bot\'s conversation memory',
@@ -1143,8 +1196,9 @@ function formatRatings() {
  *   ("Player 2" .. "Player <size>" with creator as Player 1 by default).
  * - If size is omitted (null/undefined), creates an opt-in poll with only two options:
  *   "Yes" and "No". The bot then waits for a user prompt to generate matchups from Yes voters.
+ * - If replacePollId or cancelExisting is specified, deletes the older poll from WhatsApp.
  */
-async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWord = null, timeWord = null, creatorName = null, creatorJid = null, includeCreator = true) {
+async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWord = null, timeWord = null, creatorName = null, creatorJid = null, includeCreator = true, replacePollId = null, cancelExisting = false) {
   const isOptIn = !size;
 
   if (size !== null && size !== undefined) {
@@ -1180,6 +1234,21 @@ async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWor
     return {
       err: `The specified time (${specifiedStr}) has already passed. Please specify an upcoming day or time to create the poll.`
     };
+  }
+
+  // If replacing an existing poll or user requested modifications, delete older poll from WhatsApp
+  let replacedOldPoll = false;
+  if (replacePollId && activePolls.has(replacePollId)) {
+    await cancelOrDeletePoll(sock, remoteJid, replacePollId);
+    replacedOldPoll = true;
+  } else if (cancelExisting) {
+    for (const [pollId, pollState] of [...activePolls.entries()].reverse()) {
+      if (pollState.remoteJid === remoteJid && pollState.status === 'active') {
+        await cancelOrDeletePoll(sock, remoteJid, pollId);
+        replacedOldPoll = true;
+        break;
+      }
+    }
   }
 
   // If time rolled over to tomorrow and when doesn't mention tomorrow or day name, adjust when
@@ -1274,7 +1343,7 @@ async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWor
   persistPolls();
   console.log(`[poll] Created poll ${pollId} (${isOptIn ? 'Yes/No opt-in' : `${size} spots`}, creator: ${shouldIncludeCreator ? (creatorName || 'Player 1') : 'none (not included)'}) in ${remoteJid}${resolvedWhen ? ` (${resolvedWhen})` : ''}, play time ${playAt.toISOString()}`);
 
-  return { err: null, isOptIn, size, when: resolvedWhen, includedCreator: shouldIncludeCreator, reason: excludedReason };
+  return { err: null, isOptIn, size, when: resolvedWhen, includedCreator: shouldIncludeCreator, reason: excludedReason, replacedOldPoll };
 }
 
 /**
