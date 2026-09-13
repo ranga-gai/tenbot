@@ -4,7 +4,10 @@ A WhatsApp bot for a tennis group. It coordinates who's free to play, schedules 
 
 # Development
 
-Directed by Pramod Immaneni with AI actors Antigravity & Claude and supporting crew SCVCC Early Morning Tennis Group.
+Authors:
+
+* Pramod Immaneni <pramod.immaneni@gmail.com>
+* Google Antigravity, Anthropic Claude
 
 ## Setup
 

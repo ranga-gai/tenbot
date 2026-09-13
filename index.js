@@ -80,8 +80,8 @@ const { resolvePlayDateTime, getSanJoseNow } = require('./lib/pollTime');
 // Set this to the exact group name (subject) you want the bot to listen to.
 // Leave as null to have the bot log every group name/ID it sees, so you can
 // find the right one.
-//const TARGET_GROUP_NAME = 'SCVCC Early Morning Tennis Group (that usually plays in the evenings!)';
-const TARGET_GROUP_NAME = 'Bot-testing';
+const TARGET_GROUP_NAME = 'SCVCC Early Morning Tennis Group (that usually plays in the evenings!)';
+//const TARGET_GROUP_NAME = 'Bot-testing';
 
 // Only call the LLM when the bot is directly addressed (recommended for
 // groups, otherwise it'll try to reply to every single message). Structured
@@ -533,7 +533,7 @@ async function handleDirectPollCreation(sock, chatId, sender, msg, parsed) {
 
 /**
  * Checks whether an incoming message is addressed to the bot, matching any case
- * variation of TRIGGER_PREFIX (e.g. @tenbot, @Tenbot, @TENBOT, @TenBot, tenbot),
+ * variation of TRIGGER_PREFIX (e.g. @tenbot, @Tenbot, @TENBOT, @TenBot - must start with @),
  * optional punctuation (colons, commas), or WhatsApp native @-mentions.
  */
 function isAddressedToBot(text, msg, botJids, triggerPrefix = TRIGGER_PREFIX) {
@@ -543,8 +543,8 @@ function isAddressedToBot(text, msg, botJids, triggerPrefix = TRIGGER_PREFIX) {
   const isDirectlyMentioned = mentionedJids.some((jid) => botJids.includes(jidNormalizedUser(jid)));
 
   const baseName = escapeRegex(triggerPrefix.replace(/^@/, ''));
-  const prefixRegex = new RegExp(`^@?${baseName}[:,]?\\s*`, 'i');
-  const anywhereRegex = new RegExp(`@?${baseName}[:,]?\\b`, 'ig');
+  const prefixRegex = new RegExp(`^@${baseName}[:,]?\\s*`, 'i');
+  const anywhereRegex = new RegExp(`@${baseName}[:,]?\\b`, 'ig');
 
   if (prefixRegex.test(text)) {
     const promptText = text.replace(prefixRegex, '').trim();
@@ -569,15 +569,11 @@ function isAddressedToBot(text, msg, botJids, triggerPrefix = TRIGGER_PREFIX) {
 /**
  * Removes a leading TRIGGER_PREFIX and nothing else, so "@tenbot Mike beat
  * John 6-4" can be read as a result while an occurrence further in stays put.
- *
- * That distinction matters here because a player is named "tenbot":
- * isAddressedToBot strips the trigger wherever it appears, which is right for
- * a question but would quietly delete a player from a result.
  */
 function stripLeadingTrigger(text) {
   if (!TRIGGER_PREFIX) return text;
   const baseName = escapeRegex(TRIGGER_PREFIX.replace(/^@/, ''));
-  return text.replace(new RegExp(`^@?${baseName}[:,]?\\s*`, 'i'), '').trim();
+  return text.replace(new RegExp(`^@${baseName}[:,]?\\s*`, 'i'), '').trim();
 }
 
 /**
@@ -1329,19 +1325,19 @@ async function getResponse(sock, text, chatId, sender, msg) {
     return pollStatusText(chatId);
   }
 
-  // --- Trigger check for bot-addressed messages (case-insensitive, with/without @, native mentions) ---
+  // --- Trigger check for bot-addressed messages (case-insensitive, requiring @, or native WhatsApp mentions) ---
   const mePn = jidNormalizedUser(sock?.user?.id || sock?.authState?.creds?.me?.id || '');
   const meLid = jidNormalizedUser(sock?.user?.lid || sock?.authState?.creds?.me?.lid || '');
   const botJids = [mePn, meLid].filter(Boolean);
 
   const { addressed, promptText } = isAddressedToBot(text, msg, botJids);
   if (TRIGGER_PREFIX && !addressed) {
-    return null; // not addressed to the bot, stay quiet
+    return null; // not addressed to the bot with @, stay quiet
   }
   if (!promptText) return null;
 
   // --- Direct Poll Creation Request (handled directly without LLM) ---
-  const directPollParsed = parsePollCreationText(promptText) || parsePollCreationText(text);
+  const directPollParsed = parsePollCreationText(promptText);
   if (directPollParsed) {
     return await handleDirectPollCreation(sock, chatId, sender, msg, directPollParsed);
   }
@@ -1911,7 +1907,7 @@ async function processPollVoteEvent(sock, pollMessageKey, rawPollUpdates) {
     const yesOption = aggregated.find((o) => /^yes$/i.test(o.name.trim()));
     const noOption = aggregated.find((o) => /^no$/i.test(o.name.trim()));
     const yesCount = yesOption ? yesOption.voters.length : 0;
-    const noCount = noOption ? noOption.voters.length : 0;
+    const noCount = noOption ? noOpt.voters.length : 0;
     console.log(`[poll] Opt-in poll ${pollId}: ${yesCount} Yes vote(s), ${noCount} No vote(s) recorded.`);
     return;
   }
