@@ -1,13 +1,10 @@
 # Tennis Group Bot
 
-A WhatsApp bot for a tennis group. It coordinates who's free to play, schedules matches with WhatsApp polls (auto-generating singles/doubles matchups and rotations, or opt-in Yes/No polls), tracks match results and a leaderboard, syncs player ratings from TennisRecord, checks weather for outdoor play, and answers general questions using Claude. It uses [Baileys](https://github.com/WhiskeySockets/Baileys) for WhatsApp integration.
+A WhatsApp bot for a tennis group. It coordinates who's free to play, schedules matches with WhatsApp polls (auto-generating singles/doubles matchups and rotations, or opt-in Yes/No polls), passively tracks user-created manual tennis match polls, tracks match results and a leaderboard, syncs player ratings from TennisRecord, checks weather for outdoor play, and answers general questions using Claude. It uses [Baileys](https://github.com/WhiskeySockets/Baileys) for WhatsApp integration.
 
 # Development
 
-Authors:
-
-* Pramod Immaneni <pramod.immaneni@gmail.com>
-* Google Antigravity, Anthropic Claude
+Directed by Pramod Immaneni with AI actors Antigravity & Claude and supporting crew SCVCC Early Morning Tennis Group.
 
 ## Setup
 
@@ -27,7 +24,7 @@ Authors:
    - Time resolution is anchored to San Jose, CA (`America/Los_Angeles` / Pacific Time).
 
 4. **Confirm your target group name**
-   - `TARGET_GROUP_NAME` in `index.js` is set to `"SCVCC Early Morning Tennis Group (that usually plays in the evenings!)"` (or your group name in production) — the bot only listens in a group with that exact name.
+   - `TARGET_GROUP_NAME` in `index.js` is set to `"Bot-testing"` (or your group name in production) — the bot only listens in a group with that exact name.
    - Scan the QR code that appears in your terminal (WhatsApp app → Settings → Linked Devices → Link a Device).
    - If you rename the group or want to point at a different one, set `TARGET_GROUP_NAME` to `null`, restart, and send any message in the group you want — its name prints to the console — then copy that exact name back into `index.js`.
 
@@ -40,7 +37,7 @@ Authors:
 
 ## Scheduling matches with polls
 
-The bot supports two types of match polls:
+The bot supports bot-created match polls as well as user-created manual match polls:
 
 ### 1. Fixed-Spot Polls (Singles & Doubles)
 Send `@tenbot create a poll for 8` (or 2 for singles, 4, 12, etc. — any multiple of 4 for doubles).
@@ -55,6 +52,17 @@ If no number of players is specified (e.g. `@tenbot create a poll for tomorrow 9
 - Since the total number of players is not fixed ahead of time, the bot waits for a user prompt to generate matchups.
 - When ready, say `@tenbot generate matchups` (or `!matchups`, `!draw`, `!rematch`), and the bot generates singles (for 2 Yes voters) or doubles rotations (for 4, 8, 12... Yes voters), ignoring anyone who voted "No".
 
+### 3. Manually Created Tennis Match Polls (Passive Tracking & Creator Inclusion)
+If a poll for scheduling matches is created manually by a user directly in WhatsApp:
+- The bot **passively tracks** the match poll and its votes without making any changes to the poll or sending slot conflict warnings.
+- The bot **will not automatically create matchups** when the poll is filled.
+- The bot answers questions about the poll (e.g. `@tenbot who has voted for Saturday's poll?`, `@tenbot who is playing?`, `@tenbot how many spots left?`).
+- **Creator Inclusion & Player Count Resolution**: When answering who is playing (both while voting is in progress before all votes are in, and when voting is completed) or when generating matchups, if the number of players who have voted does not meet a valid total player count configuration (2 for singles, or a multiple of 4 for doubles), the bot **includes the creator of the poll as one of the players**.
+- **Matchup Generation on Demand**: If and only if users explicitly ask to create matchups on a manually created match poll (e.g. `@tenbot generate matchups`, `!matchups`, or `!draw`), the bot generates matchups using the exact same rules as bot-created polls.
+
+### 4. Non-Match / General Polls
+- Polls not related to tennis match scheduling (e.g. dinner options, ball brands, social plans) are **ignored completely and not tracked**.
+
 ---
 
 ## Time & Date Handling (San Jose, CA)
@@ -68,28 +76,29 @@ You can include a day and/or time in your request:
 
 * **Timezone**: All times are resolved in San Jose, California (Pacific Time).
 * **Past Day + Time Rejection**: If both a day and time are specified (e.g. `@tenbot create a poll for today at 9am` or `@tenbot create a poll for Saturday 9am` when it is Saturday evening) and that time has already passed, the bot **will not create the poll** and will ask the user to fix the day or time to an upcoming schedule.
-* **Past Time-Only Rollover**: If only a time is specified without a day (e.g. `@tenbot create a poll for 9am` requested in the evening), and that time has already passed today, the bot automatically schedules the poll for **the next day at that time** (`Tomorrow 9am`).
+* **Past Time-Only Rollover**: If only a start time was specified for creating the poll and the current time is greater than the start time, the bot automatically creates the poll for **the next day with that start time** (`Tomorrow <time>`).
 * **Time formatting**: Times require an `am`/`pm` (e.g. `9am`, `6:30pm`, `7pm`). Day names (`today`, `tomorrow`, `tonight`, or `Monday`–`Sunday`) are recognized case-insensitively.
 
 ---
 
-## Multiple Polls & 1-Hour Conflict Protection
+## Multiple Polls & 90-Minute Window Protection
 
 Multiple polls can be created concurrently for different times or by different members.
-* **1-Hour Window Check**: If an active match poll already exists within **1 hour** of a new poll's start time that includes the creator, the bot creates the new poll with **all slots open** (`Player 1` .. `Player <N>`) rather than auto-assigning the creator as Player 1.
+* **90-Minute Separation**: If the same creator has other polls but the new poll's start time is **90 minutes or more** from other polls' start times, the bot creates the poll directly without requiring extra confirmation and includes the creator as Player 1.
+* **Conflict Window (< 90 minutes)**: If an active match poll already exists within **less than 90 minutes** of a new poll's start time that includes the creator, the bot creates the new poll with **all spots open** (`Player 1` .. `Player <N>`) rather than auto-assigning the creator as Player 1.
 
 ---
 
 ## Poll Deletion & Modifications on WhatsApp
 
 * **Cancelling / Deleting Polls**: When a poll is cancelled via `!cancelpoll` / `!deletepoll` or by asking `@tenbot cancel the poll` / `@tenbot delete the poll`, the bot cancels the poll internally and **deletes the poll message directly from WhatsApp**.
-* **Modifying Polls**: If a user requests changes to an existing poll (e.g. changing the number of spots, day, or time), the bot creates the updated poll and automatically **deletes the older poll message from WhatsApp**.
+* **Modifying Polls**: If a user requests changes to an existing poll (e.g. changing the number of spots, day, or time), the bot creates the updated poll and automatically **deletes the older poll message from WhatsApp**.\n* **Deleted in WhatsApp**: When a poll is deleted for everyone directly in the WhatsApp app (by the creator, an admin, or the bot), the bot listens for the revocation / deletion event across `messages.upsert`, `messages.update`, and `messages.delete`, and automatically clears it from active tracked polls and stored messages.
 
 ---
 
 ## Matchup Rotations & Court Balancing
 
-Once a fixed poll fills or an opt-in poll draw is requested:
+Once a fixed poll fills or an opt-in/manual poll draw is requested:
 
 ```
 🎾 All spots filled! Here are today's matchups:
@@ -107,7 +116,7 @@ Set 2:
 - **Rotations**: Lowest-repeat draws ensure players partner with different teammates each set and face different opponents.
 - **Freshness across weeks**: Past partnerships from the last 3 weeks are remembered in `pair-history.json` and weighted to avoid repeat pairings across sessions.
 - **Even courts**: The draw balances pairings so court rating sums are within **0.49** of each other.
-- **Slot Conflicts**: In fixed-spot polls, if multiple voters pick the same number, the bot alerts the group to switch slots before generating matchups.
+- **Slot Conflicts**: In bot fixed-spot polls, if multiple voters pick the same number, the bot alerts the group to switch slots before generating matchups.
 
 ---
 
@@ -130,43 +139,29 @@ Every player carries a rating between **2.50 and 4.50**, formatted to two decima
 Results can be logged using `!score` or in plain conversational text addressed to `@tenbot`:
 
 ```
-@tenbot Mike & Sara beat John & Alex 6-4 6-2   → recorded as written
-@tenbot John & Alex lost to Mike & Sara 6-4    → same result, sides swapped
-@tenbot Mike & Sara vs John & Alex 4-6 6-3     → neutral, winner parsed from score
-@tenbot Mike beat John                         → no score given, 6-3 assumed
-@tenbot Mike & Sara won                        → opponents filled in from today's draw
-@tenbot we beat John & Alex 6-1                → "we" resolves to sender and partner
+@tenbot Mike & Sara beat John & Alex 6-4
 ```
+or simply:
+```
+@tenbot we won 6-4
+```
+(If no score is mentioned, e.g. `@tenbot we won`, it logs a default 6-3 set).
 
 ---
 
-## Command Reference
+## Commands Summary
 
-| Command | What it does |
+| Command | Description |
 |---|---|
-| `!free <when>` | Marks you as free to play, e.g. `!free Sat 9am` |
-| `!free` | Shows everyone currently marked as free |
-| `!notfree` | Removes you from the availability list |
-| `!clearfree` | Clears the whole availability list |
-| `!score <winner> def <loser> <score>` | Records a match and updates ratings, e.g. `!score Mike & Sara def John & Alex 6-4 6-2` |
-| `!leaderboard` | Shows the win/loss leaderboard |
-| `!ratings` | Shows all player ratings, strongest first |
-| `!setrating <rating>` | Sets or updates your player rating (`2.50`–`4.50`), e.g. `!setrating 4.0` |
-| `!matchups` / `!draw` / `!rematch` | Generates matchups from Yes votes in an opt-in poll, or re-draws an existing match |
-| `!cancelpoll` / `!deletepoll` | Cancels the active poll and deletes the poll message from WhatsApp |
-| `!pollstatus` | Debug: shows raw vote tallies and voter lists for active polls |
-| `!cleanuppolls` | Debug: removes expired/completed polls |
-| `!weather [location]` | 3-day forecast for outdoor play (defaults to San Jose, CA) |
-| `!reset` | Clears the bot's conversation memory for the chat |
-| `!ping` / `!help` | Health check / command list |
-| `@tenbot <message>` | Ask anything — answered by Claude with live group, poll, and ratings context |
-
----
-
-## Data & Persistence
-
-- **Polls**: Tracked in `poll-state.json` and survives bot restarts.
-- **Availability & Leaderboard**: Saved in `data.json`.
-- **Pairing History**: Saved in `pair-history.json`.
-- **Ratings**: Saved in `ratings.json`.
-- **WhatsApp Session**: Stored in `auth_info_baileys/`.
+| `@tenbot create a poll for <N> [when]` | Create a fixed-spot poll with creator as Player 1 |
+| `@tenbot create a poll [when]` | Create a Yes/No opt-in poll |
+| `@tenbot generate matchups` / `!matchups` | Generate matchups from active poll (opt-in or manual) |
+| `@tenbot cancel poll` / `!cancelpoll` | Cancel active poll and delete poll message from WhatsApp |
+| `!free <when>` / `!notfree` / `!clearfree` | Manage casual player availability |
+| `!score <winner> def <loser> <score>` | Log match score and update ratings / leaderboard |
+| `!leaderboard` | View win/loss leaderboard |
+| `!ratings` / `!setrating <rating>` | View ratings or set your rating |
+| `!weather [location]` | View outdoor tennis weather forecast |
+| `!pollstatus` | Debug: inspect active polls and raw vote tally |
+| `!cleanuppolls` | Debug: sweep and remove expired polls |
+| `!reset` | Clear conversational chat memory |

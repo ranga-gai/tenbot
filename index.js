@@ -9,13 +9,24 @@
  *   - Scheduling matches via WhatsApp polls:
  *       - Fixed spots: "@tenbot create a poll for 2" (singles) or "@tenbot create a poll for 8" (doubles).
  *         The creator is automatically Player 1 (unless specified otherwise or if they already have
- *         another match poll within 1 hour), with votes starting from Player 2. Once all spots fill,
+ *         another match poll within less than 90 minutes), with votes starting from Player 2. Once all spots fill,
  *         the bot automatically posts singles/doubles matchups with rotations.
  *       - Opt-in (Yes/No): "@tenbot create a poll for tomorrow 9am" (no size specified). Creates a
  *         Yes/No poll. The bot waits for a user prompt ("@tenbot generate matchups" or "!matchups")
  *         to create matchups for players who voted Yes.
+ *       - Direct Message Handling: Poll creation requests (e.g. "@tenbot create a poll for 4 tomorrow 9am",
+ *         "@tenbot create a poll for 6am", "@tenbot create a poll for 10:30am for 4", "!createpoll 4 today 6pm")
+ *         are parsed and handled directly by deterministic code without going through the LLM.
+ *       - Manually Created Match Polls: The bot passively tracks user-created tennis match polls and their
+ *         votes without making any changes or auto-generating matchups. It answers questions about them
+ *         (who voted, who is playing, etc.) and generates matchups with the same court-balancing and rating rules
+ *         IF AND ONLY IF users explicitly request it. When answering who is playing (both while voting is in progress
+ *         and when voting finishes), if the number of players who have voted does not meet a valid total player count
+ *         configuration (2 for singles, multiples of 4 for doubles), the bot includes the creator of the poll as one of the players.
+ *         Non-match polls are not tracked.
  *       - Poll deletions & modifications: When cancelling/deleting a poll or modifying/replacing a poll,
- *         the bot also deletes the older poll message directly from WhatsApp.
+ *         the bot also deletes the older poll message directly from WhatsApp. When a poll is deleted directly in WhatsApp
+ *         by a user or admin, the bot detects it and removes it from active tracked polls.
  *   - General questions, answered by Claude with live group context (@tenbot ...)
  *
  * Setup:
@@ -99,32 +110,48 @@ const SYSTEM_PROMPT =
   "or Yes/No opt-in polls when no number of players is specified), generate matchups from poll votes, " +
   "set/update player ratings, check weather, cancel/delete polls, and access the group's availability list, win/loss leaderboard, " +
   'and active polls (given below). Multiple polls can be created for different times or by different users. ' +
+  'The live local time in San Jose, CA is provided at the top of the context blurb below. ' +
+  'Polls created manually by users for organizing tennis matches are passively tracked by the bot (marked as user-created / isManual). ' +
+  'Non-match polls (such as food, social, or general polls) are not tracked. ' +
+  'For tracked manual match polls, do not make any changes or auto-generate matchups when they fill up. ' +
+  'Answer questions about manual match polls when asked (who voted, who is playing, current count, etc.). ' +
+  'For manual match polls, when answering who is playing (both while voting is in progress before all votes are in, and when voting is completed), ' +
+  'if the number of players who voted so far does not meet a valid total player count configuration (2 for singles, multiples of 4 for doubles), ' +
+  'always include the creator of the poll as one of the players playing. ' +
+  'If and ONLY IF users explicitly ask to create matchups or draw on a user-created manual match poll (e.g. "@tenbot generate matchups", "!matchups", "make the draw for the poll"), ' +
+  'call generate_matchups to generate matchups using the exact same rules as bot polls (singles for 2, doubles for multiples of 4, ratings balancing, lowest repeat rotations). ' +
   'Results can be reported to you in plain words ("Mike & Sara ' +
   'beat John & Alex 6-4", or "we won" right after a draw) and are logged automatically before ' +
   "you see the message, so don't claim you can't record scores. " +
   'Initial ratings for new players are looked up from TennisRecord.com (defaulting to 3.49 if not found). ' +
   'Users can also change their own rating by addressing you (e.g. "@tenbot my rating is 4.0" or "@tenbot set my rating to 3.5") -- ' +
   'call the set_rating tool to update it. ' +
-  'When creating a poll, if both a day and time are specified (e.g. "today 9am", "Saturday 9am" when it is already Saturday evening) and that time has already passed in San Jose, ' +
+  'When creating a poll: ' +
+  '- ALWAYS call the create_poll tool directly when a user asks to create a poll. Never ask the user for confirmation before creating the poll, even if the creator already has other active polls in the group (the backend handles slot allocation and conflict separation automatically). ' +
+  '- If only a start time was specified without a day (e.g. "create a poll for 6am" or "create a poll for 9am"): ' +
+  '  leave dayWord empty/null and pass when with just the requested time (e.g. when="6am", timeWord="6am"). ' +
+  '  The create_poll backend compares the start time against the current San Jose time: if the current time is greater than the start time, it automatically creates the poll for the next day with that start time (e.g. "Tomorrow 6am"); if the start time is upcoming today, it creates the poll for today at that start time. Do not add "Tomorrow" to when or dayWord unless the user explicitly said "tomorrow". ' +
+  '- When checking the 90-minute conflict window against other polls from the same creator: evaluate the conflict window against the modified/actual scheduled start time (for instance, if a start time was rolled over to next day, evaluate against the next-day start time, NOT the original passed time today). ' +
+  '- If the new poll start time is 90 minutes or more (including exactly 90 minutes away, e.g. 9:00am and 10:30am, or when rolled over to the next day) from the creator\'s other polls start times, create the poll immediately without requiring extra confirmation. ' +
+  '- If both a day and time are specified (e.g. "today 9am", "Saturday 9am" when it is already Saturday evening) and that time has already passed in San Jose, ' +
   'do NOT create the poll -- ask the user to fix the day/time to an upcoming time. ' +
-  'If only a time is specified without a day (e.g. "create a poll for 9am") and that time has already passed today in San Jose, ' +
-  'create the poll for tomorrow at that time (e.g. when="Tomorrow 9am", dayWord="tomorrow", timeWord="9am"). ' +
   'If the user asks to create a poll without specifying the number of players (e.g. "create a poll for tomorrow 9am"), ' +
   'call create_poll without size to create a Yes/No opt-in poll. For Yes/No polls, matchups are created when ' +
   'the user prompts to create/generate matchups (using generate_matchups). ' +
   'When cancelling or deleting a poll upon user request (e.g. "@tenbot cancel poll" or "@tenbot delete poll"), ' +
   'call cancel_poll, which will also delete the poll message from WhatsApp. ' +
+  'If a poll is deleted directly in WhatsApp by a user or admin, it is automatically removed from tracking. ' +
   'If the user requests changes to an existing poll (e.g. changing the time, number of players, or day) and a new poll is created, ' +
   'set cancelExisting: true (or pass replacePollId) in create_poll so the older poll is automatically deleted from WhatsApp and replaced. ' +
   'For fixed-spot polls, by default the user asking to create the poll is Player 1 ' +
-  'unless they explicitly state they are not playing or they already have another match poll scheduled within 1 hour. ' +
+  'unless they explicitly state they are not playing or they already have another match poll scheduled within less than 90 minutes of the resolved play time. ' +
   'When a message contains a request alongside other questions, execute the appropriate tools and answer naturally.';
 
 // Tools exposed to Claude for handling natural language requests
 const CLAUDE_TOOLS = [
   {
     name: 'create_poll',
-    description: 'Creates and sends a WhatsApp poll for organizing a tennis match in the group. If size is specified (2 for singles, 4/8/12 for doubles), creates numbered slot spots where creator is Player 1 by default. If size is omitted or not specified, creates an opt-in poll with only two options (Yes and No) where players vote Yes to opt in. Note: users are in San Jose, CA (Pacific Time). If both day and time are given and in the past, poll creation is rejected. If only a time in the past is given without a day, the match is scheduled for tomorrow at that time. If modifying/replacing an existing poll, set cancelExisting to true to delete the older poll from WhatsApp.',
+    description: 'Creates and sends a WhatsApp poll for organizing a tennis match in the group. Always call this tool directly when asked to create a poll without asking for user confirmation beforehand, even if the creator already has other polls (especially when the start time is 90 minutes or more away or rolled over to the next day). If size is specified (2 for singles, 4/8/12 for doubles), creates numbered slot spots where creator is Player 1 by default. If size is omitted or not specified, creates an opt-in poll with only two options (Yes and No) where players vote Yes to opt in. Note: users are in San Jose, CA (Pacific Time). If both day and time are given and in the past, poll creation is rejected. If only a start time is specified and the current time is greater than the start time, the poll is automatically created for the next day with that start time. If modifying/replacing an existing poll, set cancelExisting to true to delete the older poll from WhatsApp.',
     input_schema: {
       type: 'object',
       properties: {
@@ -134,11 +161,11 @@ const CLAUDE_TOOLS = [
         },
         when: {
           type: 'string',
-          description: 'Human-readable day/time description (e.g. "Tomorrow 9am", "Saturday 9am", "Tonight 6pm").'
+          description: 'Human-readable day/time description (e.g. "9am", "6pm", "Tomorrow 9am", "Saturday 9am", "Tonight 6pm"). If user only specified a time, pass just that time (e.g. "9am").'
         },
         dayWord: {
           type: 'string',
-          description: 'Day word mentioned in the request (e.g. "today", "tomorrow", "Saturday", "Sun").'
+          description: 'Day word explicitly mentioned by the user (e.g. "today", "tomorrow", "Saturday", "Sun"). If user only gave a time, omit this field or leave null.'
         },
         timeWord: {
           type: 'string',
@@ -146,7 +173,7 @@ const CLAUDE_TOOLS = [
         },
         includeCreator: {
           type: 'boolean',
-          description: 'Whether the user requesting the fixed-spot poll is playing in it. Defaults to true unless the user explicitly mentions they are not playing.'
+          description: 'Whether the user requesting the fixed-spot poll is playing in it. Set to false ONLY if the user explicitly stated they are not playing (e.g. "I\'m not playing"). Do NOT set to false for time conflicts; the backend automatically checks conflicts on the resolved play date/time.'
         },
         cancelExisting: {
           type: 'boolean',
@@ -161,7 +188,7 @@ const CLAUDE_TOOLS = [
   },
   {
     name: 'generate_matchups',
-    description: 'Generates and posts singles/doubles matchups and rotations from the current poll votes. For Yes/No opt-in polls, considers only players who voted Yes. Also used when user asks to make the draw, create matchups, or rematch.',
+    description: 'Generates and posts singles/doubles matchups and rotations from current poll votes. Supports bot-created polls, Yes/No opt-in polls, and user-created manual tennis scheduling polls when explicitly requested. For manual match polls, if player count does not match valid configurations (2 or multiples of 4), includes the poll creator.',
     input_schema: {
       type: 'object',
       properties: {}
@@ -264,7 +291,7 @@ let botSock = null;
 // the in-memory maps and as the persisted key format.
 const {
   messageStore,   // `${remoteJid}:${id}` -> stored WAMessage content, needed for getMessage() and vote decoding
-  activePolls,    // pollId -> { remoteJid, size, type, when, playAt, status, creator, lastConflictSignature, voteBuffer, lastPlayers }
+  activePolls,    // pollId -> { remoteJid, size, type, when, playAt, status, creator, lastConflictSignature, voteBuffer, lastPlayers, isManual }
   latestPollIdByChat // chatId -> pollId, so "!cancelpoll"/"!rematch"/"!pollstatus" know which poll to act on
 } = pollStore.load();
 
@@ -276,6 +303,232 @@ function persistPolls() {
 
 function escapeRegex(str) {
   return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Checks whether a poll title/options indicate a tennis match scheduling poll
+ * rather than a general social/opinion poll (e.g. food, equipment, general banter).
+ */
+function isMatchSchedulingPoll(title = '', options = []) {
+  const text = `${title} ${options.join(' ')}`.toLowerCase();
+  const matchKeywords = /\b(tennis|match|matches|court|courts|singles|doubles|play|playing|players|player|game|games|drill|drills|session|hit|hitting|schedule|scheduling|scvcc)\b/i;
+  const timeKeywords = /\b(today|tomorrow|tonight|monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tue|wed|thu|fri|sat|sun|morning|evening|afternoon)\b|\b\d{1,2}(?::\d{2})?\s*(?:am|pm)\b/i;
+  const slotKeywords = /\b(player|spot|slot|court)\s*\d+|\b\d+\b/i;
+  const hasOptInOrSlot = options.some((opt) => /^(yes|no|in|out|playing|can't play)$/i.test(opt.trim()) || slotKeywords.test(opt.trim()));
+
+  if (matchKeywords.test(text)) return true;
+  if (timeKeywords.test(title) && hasOptInOrSlot) return true;
+  return false;
+}
+
+/**
+ * Checks whether a given count of players is valid for standard matchups
+ * (2 for singles, or any positive multiple of 4: 4, 8, 12, 16... for doubles).
+ */
+function isValidPlayerCount(n) {
+  return n === 2 || (n >= 4 && n % 4 === 0);
+}
+
+/**
+ * For manually created match polls: if the voting player count does not meet a valid configuration
+ * (2 for singles, multiples of 4 for doubles), include the creator of the poll as one of the players.
+ */
+function resolveManualPollPlayers(targetPollState, currentPlayers) {
+  const players = [...currentPlayers];
+  if (isValidPlayerCount(players.length)) {
+    return { players, addedCreator: false };
+  }
+
+  const creatorName = targetPollState.creator?.name || (targetPollState.creator?.jid ? nameFor(targetPollState.creator.jid) : 'Creator');
+  const creatorKey = ratings.keyFor(creatorName);
+  let addedCreator = false;
+
+  // Include the creator of the poll as one of the players if not already in the list
+  const isCreatorInList = players.some((p) => ratings.keyFor(p) === creatorKey);
+  if (!isCreatorInList && !GENERIC_NAMES.has(creatorKey)) {
+    players.push(creatorName);
+    addedCreator = true;
+  }
+
+  return { players, addedCreator };
+}
+
+/**
+ * Extracts options, votes, and interested players from a poll.
+ */
+function getPollVoters(pollId, pollState, mePn) {
+  let pollCreationMessage = messageStore.get(storeKey(pollState.remoteJid, pollId));
+  const merged = [...(pollState.voteBuffer ? pollState.voteBuffer.values() : [])].map((u) => ({
+    ...u,
+    vote: normalizeVotePayload(u.vote)
+  }));
+
+  let aggregated = [];
+  if (pollCreationMessage) {
+    try {
+      aggregated = getAggregateVotesInPollMessage(
+        {
+          message: pollCreationMessage,
+          pollUpdates: merged
+        },
+        mePn
+      );
+    } catch (err) {
+      console.error(`[poll] getAggregateVotesInPollMessage failed for ${pollId}:`, err.message);
+    }
+  }
+
+  const yesOption = aggregated.find((o) => /^yes$/i.test(o.name.trim()));
+  const noOption = aggregated.find((o) => /^no$/i.test(o.name.trim()));
+
+  let interestedPlayers = [];
+  if (pollState.type === 'opt_in' || yesOption) {
+    const yesVoters = yesOption ? yesOption.voters : [];
+    interestedPlayers = yesVoters.map((v) => nameFor(v));
+  } else if (aggregated.length > 0) {
+    for (const opt of aggregated) {
+      if (/^(no|out|can't play|cannot play)$/i.test(opt.name.trim())) continue;
+      for (const v of opt.voters) {
+        const name = nameFor(v);
+        if (!interestedPlayers.includes(name)) interestedPlayers.push(name);
+      }
+    }
+  }
+
+  if (interestedPlayers.length === 0 && pollState.voteBuffer && pollState.voteBuffer.size > 0 && !yesOption) {
+    for (const voterJid of pollState.voteBuffer.keys()) {
+      const name = nameFor(voterJid);
+      if (!interestedPlayers.includes(name)) interestedPlayers.push(name);
+    }
+  }
+
+  return { aggregated, interestedPlayers, yesOption, noOption };
+}
+
+/**
+ * Parses a user's message to see if it is a poll creation request.
+ * Returns the parsed poll parameters or null if not a poll creation request.
+ */
+function parsePollCreationText(text) {
+  if (!text) return null;
+
+  const isPollCreationCommand = /^!(?:createpoll|poll|makepoll|newpoll)\b/i.test(text);
+  const isPollCreationPhrase = /\b(?:create|make|post|start|set\s*up|setup|open)\s+(?:a\s+)?(?:match\s+)?(?:singles\s+|doubles\s+)?poll\b|\bnew\s+(?:match\s+)?poll\b|\bpoll\s+for\b/i.test(text);
+
+  if (!isPollCreationCommand && !isPollCreationPhrase) {
+    return null;
+  }
+
+  // Extract timeWord first (e.g. 10:30am, 9am, 6:00pm)
+  let timeWord = null;
+  const timeMatch = text.match(/\b(\d{1,2}(?::\d{2})?\s*(?:am|pm))\b/i) || text.match(/\b(\d{1,2}:\d{2})\b/i);
+  if (timeMatch) {
+    timeWord = timeMatch[1].trim();
+  }
+
+  // Extract dayWord (e.g. today, tomorrow, Saturday)
+  let dayWord = null;
+  const dayMatch = text.match(/\b(today|tonight|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tue|wed|thu|fri|sat|sun)\b/i);
+  if (dayMatch) {
+    dayWord = dayMatch[1];
+  }
+
+  // Build when string
+  let when = null;
+  if (dayWord && timeWord) {
+    const capDay = dayWord.charAt(0).toUpperCase() + dayWord.slice(1).toLowerCase();
+    when = `${capDay} ${timeWord}`;
+  } else if (timeWord) {
+    when = timeWord;
+  } else if (dayWord) {
+    when = dayWord.charAt(0).toUpperCase() + dayWord.slice(1).toLowerCase();
+  }
+
+  // Remove time patterns from text before parsing size so that times like "10:30am" or "10am" don't match as size 10
+  let textWithoutTime = text;
+  if (timeMatch) {
+    textWithoutTime = textWithoutTime.replace(timeMatch[0], ' ');
+  }
+  textWithoutTime = textWithoutTime.replace(/\b\d{1,2}(?::\d{2})?\s*(?:am|pm)\b/ig, ' ').replace(/\b\d{1,2}:\d{2}\b/g, ' ');
+
+  // Determine size
+  let size = null;
+  const sizeMatch = textWithoutTime.match(/\b(?:for|size|spots?|players?)\s*[:=]?\s*(\d+)\b/i) ||
+                    textWithoutTime.match(/\b(\d+)\s*(?:spots?|players?|people|courts?)\b/i) ||
+                    textWithoutTime.match(/\bpoll\s+for\s+(\d+)\b/i) ||
+                    textWithoutTime.match(/^!(?:createpoll|poll|makepoll|newpoll)\s+(\d+)\b/i) ||
+                    textWithoutTime.match(/\bcreate\s+(?:a\s+)?(?:match\s+)?poll\s+(\d+)\b/i) ||
+                    textWithoutTime.match(/\b([248]|12|16)\s*(?:players?|spots?)?\b/i);
+  if (sizeMatch) {
+    size = parseInt(sizeMatch[1], 10);
+  } else if (/\bsingles\b/i.test(textWithoutTime)) {
+    size = 2;
+  } else if (/\bdoubles\b/i.test(textWithoutTime)) {
+    size = 4;
+  }
+
+  // Determine includeCreator
+  let includeCreator = true;
+  if (/\b(?:not\s+playing|won't\s+play|wont\s+play|without\s+me|exclude\s+me|not\s+for\s+me|i'm\s+not\s+playing|im\s+not\s+playing)\b/i.test(text)) {
+    includeCreator = false;
+  }
+
+  // Determine cancelExisting / replacement
+  let cancelExisting = false;
+  if (/\b(?:replace|cancel\s+existing|cancel\s+previous|update\s+poll|change\s+poll|reschedule)\b/i.test(text)) {
+    cancelExisting = true;
+  }
+
+  return {
+    size,
+    when,
+    dayWord,
+    timeWord,
+    includeCreator,
+    cancelExisting
+  };
+}
+
+/**
+ * Handles direct poll creation from parsed message parameters without calling the LLM.
+ */
+async function handleDirectPollCreation(sock, chatId, sender, msg, parsed) {
+  const { size, when, dayWord, timeWord, includeCreator, cancelExisting } = parsed;
+  const creatorName = sender !== 'Someone' ? sender : (msg?.key?.participant ? nameFor(msg.key.participant) : 'Player 1');
+  const creatorJid = msg?.key?.participant || msg?.key?.remoteJid || null;
+
+  const res = await createMatchPoll(
+    sock,
+    chatId,
+    size,
+    when,
+    dayWord,
+    timeWord,
+    creatorName,
+    creatorJid,
+    includeCreator,
+    null,
+    cancelExisting
+  );
+
+  if (res?.err) {
+    return `Could not create poll: ${res.err}`;
+  }
+
+  const resolvedWhen = res?.when ? ` for ${res.when}` : (when ? ` for ${when}` : '');
+  const replacedNote = res?.replacedOldPoll ? ' (older poll deleted from WhatsApp)' : '';
+
+  if (res?.isOptIn) {
+    return `Opt-in poll created with "Yes" and "No" options${resolvedWhen}${replacedNote}. Players can vote "Yes" to opt in. When ready, ask me to generate the matchups!`;
+  }
+
+  if (res?.includedCreator) {
+    const needed = size - 1;
+    return `Poll for ${size} spots (${size === 2 ? 'Singles' : 'Doubles'}${resolvedWhen}${replacedNote}) created with ${creatorName} as Player 1 (${needed} spot(s) to vote on: Player 2..Player ${size}).`;
+  } else {
+    const note = res?.reason ? ` (${res.reason}, so not automatically added as Player 1)` : '';
+    return `Poll for ${size} spots (${size === 2 ? 'Singles' : 'Doubles'}${resolvedWhen}${replacedNote}) created with all ${size} spot(s) open to vote on: Player 1..Player ${size}${note}.`;
+  }
 }
 
 /**
@@ -358,7 +611,7 @@ function isSameUser(jid1, jid2, name1, name2) {
   const norm2 = jidNormalizedUser(jid2);
   if (norm1 && norm2 && norm1 === norm2) return true;
   const pn1 = lidToPn.get(norm1) || (norm1?.endsWith('@s.whatsapp.net') ? norm1 : null);
-  const pn2 = lidToPn.get(norm2) || (norm2?.endsWith('@s.whatsapp.net') ? norm2 : null);
+  const pn2 = lidToPn.get(norm1) || (norm2?.endsWith('@s.whatsapp.net') ? norm2 : null);
   if (pn1 && pn2 && pn1 === pn2) return true;
   const lid1 = pnToLid.get(norm1) || (norm1?.endsWith('@lid') ? norm1 : null);
   const lid2 = pnToLid.get(norm2) || (norm2?.endsWith('@lid') ? norm2 : null);
@@ -532,15 +785,67 @@ async function deletePollFromWhatsApp(sock, remoteJid, pollId) {
 }
 
 /**
+ * Handles deletion / revocation of a poll message in WhatsApp (whether deleted
+ * manually by a user in the WhatsApp app, by an admin, or deleted by the bot).
+ */
+function handlePollDeleted(remoteJid, pollId) {
+  if (!pollId) return;
+  let changed = false;
+
+  let chatId = remoteJid;
+  if (activePolls.has(pollId)) {
+    const pollState = activePolls.get(pollId);
+    if (!chatId) chatId = pollState.remoteJid;
+    const pollName = pollState.name || 'Match Poll';
+    console.log(`[poll] Tracked poll ${pollId} ("${pollName}") was deleted in WhatsApp chat ${chatId}. Removing from active polls.`);
+    activePolls.delete(pollId);
+    changed = true;
+  }
+
+  // Remove from messageStore
+  for (const key of messageStore.keys()) {
+    if (key.endsWith(`:${pollId}`)) {
+      messageStore.delete(key);
+      changed = true;
+    }
+  }
+
+  // Update latestPollIdByChat
+  if (chatId && latestPollIdByChat.get(chatId) === pollId) {
+    latestPollIdByChat.delete(chatId);
+    for (const [id, state] of [...activePolls.entries()].reverse()) {
+      if (state.remoteJid === chatId && state.status === 'active') {
+        latestPollIdByChat.set(chatId, id);
+        break;
+      }
+    }
+    changed = true;
+  } else {
+    for (const [cId, id] of latestPollIdByChat.entries()) {
+      if (id === pollId) {
+        latestPollIdByChat.delete(cId);
+        for (const [otherId, state] of [...activePolls.entries()].reverse()) {
+          if (state.remoteJid === cId && state.status === 'active') {
+            latestPollIdByChat.set(cId, otherId);
+            break;
+          }
+        }
+        changed = true;
+      }
+    }
+  }
+
+  if (changed) {
+    persistPolls();
+  }
+}
+
+/**
  * Cancels a poll internally and deletes the poll message from WhatsApp.
  */
 async function cancelOrDeletePoll(sock, remoteJid, pollId) {
   if (!pollId) return;
-  const pollState = activePolls.get(pollId);
-  if (pollState) {
-    pollState.status = 'cancelled';
-    persistPolls();
-  }
+  handlePollDeleted(remoteJid, pollId);
   await deletePollFromWhatsApp(sock, remoteJid, pollId);
 }
 
@@ -650,18 +955,78 @@ async function startBot() {
 
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
     for (const msg of messages) {
+      // Check for message revocation (deleted for everyone in WhatsApp)
+      const protocolMsg = msg.message?.protocolMessage;
+      if (protocolMsg && (protocolMsg.type === 0 || protocolMsg.key?.id)) {
+        const deletedId = protocolMsg.key?.id;
+        if (deletedId && activePolls.has(deletedId)) {
+          handlePollDeleted(msg.key?.remoteJid || protocolMsg.key?.remoteJid, deletedId);
+        }
+      }
+
       // Remember voter's display name if present
       if (msg.pushName && (msg.key.participant || msg.key.remoteJid)) {
         const rawJid = msg.key.participant || msg.key.remoteJid;
         recordName(rawJid, msg.pushName);
       }
 
+      // Check for incoming poll creation message (bot-created or user-created in group)
+      const pollCreation = msg.message?.pollCreationMessage || msg.message?.pollCreationMessageV2 || msg.message?.pollCreationMessageV3;
+      if (pollCreation) {
+        const remoteJid = msg.key.remoteJid;
+        const pollId = msg.key.id;
+
+        // If not already tracked by bot, check if this manually created poll is for tennis match scheduling
+        if (!activePolls.has(pollId)) {
+          const pollName = pollCreation.name || 'Match Poll';
+          const options = (pollCreation.options || []).map((o) => o.optionName);
+
+          const isMatchScheduling = isMatchSchedulingPoll(pollName, options);
+          if (!isMatchScheduling) {
+            console.log(`[poll] Ignoring non-match poll ${pollId} ("${pollName}") in ${remoteJid}`);
+            continue; // Do not track non-match polls
+          }
+
+          messageStore.set(storeKey(remoteJid, pollId), msg.message);
+          const creatorName = msg.pushName || (msg.key.participant ? nameFor(msg.key.participant) : 'Someone');
+          const creatorJid = msg.key.participant || msg.key.remoteJid || null;
+
+          const dayMatch = pollName.match(/\b(today|tonight|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tue|wed|thu|fri|sat|sun)\b/i);
+          const timeMatch = pollName.match(/\b(\d{1,2}(?::\d{2})?\s*(?:am|pm))\b/i);
+          const playAt = resolvePlayDateTime(dayMatch ? dayMatch[1] : null, timeMatch ? timeMatch[1] : null);
+
+          const hasYesNo = options.some((opt) => /^yes$/i.test(opt.trim())) && options.some((opt) => /^no$/i.test(opt.trim()));
+          const pollType = hasYesNo ? 'opt_in' : 'manual';
+
+          activePolls.set(pollId, {
+            remoteJid,
+            name: pollName,
+            options,
+            size: hasYesNo ? null : (options.length > 0 ? options.length : null),
+            type: pollType,
+            when: pollName,
+            playAt: playAt.toISOString(),
+            status: 'active',
+            isManual: true, // user-created manual match poll, passively tracked
+            creator: { name: creatorName, jid: creatorJid },
+            lastConflictSignature: null,
+            voteBuffer: new Map(),
+            lastPlayers: null
+          });
+          latestPollIdByChat.set(remoteJid, pollId);
+          persistPolls();
+          console.log(`[poll] Passively tracking manually-created match poll ${pollId} ("${pollName}") by ${creatorName} in ${remoteJid}`);
+        } else {
+          messageStore.set(storeKey(remoteJid, pollId), msg.message);
+        }
+      }
+
       // Baileys delivers poll updates via messages.upsert with pollUpdateMessage payload.
       if (msg.message?.pollUpdateMessage) {
         const pollUpdateMessage = msg.message.pollUpdateMessage;
         const pollKey = pollUpdateMessage.pollCreationMessageKey;
-        console.log(`[poll] Vote received via messages.upsert for poll ${pollKey?.id || '(unknown)'}`);
-        if (pollKey) {
+        if (pollKey && activePolls.has(pollKey.id)) {
+          console.log(`[poll] Vote received via messages.upsert for poll ${pollKey?.id || '(unknown)'}`);
           try {
             await processPollVoteEvent(sock, pollKey, [{
               pollUpdateMessageKey: msg.key,
@@ -687,16 +1052,42 @@ async function startBot() {
     }
   });
 
-  // Poll votes also arrive here on some Baileys setups.
+  // Poll votes and message revocations also arrive here on some Baileys setups.
   sock.ev.on('messages.update', async (updates) => {
     for (const { key, update } of updates) {
+      // Check if a tracked poll message was revoked/deleted (message set to null)
+      if (update && update.message === null) {
+        const deletedId = key?.id || update.key?.id;
+        if (deletedId && activePolls.has(deletedId)) {
+          handlePollDeleted(key?.remoteJid || update.key?.remoteJid, deletedId);
+        }
+      }
+
       if (!update.pollUpdates) continue;
+      if (!activePolls.has(key.id)) continue;
       console.log(`[poll] Vote received via messages.update for poll ${key.id} (${update.pollUpdates.length} entry/entries)`);
       try {
         await processPollVoteEvent(sock, key, update.pollUpdates);
       } catch (err) {
         console.error('Error handling poll update:', err && err.message ? err.message : err);
         console.error(err && err.stack ? err.stack : '(no stack trace available)');
+      }
+    }
+  });
+
+  // Handle message deletion events emitted by Baileys
+  sock.ev.on('messages.delete', async (item) => {
+    if (item.all && item.jid) {
+      for (const [pollId, pollState] of [...activePolls.entries()]) {
+        if (pollState.remoteJid === item.jid) {
+          handlePollDeleted(item.jid, pollId);
+        }
+      }
+    } else if (Array.isArray(item.keys)) {
+      for (const key of item.keys) {
+        if (key?.id && activePolls.has(key.id)) {
+          handlePollDeleted(key.remoteJid, key.id);
+        }
       }
     }
   });
@@ -827,8 +1218,8 @@ async function executeTool(sock, chatId, sender, toolUse, msg) {
 
 /**
  * Routes an incoming message to the right handler: structured tennis
- * commands first, then the LLM with tool support for free-form queries,
- * questions, and poll creation.
+ * commands first, direct poll creation parsing, then the LLM with tool support for free-form queries,
+ * questions, etc.
  */
 async function getResponse(sock, text, chatId, sender, msg) {
   const lower = text.toLowerCase();
@@ -898,6 +1289,14 @@ async function getResponse(sock, text, chatId, sender, msg) {
     }
   }
 
+  // --- Direct Command Poll creation (!createpoll / !poll / !makepoll / !newpoll) ---
+  if (/^!(?:createpoll|poll|makepoll|newpoll)\b/i.test(text)) {
+    const parsed = parsePollCreationText(text);
+    if (parsed) {
+      return await handleDirectPollCreation(sock, chatId, sender, msg, parsed);
+    }
+  }
+
   // --- Poll management ---
   if (lower === '!cancelpoll' || lower === '!deletepoll') {
     let targetPollId = null;
@@ -941,6 +1340,12 @@ async function getResponse(sock, text, chatId, sender, msg) {
   }
   if (!promptText) return null;
 
+  // --- Direct Poll Creation Request (handled directly without LLM) ---
+  const directPollParsed = parsePollCreationText(promptText) || parsePollCreationText(text);
+  if (directPollParsed) {
+    return await handleDirectPollCreation(sock, chatId, sender, msg, directPollParsed);
+  }
+
   // --- Free-form score reports ---
   // A result can be announced with "!score" (handled further up) or in plain
   // words to the bot ("@tenbot Mike & Sara beat John & Alex 6-4"), so this sits
@@ -955,7 +1360,7 @@ async function getResponse(sock, text, chatId, sender, msg) {
   );
   if (freeformScore) return freeformScore;
 
-  // --- LLM (handles free-form queries, poll creation, weather, Q&A, etc.) ---
+  // --- LLM (handles free-form queries, weather, Q&A, etc.) ---
   try {
     return await callClaude(sock, chatId, sender, promptText, msg);
   } catch (err) {
@@ -977,13 +1382,14 @@ function helpText() {
     '!ratings – show player ratings used to balance the courts',
     `!setrating <rating> (or ${TRIGGER_PREFIX} my rating is <rating>) – set or update your rating (${ratings.MIN_RATING}–${ratings.MAX_RATING})`,
     '!weather [location] – forecast for outdoor play (defaults to ' + DEFAULT_LOCATION + ')',
-    `${TRIGGER_PREFIX} create a poll [for <N>] – post a match poll (N spots for singles/doubles, or Yes/No opt-in if N is omitted)`,
-    '!matchups (or !draw, !rematch) – generate matchups from Yes votes in an opt-in poll, or re-draw a completed poll',
+    `${TRIGGER_PREFIX} create a poll [for <N>] [when] – post a match poll (N spots for singles/doubles, or Yes/No opt-in if N is omitted)`,
+    '!poll [for <N>] [when] (or !createpoll) – direct command to create a match poll',
+    '!matchups (or !draw, !rematch) – generate matchups from active tennis match poll',
     '!cancelpoll (or !deletepoll) – stop and delete the active poll from WhatsApp',
-    '!pollstatus – debug: show raw vote count and voters for active poll(s)',
+    '!pollstatus – debug: show raw vote count and voters for active match poll(s)',
     '!cleanuppolls – debug: force a sweep that deletes expired/completed polls now',
     '!reset – clear the bot\'s conversation memory',
-    TRIGGER_PREFIX ? `${TRIGGER_PREFIX} <question> – ask the bot anything (including setting rating, poll creation, and questions)` : '(bot also responds to any message)'
+    TRIGGER_PREFIX ? `${TRIGGER_PREFIX} <question> – ask the bot anything (including setting rating, questions)` : '(bot also responds to any message)'
   ].join('\n');
 }
 
@@ -1054,7 +1460,7 @@ function applyScoreReport({ winners, losers, sets, assumedScore = false, inferre
 
 /**
  * Parses "!score <winner> def <loser> <score>", e.g.
- * "!score Mike def John 6-4 6-2" or "!score Mike & Sara def John & Alex 6-4 4-6 7-5"
+ * "!score Mike def John 6-4 6-2" or "!score Mike & Sara def John & Alex 6-4 6-2"
  *
  * Unlike free-form reports, the command takes names as given rather than
  * insisting it already knows them -- asking for a score explicitly is enough
@@ -1185,7 +1591,7 @@ function formatRatings() {
     return `Nobody's rated yet -- everyone starts from their TennisRecord rating (or ${ratings.formatRating(ratings.INITIAL_RATING)}) once they play a poll or set their rating.`;
   }
   const lines = board.map((p, i) => `${i + 1}. ${p.name} — ${ratings.formatRating(p.rating)}`);
-  return `📊 Player ratings (${ratings.formatRating(ratings.MIN_RATING)}–${ratings.formatRating(ratings.MAX_RATING)}):\n${lines.join('\n')}`;
+  return `📊 Player ratings (${ratings.formatRating(ratings.MIN_RATING)}–${ratings.MAX_RATING}):\n${lines.join('\n')}`;
 }
 
 // ---- Poll creation & vote handling ----
@@ -1269,9 +1675,9 @@ async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWor
   let shouldIncludeCreator = includeCreator;
   let excludedReason = null;
 
-  // Check if a poll already exists for the same person within one hour of the new poll's start time
+  // Check if a poll already exists for the same person within 90 minutes of the new poll's start time
   if (shouldIncludeCreator && (creatorJid || creatorName)) {
-    const ONE_HOUR_MS = 60 * 60 * 1000;
+    const CONFLICT_WINDOW_MS = 90 * 60 * 1000; // 90 minutes
     const newPlayTime = playAt.getTime();
 
     for (const [existingPollId, existingPoll] of activePolls.entries()) {
@@ -1282,12 +1688,12 @@ async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWor
       const existingPlayTime = new Date(existingPoll.playAt).getTime();
       if (Number.isNaN(existingPlayTime)) continue;
 
-      if (Math.abs(newPlayTime - existingPlayTime) <= ONE_HOUR_MS) {
+      if (Math.abs(newPlayTime - existingPlayTime) < CONFLICT_WINDOW_MS) {
         if (isUserInPoll(existingPoll, creatorJid, creatorName)) {
           shouldIncludeCreator = false;
           const existingWhen = existingPoll.when || new Date(existingPoll.playAt).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
-          excludedReason = `a poll already exists for ${creatorName || 'you'} within one hour of this start time (${existingWhen})`;
-          console.log(`[poll] Not auto-adding ${creatorName || 'creator'} as Player 1 in new poll: already in poll ${existingPollId} within 1 hour`);
+          excludedReason = `a poll already exists for ${creatorName || 'you'} within 90 minutes of this start time (${existingWhen})`;
+          console.log(`[poll] Not auto-adding ${creatorName || 'creator'} as Player 1 in new poll: already in poll ${existingPollId} within 90 minutes`);
           break;
         }
       }
@@ -1329,11 +1735,14 @@ async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWor
   messageStore.set(storeKey(sent.key.remoteJid, pollId), sent.message);
   activePolls.set(pollId, {
     remoteJid,
+    name: `${titlePrefix} (${matchType}${suffix})`,
+    options: values,
     size: isOptIn ? null : size,
     type: isOptIn ? 'opt_in' : 'fixed',
     when: resolvedWhen || null,
     playAt: playAt.toISOString(),
     status: 'active', // 'active' | 'resolved' | 'cancelled'
+    isManual: false,
     creator: shouldIncludeCreator ? { name: creatorName || 'Player 1', jid: creatorJid || null } : null,
     lastConflictSignature: null,
     voteBuffer: new Map(), // voterJid -> raw pollUpdate entry
@@ -1350,7 +1759,7 @@ async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWor
  * Handles an incoming poll vote (from either event path): decrypts it if
  * needed, merges it into our running tally for that poll, and if every slot
  * now has exactly one voter (for fixed-slot polls), posts matchups.
- * For Yes/No opt-in polls, updates vote tallies and waits for user command.
+ * For Yes/No opt-in polls and manual user polls, updates vote tallies and waits for user command.
  */
 async function processPollVoteEvent(sock, pollMessageKey, rawPollUpdates) {
   const pollId = pollMessageKey.id;
@@ -1466,6 +1875,24 @@ async function processPollVoteEvent(sock, pollMessageKey, rawPollUpdates) {
     vote: normalizeVotePayload(u.vote)
   }));
 
+  // If this poll was created manually by a user, passively track votes without automatic changes or auto-matchups
+  if (pollState.isManual) {
+    let yesCount = 0;
+    let noCount = 0;
+    try {
+      const aggregated = getAggregateVotesInPollMessage(
+        { message: pollCreationMessage, pollUpdates: merged },
+        mePn
+      );
+      const yesOpt = aggregated.find((o) => /^yes$/i.test(o.name.trim()));
+      const noOpt = aggregated.find((o) => /^no$/i.test(o.name.trim()));
+      yesCount = yesOpt ? yesOpt.voters.length : 0;
+      noCount = noOpt ? noOpt.voters.length : 0;
+    } catch (e) {}
+    console.log(`[poll] Manually-created poll ${pollId} vote updated (${pollState.voteBuffer.size} vote(s) buffered, Yes: ${yesCount}, No: ${noCount}). Passively tracking -- waiting for explicit matchup request.`);
+    return;
+  }
+
   // If this is a Yes/No opt-in poll, tally the votes and wait for user prompt
   if (pollState.type === 'opt_in' || pollState.size === null) {
     let aggregated;
@@ -1571,22 +1998,25 @@ async function processPollVoteEvent(sock, pollMessageKey, rawPollUpdates) {
 /**
  * Generates and posts matchups for a poll:
  * - For Yes/No opt-in polls: considers all players who voted Yes and generates matchups.
+ * - For user-created manual tennis match polls: extracts voters in slot/option order or Yes voters.
+ *   If the player count does not meet valid configurations (2 for singles, multiples of 4 for doubles),
+ *   includes the creator of the poll as one of the players.
  * - For fixed-size polls / rematches: regenerates matchups from the recorded player list.
  */
 async function generateMatchupsFromPoll(sock, chatId) {
   let targetPollId = null;
   let targetPollState = null;
 
-  // 1. Look for active opt-in poll first
+  // 1. Look for active opt-in or manual match poll first
   for (const [pollId, pollState] of [...activePolls.entries()].reverse()) {
-    if (pollState.remoteJid === chatId && pollState.status === 'active' && (pollState.type === 'opt_in' || pollState.size === null)) {
+    if (pollState.remoteJid === chatId && pollState.status === 'active' && (pollState.type === 'opt_in' || pollState.size === null || pollState.isManual)) {
       targetPollId = pollId;
       targetPollState = pollState;
       break;
     }
   }
 
-  // 2. Look for any active poll with votes
+  // 2. Look for any active match poll with votes
   if (!targetPollState) {
     for (const [pollId, pollState] of [...activePolls.entries()].reverse()) {
       if (pollState.remoteJid === chatId && pollState.status === 'active' && pollState.voteBuffer.size > 0) {
@@ -1615,81 +2045,58 @@ async function generateMatchupsFromPoll(sock, chatId) {
   }
 
   if (!targetPollState) {
-    return `No poll found to generate matchups from -- create one with "${TRIGGER_PREFIX} create a poll" first.`;
+    return `No tennis match poll found to generate matchups from -- create one with "${TRIGGER_PREFIX} create a poll" first.`;
   }
 
   const mePn = jidNormalizedUser(sock?.user?.id || sock?.authState?.creds?.me?.id || '');
 
-  // If this is a Yes/No opt-in poll, gather all "Yes" voters
-  if (targetPollState.type === 'opt_in' || targetPollState.size === null) {
-    let pollCreationMessage = messageStore.get(storeKey(targetPollState.remoteJid, targetPollId));
-    if (!pollCreationMessage) {
-      return 'Could not retrieve the poll creation message to decode votes.';
+  // Extract players from votes or previous draw
+  let players = [];
+  if (targetPollState.lastPlayers && targetPollState.status === 'resolved') {
+    players = targetPollState.lastPlayers;
+  } else {
+    const { interestedPlayers, yesOption } = getPollVoters(targetPollId, targetPollState, mePn);
+    players = interestedPlayers;
+
+    // For manually created match polls: if player count does not meet valid configuration,
+    // include the creator of the poll as one of the players
+    if (targetPollState.isManual && !isValidPlayerCount(players.length)) {
+      const { players: adjustedPlayers, addedCreator } = resolveManualPollPlayers(targetPollState, players);
+      if (addedCreator) {
+        console.log(`[poll] Adjusted manual poll players: included creator "${targetPollState.creator?.name}" -> total ${adjustedPlayers.length} player(s)`);
+        players = adjustedPlayers;
+      }
     }
-
-    const merged = [...targetPollState.voteBuffer.values()].map((u) => ({
-      ...u,
-      vote: normalizeVotePayload(u.vote)
-    }));
-
-    let aggregated;
-    try {
-      aggregated = getAggregateVotesInPollMessage(
-        {
-          message: pollCreationMessage,
-          pollUpdates: merged
-        },
-        mePn
-      );
-    } catch (err) {
-      return `Failed to calculate poll votes: ${err.message}`;
-    }
-
-    const yesOption = aggregated.find((o) => /^yes$/i.test(o.name.trim()));
-    const yesVoters = yesOption ? yesOption.voters : [];
-    const players = yesVoters.map((v) => nameFor(v));
-
-    if (players.length === 0) {
-      return 'No one has voted "Yes" yet in the opt-in poll.';
-    }
-
-    if (players.length === 1) {
-      return `Only 1 player has voted "Yes" so far (${players[0]}). Need at least 2 for singles or 4 for doubles.`;
-    }
-
-    if (players.length !== 2 && players.length % 4 !== 0) {
-      return `Got ${players.length} players who voted Yes: ${players.join(', ')}.\nNeed 2 players for singles or a multiple of 4 (4, 8, 12, etc.) for doubles to generate standard matchups.`;
-    }
-
-    targetPollState.status = 'resolved';
-    targetPollState.lastPlayers = players;
-    persistPolls();
-
-    console.log(`[poll] Generating matchups for opt-in poll ${targetPollId} with ${players.length} Yes voter(s): ${players.join(', ')}`);
-
-    await ratings.ensureRated(players);
-    const schedule = generateMatchups(players);
-    const header = targetPollState.when ? `📅 ${targetPollState.when}\n\n` : '';
-    await sock.sendMessage(targetPollState.remoteJid, { text: header + formatMatchups(schedule) });
-    pairHistory.recordDraw(targetPollId, schedule);
-    targetPollState.lastSchedule = summarizeSchedule(schedule);
-    persistPolls();
-    return null;
   }
 
-  // Fixed-size poll with lastPlayers
-  if (targetPollState.lastPlayers) {
-    await ratings.ensureRated(targetPollState.lastPlayers);
-    const schedule = generateMatchups(targetPollState.lastPlayers);
-    const header = targetPollState.when ? `📅 ${targetPollState.when}\n\n` : '';
-    await sock.sendMessage(targetPollState.remoteJid, { text: header + formatMatchups(schedule) });
-    pairHistory.recordDraw(targetPollId, schedule);
-    targetPollState.lastSchedule = summarizeSchedule(schedule);
-    persistPolls();
-    return null;
+  if (players.length === 0) {
+    return targetPollState.type === 'opt_in' || targetPollState.options?.some((o) => /^yes$/i.test(o))
+      ? 'No one has voted "Yes" yet in the opt-in poll.'
+      : 'No votes have been recorded yet for this poll.';
   }
 
-  return 'That poll hasn\'t filled up yet, so there\'s nothing to generate matchups from.';
+  if (players.length === 1) {
+    return `Only 1 player has voted so far (${players[0]}). Need at least 2 for singles or 4 for doubles.`;
+  }
+
+  if (players.length !== 2 && players.length % 4 !== 0) {
+    return `Got ${players.length} players (${players.join(', ')}).\nNeed 2 players for singles or a multiple of 4 (4, 8, 12, etc.) for doubles to generate standard matchups.`;
+  }
+
+  targetPollState.status = 'resolved';
+  targetPollState.lastPlayers = players;
+  persistPolls();
+
+  console.log(`[poll] Generating matchups for poll ${targetPollId} (${targetPollState.isManual ? 'manual poll' : targetPollState.type}) with ${players.length} player(s): ${players.join(', ')}`);
+
+  await ratings.ensureRated(players);
+  const schedule = generateMatchups(players);
+  const header = targetPollState.when ? `📅 ${targetPollState.when}\n\n` : '';
+  await sock.sendMessage(targetPollState.remoteJid, { text: header + formatMatchups(schedule) });
+  pairHistory.recordDraw(targetPollId, schedule);
+  targetPollState.lastSchedule = summarizeSchedule(schedule);
+  persistPolls();
+  return null;
 }
 
 /** Best-effort JID -> display name lookup, falling back to a short id. */
@@ -1728,6 +2135,26 @@ function pollStatusText(chatId) {
 
   const sections = chatPolls.map(([pollId, pollState]) => {
     const playAtLocal = pollState.playAt ? new Date(pollState.playAt).toLocaleString() : 'unknown';
+
+    if (pollState.isManual) {
+      const { aggregated, interestedPlayers } = getPollVoters(pollId, pollState, mePn);
+      const optionSummaries = aggregated.map((opt) => `${opt.name} (${opt.voters.length}): ${opt.voters.map(nameFor).join(', ') || '(none)'}`);
+      const { players: playingPlayers, addedCreator } = resolveManualPollPlayers(pollState, interestedPlayers);
+      const creatorName = pollState.creator?.name || 'Someone';
+
+      const lines = [
+        `Poll ${pollId}: User-Created Manual Match Poll "${pollState.name || 'Match Poll'}".`,
+        `Creator: ${creatorName}`,
+        `Status: ${pollState.status} (Passively tracked)`,
+        `Play time: ${playAtLocal} (auto-deleted ${POLL_EXPIRY_GRACE_HOURS}h after this if not already gone)`,
+        `Total votes buffered: ${pollState.voteBuffer.size}`,
+        `Options & Votes:\n  ${optionSummaries.length ? optionSummaries.join('\n  ') : '(none)'}`,
+        `Voted so far (${interestedPlayers.length}): ${interestedPlayers.length ? interestedPlayers.join(', ') : '(none yet)'}`,
+        `Currently playing (${playingPlayers.length}): ${playingPlayers.join(', ')}${addedCreator ? ` (includes poll creator ${creatorName} because voter count does not meet valid player count)` : ''}`,
+        'Matchups: Passively tracked -- will generate matchups only upon explicit user request (!matchups or "@tenbot generate matchups")'
+      ];
+      return lines.join('\n');
+    }
 
     if (pollState.type === 'opt_in' || pollState.size === null) {
       let yesVoters = [];
@@ -1781,6 +2208,17 @@ function pollStatusText(chatId) {
  * active polls to give the LLM real context instead of letting it guess.
  */
 function buildContextBlurb(chatId) {
+  const sjTimeStr = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/Los_Angeles',
+    weekday: 'long',
+    year: 'numeric',
+    month: 'short',
+    day: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+    hour12: true
+  }).format(new Date());
+
   const availability = storage.getAvailability();
   const board = storage.getLeaderboard();
   const recent = storage.getRecentMatches(5);
@@ -1803,6 +2241,29 @@ function buildContextBlurb(chatId) {
   if (chatPolls.length > 0) {
     const pollDescriptions = chatPolls.map(([id, pollState]) => {
       const whenSuffix = pollState.when ? ` for ${pollState.when}` : '';
+
+      if (pollState.isManual) {
+        const { aggregated, interestedPlayers } = getPollVoters(id, pollState, mePn);
+        const optionDetails = [];
+        for (const opt of aggregated) {
+          const names = opt.voters.map(nameFor);
+          if (names.length > 0) {
+            optionDetails.push(`${opt.name}: ${names.join(', ')}`);
+          }
+        }
+
+        const { players: playingPlayers, addedCreator } = resolveManualPollPlayers(pollState, interestedPlayers);
+        const creatorName = pollState.creator?.name || 'Someone';
+
+        if (pollState.status === 'resolved') {
+          return `[Poll ${id}] a user-created manual match poll "${pollState.name || 'Match Poll'}" was resolved with ${playingPlayers.length} players (${playingPlayers.join(', ')}) and matchups were posted`;
+        } else if (pollState.status === 'cancelled') {
+          return `[Poll ${id}] a user-created manual match poll "${pollState.name || 'Match Poll'}" was cancelled`;
+        } else {
+          return `[Poll ${id}] a user-created manual match poll "${pollState.name || 'Match Poll'}" (created by ${creatorName}) is actively tracked. Votes recorded so far (${interestedPlayers.length} voter(s): [${optionDetails.join('; ') || 'no votes yet'}]). Players currently in/playing (${playingPlayers.length}): ${playingPlayers.join(', ')}${addedCreator ? ` (includes poll creator ${creatorName} because the ${interestedPlayers.length} vote(s) so far do not meet a valid player count configuration)` : ''}. (Note: Passively tracked -- when asked who is playing, answer with the currently playing list which includes the creator as shown; do NOT auto-generate matchups unless user explicitly asks for matchups/draw on this poll)`;
+        }
+      }
+
       if (pollState.type === 'opt_in' || pollState.size === null) {
         let yesCount = 0;
         let noCount = 0;
@@ -1852,18 +2313,18 @@ function buildContextBlurb(chatId) {
     : 'nobody rated yet';
 
   return (
+    `Current time in San Jose, CA (Pacific Time): ${sjTimeStr}\n` +
     `Current availability: ${availabilityText}\n` +
     `Leaderboard (top 5): ${leaderboardText}\n` +
     `Recent matches: ${recentText}\n` +
-    `Player ratings (${ratings.formatRating(ratings.MIN_RATING)}-${ratings.formatRating(ratings.MAX_RATING)}, a pairing's rating is the sum of its two players'): ${ratingsText}\n` +
+    `Player ratings (${ratings.formatRating(ratings.MIN_RATING)}-${ratings.MAX_RATING}, a pairing's rating is the sum of its two players'): ${ratingsText}\n` +
     `Active poll: ${pollText}`
   );
 }
 
 /**
  * Calls the Anthropic API with tools, recent chat history, and live context.
- * Enables Claude to handle free-form poll creation requests while answering
- * any other questions in the same message.
+ * Enables Claude to handle general questions and conversational queries with live group context.
  */
 async function callClaude(sock, chatId, sender, promptText, msg) {
   const history = chatHistories.get(chatId) || [];
