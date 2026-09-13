@@ -61,14 +61,14 @@ const { parseScoreReport } = require('./lib/scoreReport');
 const pairHistory = require('./lib/pairHistory');
 const ratings = require('./lib/ratings');
 const pollStore = require('./lib/pollStore');
-const { resolvePlayDateTime } = require('./lib/pollTime');
+const { resolvePlayDateTime, getSanJoseNow } = require('./lib/pollTime');
 
 // ---- CONFIG ----
 // Set this to the exact group name (subject) you want the bot to listen to.
 // Leave as null to have the bot log every group name/ID it sees, so you can
 // find the right one.
-const TARGET_GROUP_NAME = 'SCVCC Early Morning Tennis Group (that usually plays in the evenings!)';
-//const TARGET_GROUP_NAME = 'Bot-testing';
+//const TARGET_GROUP_NAME = 'SCVCC Early Morning Tennis Group (that usually plays in the evenings!)';
+const TARGET_GROUP_NAME = 'Bot-testing';
 
 // Only call the LLM when the bot is directly addressed (recommended for
 // groups, otherwise it'll try to reply to every single message). Structured
@@ -91,7 +91,7 @@ const POLL_CLEANUP_INTERVAL_MINUTES = 15;
 // System prompt controlling the bot's personality/behavior
 const SYSTEM_PROMPT =
   'You are a helpful assistant in a WhatsApp group chat for a group of tennis ' +
-  'players who organize casual matches together. Keep replies short and ' +
+  'players in San Jose, California (Pacific Time) who organize casual matches together. Keep replies short and ' +
   'conversational (1-3 sentences) unless asked for more detail. You have ' +
   "access to tools to create match polls (fixed-spot polls for 2 singles or 4/8/12 doubles, " +
   "or Yes/No opt-in polls when no number of players is specified), generate matchups from poll votes, " +
@@ -103,6 +103,10 @@ const SYSTEM_PROMPT =
   'Initial ratings for new players are looked up from TennisRecord.com (defaulting to 3.49 if not found). ' +
   'Users can also change their own rating by addressing you (e.g. "@tenbot my rating is 4.0" or "@tenbot set my rating to 3.5") -- ' +
   'call the set_rating tool to update it. ' +
+  'When creating a poll, if both a day and time are specified (e.g. "today 9am", "Saturday 9am" when it is already Saturday evening) and that time has already passed in San Jose, ' +
+  'do NOT create the poll -- ask the user to fix the day/time to an upcoming time. ' +
+  'If only a time is specified without a day (e.g. "create a poll for 9am") and that time has already passed today in San Jose, ' +
+  'create the poll for tomorrow at that time (e.g. when="Tomorrow 9am", dayWord="tomorrow", timeWord="9am"). ' +
   'If the user asks to create a poll without specifying the number of players (e.g. "create a poll for tomorrow 9am"), ' +
   'call create_poll without size to create a Yes/No opt-in poll. For Yes/No polls, matchups are created when ' +
   'the user prompts to create/generate matchups (using generate_matchups). ' +
@@ -114,7 +118,7 @@ const SYSTEM_PROMPT =
 const CLAUDE_TOOLS = [
   {
     name: 'create_poll',
-    description: 'Creates and sends a WhatsApp poll for organizing a tennis match in the group. If size is specified (2 for singles, 4/8/12 for doubles), creates numbered slot spots where creator is Player 1 by default. If size is omitted or not specified, creates an opt-in poll with only two options (Yes and No) where players vote Yes to opt in.',
+    description: 'Creates and sends a WhatsApp poll for organizing a tennis match in the group. If size is specified (2 for singles, 4/8/12 for doubles), creates numbered slot spots where creator is Player 1 by default. If size is omitted or not specified, creates an opt-in poll with only two options (Yes and No) where players vote Yes to opt in. Note: users are in San Jose, CA (Pacific Time). If both day and time are given and in the past, poll creation is rejected. If only a time in the past is given without a day, the match is scheduled for tomorrow at that time.',
     input_schema: {
       type: 'object',
       properties: {
@@ -124,7 +128,7 @@ const CLAUDE_TOOLS = [
         },
         when: {
           type: 'string',
-          description: 'Human-readable day/time description (e.g. "Saturday 9am", "Tomorrow 7pm", "Tonight 6pm").'
+          description: 'Human-readable day/time description (e.g. "Tomorrow 9am", "Saturday 9am", "Tonight 6pm").'
         },
         dayWord: {
           type: 'string',
@@ -711,17 +715,18 @@ async function executeTool(sock, chatId, sender, toolUse, msg) {
 
     const res = await createMatchPoll(sock, chatId, size, when, dayWord, timeWord, creatorName, creatorJid, includeCreator);
     if (res?.err) {
-      return `Failed to create poll: ${res.err}`;
+      return `Could not create poll: ${res.err}`;
     }
+    const resolvedWhen = res?.when ? ` for ${res.when}` : (when ? ` for ${when}` : '');
     if (res?.isOptIn) {
-      return `Opt-in poll created with "Yes" and "No" options${when ? ` for ${when}` : ''}. Players can vote "Yes" to opt in. When ready, ask me to generate the matchups!`;
+      return `Opt-in poll created with "Yes" and "No" options${resolvedWhen}. Players can vote "Yes" to opt in. When ready, ask me to generate the matchups!`;
     }
     if (res?.includedCreator) {
       const needed = size - 1;
-      return `Poll for ${size} spots (${size === 2 ? 'Singles' : 'Doubles'}${when ? ` -- ${when}` : ''}) created with ${creatorName} as Player 1 (${needed} spot(s) to vote on: Player 2..Player ${size}).`;
+      return `Poll for ${size} spots (${size === 2 ? 'Singles' : 'Doubles'}${resolvedWhen}) created with ${creatorName} as Player 1 (${needed} spot(s) to vote on: Player 2..Player ${size}).`;
     } else {
       const note = res?.reason ? ` (${res.reason}, so not automatically added as Player 1)` : '';
-      return `Poll for ${size} spots (${size === 2 ? 'Singles' : 'Doubles'}${when ? ` -- ${when}` : ''}) created with all ${size} spot(s) open to vote on: Player 1..Player ${size}${note}.`;
+      return `Poll for ${size} spots (${size === 2 ? 'Singles' : 'Doubles'}${resolvedWhen}) created with all ${size} spot(s) open to vote on: Player 1..Player ${size}${note}.`;
     }
   }
   if (name === 'generate_matchups' || name === 'rematch') {
@@ -1154,7 +1159,44 @@ async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWor
     }
   }
 
-  const playAt = resolvePlayDateTime(dayWord, timeWord);
+  // Extract dayWord and timeWord from when if not explicitly provided
+  let effectiveDayWord = dayWord;
+  let effectiveTimeWord = timeWord;
+  if (!effectiveDayWord && when) {
+    const dayMatch = when.match(/\b(today|tonight|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tue|wed|thu|fri|sat|sun)\b/i);
+    if (dayMatch) effectiveDayWord = dayMatch[1];
+  }
+  if (!effectiveTimeWord && when) {
+    const timeMatch = when.match(/\b(\d{1,2}(?::\d{2})?\s*(?:am|pm))\b/i);
+    if (timeMatch) effectiveTimeWord = timeMatch[1];
+  }
+
+  const playAt = resolvePlayDateTime(effectiveDayWord, effectiveTimeWord);
+  const sjNow = getSanJoseNow();
+
+  // If BOTH day and time were specified and have already passed, reject and ask user to fix it
+  if (effectiveDayWord && effectiveTimeWord && playAt.getTime() <= sjNow.getTime()) {
+    const specifiedStr = when || `${effectiveDayWord} ${effectiveTimeWord}`;
+    return {
+      err: `The specified time (${specifiedStr}) has already passed. Please specify an upcoming day or time to create the poll.`
+    };
+  }
+
+  // If time rolled over to tomorrow and when doesn't mention tomorrow or day name, adjust when
+  const isTomorrow = playAt.getDate() !== sjNow.getDate() || playAt.getMonth() !== sjNow.getMonth();
+  let resolvedWhen = when;
+  if (isTomorrow && !effectiveDayWord) {
+    if (resolvedWhen) {
+      if (!/\b(today|tomorrow|tonight|monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tue|wed|thu|fri|sat|sun)\b/i.test(resolvedWhen)) {
+        resolvedWhen = `Tomorrow ${resolvedWhen}`;
+      }
+    } else if (effectiveTimeWord) {
+      resolvedWhen = `Tomorrow ${effectiveTimeWord}`;
+    } else {
+      resolvedWhen = 'Tomorrow';
+    }
+  }
+
   let shouldIncludeCreator = includeCreator;
   let excludedReason = null;
 
@@ -1203,7 +1245,7 @@ async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWor
       : '🎾 Vote for a spot!';
   }
 
-  const suffix = when ? ` -- ${when}` : ' for today\'s matches';
+  const suffix = resolvedWhen ? ` -- ${resolvedWhen}` : ' for today\'s matches';
 
   const sent = await sock.sendMessage(remoteJid, {
     poll: {
@@ -1220,7 +1262,7 @@ async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWor
     remoteJid,
     size: isOptIn ? null : size,
     type: isOptIn ? 'opt_in' : 'fixed',
-    when: when || null,
+    when: resolvedWhen || null,
     playAt: playAt.toISOString(),
     status: 'active', // 'active' | 'resolved' | 'cancelled'
     creator: shouldIncludeCreator ? { name: creatorName || 'Player 1', jid: creatorJid || null } : null,
@@ -1230,9 +1272,9 @@ async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWor
   });
   latestPollIdByChat.set(remoteJid, pollId);
   persistPolls();
-  console.log(`[poll] Created poll ${pollId} (${isOptIn ? 'Yes/No opt-in' : `${size} spots`}, creator: ${shouldIncludeCreator ? (creatorName || 'Player 1') : 'none (not included)'}) in ${remoteJid}${when ? ` (${when})` : ''}, play time ${playAt.toISOString()}`);
+  console.log(`[poll] Created poll ${pollId} (${isOptIn ? 'Yes/No opt-in' : `${size} spots`}, creator: ${shouldIncludeCreator ? (creatorName || 'Player 1') : 'none (not included)'}) in ${remoteJid}${resolvedWhen ? ` (${resolvedWhen})` : ''}, play time ${playAt.toISOString()}`);
 
-  return { err: null, isOptIn, size, includedCreator: shouldIncludeCreator, reason: excludedReason };
+  return { err: null, isOptIn, size, when: resolvedWhen, includedCreator: shouldIncludeCreator, reason: excludedReason };
 }
 
 /**
@@ -1584,7 +1626,7 @@ async function generateMatchupsFromPoll(sock, chatId) {
 /** Best-effort JID -> display name lookup, falling back to a short id. */
 function nameFor(jid) {
   if (!jid || jid === 'me') {
-    const meName = botSock?.user?.name || botSock?.authState?.creds?.me?.name;
+    const meName = botSock?.user?.name || botSock?.authState?.creds?.me?.id;
     if (meName) return meName;
     const meId = jidNormalizedUser(botSock?.user?.id || botSock?.authState?.creds?.me?.id || '');
     if (meId && meId !== jid) return nameFor(meId);

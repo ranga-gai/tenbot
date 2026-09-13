@@ -1,10 +1,14 @@
 # Tennis Group Bot
 
-A WhatsApp bot for a tennis group. It coordinates who's free to play, schedules daily matches with a WhatsApp poll (auto-generating doubles matchups once it fills up), tracks match results and a leaderboard, checks weather for outdoor play, and answers general questions using Claude. It uses [Baileys](https://github.com/WhiskeySockets/Baileys) for WhatsApp integration.
+A WhatsApp bot for a tennis group. It coordinates who's free to play, schedules matches with WhatsApp polls (auto-generating singles/doubles matchups and rotations, or opt-in Yes/No polls), tracks match results and a leaderboard, syncs player ratings from TennisRecord, checks weather for outdoor play, and answers general questions using Claude. It uses [Baileys](https://github.com/WhiskeySockets/Baileys) for WhatsApp integration.
 
 # Development
 
-Directed by Pramod Immaneni with AI actors Antigravity & Claude and supporting crew SCVCC Early Morning Tennis Group.
+Authors:
+
+Pramod Immaneni <pramod.immaneni@gmail.com>
+Google Antigravity
+Anthropic Claude
 
 ## Setup
 
@@ -19,32 +23,67 @@ Directed by Pramod Immaneni with AI actors Antigravity & Claude and supporting c
    - Paste it into `.env` as `ANTHROPIC_API_KEY=sk-ant-...`
    - Note: this is the paid API, billed per token, separate from a claude.ai subscription
 
-3. **Set your default location** for weather checks — edit `DEFAULT_LOCATION` in `index.js` (defaults to `"San Jose, CA"`).
+3. **Set your default location & timezone** for weather checks and scheduling:
+   - Edit `DEFAULT_LOCATION` in `index.js` (defaults to `"San Jose, CA"`).
+   - Time resolution is anchored to San Jose, CA (`America/Los_Angeles` / Pacific Time).
 
 4. **Confirm your target group name**
-   - `TARGET_GROUP_NAME` in `index.js` is already set to `"Bot-testing"` — the bot only listens in a group with that exact name
-   - Scan the QR code that appears in your terminal (WhatsApp app → Settings → Linked Devices → Link a Device)
-   - If you rename the group or want to point at a different one, set `TARGET_GROUP_NAME` to `null`, restart, and send any message in the group you want — its name prints to the console — then copy that exact name back into `index.js`
+   - `TARGET_GROUP_NAME` in `index.js` is set to `"Bot-testing"` (or your group name in production) — the bot only listens in a group with that exact name.
+   - Scan the QR code that appears in your terminal (WhatsApp app → Settings → Linked Devices → Link a Device).
+   - If you rename the group or want to point at a different one, set `TARGET_GROUP_NAME` to `null`, restart, and send any message in the group you want — its name prints to the console — then copy that exact name back into `index.js`.
 
 5. **Run it**
    ```bash
    npm start
    ```
 
+---
+
 ## Scheduling matches with polls
 
-Send `@tenbot create a poll for 8` (or 4, 12, etc. — any multiple of 4) and the bot posts a native WhatsApp poll with numbered slots 1 through 8. Members tap a number to claim that spot.
+The bot supports two types of match polls:
 
-You can optionally include a day and/or time — the bot echoes it back in the poll title:
+### 1. Fixed-Spot Polls (Singles & Doubles)
+Send `@tenbot create a poll for 8` (or 2 for singles, 4, 12, etc. — any multiple of 4 for doubles).
+- The bot posts a native WhatsApp poll.
+- By default, the person requesting the poll is automatically added as **Player 1**, with open voting slots starting from **Player 2** (`Player 2` .. `Player 8`).
+- Once all spots are filled (each slot has exactly one voter), the bot automatically posts balanced singles/doubles matchups with court rotations.
+
+### 2. Yes/No Opt-In Polls (Unspecified Player Count)
+If no number of players is specified (e.g. `@tenbot create a poll for tomorrow 9am` or `@tenbot create a poll for tonight 6pm`):
+- The bot creates a poll with two options: **"Yes"** and **"No"**.
+- Players vote "Yes" to opt in.
+- Since the total number of players is not fixed ahead of time, the bot waits for a user prompt to generate matchups.
+- When ready, say `@tenbot generate matchups` (or `!matchups`, `!draw`, `!rematch`), and the bot generates singles (for 2 Yes voters) or doubles rotations (for 4, 8, 12... Yes voters), ignoring anyone who voted "No".
+
+---
+
+## Time & Date Handling (San Jose, CA)
+
+You can include a day and/or time in your request:
 
 ```
 @tenbot create a poll for 8 on Saturday at 9am
 ```
-→ poll titled "🎾 Vote for a spot! (8 spots -- Saturday 9am)", and the matchup announcement is headed with "📅 Saturday 9am" once it fills up.
+→ Poll titled `🎾 Creator's match: Vote for a spot! (8 spots -- Saturday 9am)`.
 
-Times need an `am`/`pm` (e.g. `9am`, `6:30pm`) for the bot to recognize them as a time rather than the player count — a 24-hour time like `18:00` won't be picked up as "when". Day names (today, tomorrow, tonight, or Monday–Sunday, full or abbreviated) are recognized regardless of case. If no day/time is given, the poll just says "for today's matches".
+* **Timezone**: All times are resolved in San Jose, California (Pacific Time).
+* **Past Day + Time Rejection**: If both a day and time are specified (e.g. `@tenbot create a poll for today at 9am` or `@tenbot create a poll for Saturday 9am` when it is Saturday evening) and that time has already passed, the bot **will not create the poll** and will ask the user to fix the day or time to an upcoming schedule.
+* **Past Time-Only Rollover**: If only a time is specified without a day (e.g. `@tenbot create a poll for 9am` requested in the evening), and that time has already passed today, the bot automatically schedules the poll for **the next day at that time** (`Tomorrow 9am`).
+* **Time formatting**: Times require an `am`/`pm` (e.g. `9am`, `6:30pm`, `7pm`). Day names (`today`, `tomorrow`, `tonight`, or `Monday`–`Sunday`) are recognized case-insensitively.
 
-Once every slot has exactly one vote, the bot automatically posts doubles matchups:
+---
+
+## Multiple Polls & 1-Hour Conflict Protection
+
+Multiple polls can be created concurrently for different times or by different members.
+* **1-Hour Window Check**: If an active match poll already exists within **1 hour** of a new poll's start time that includes the creator, the bot creates the new poll with **all slots open** (`Player 1` .. `Player <N>`) rather than auto-assigning the creator as Player 1.
+
+---
+
+## Matchup Rotations & Court Balancing
+
+Once a fixed poll fills or an opt-in poll draw is requested:
 
 ```
 🎾 All spots filled! Here are today's matchups:
@@ -58,19 +97,44 @@ Set 2:
   Court 2: Priya & John vs Sara & Lisa
 ```
 
-- **Courts**: players are split four to a court, so an 8-person poll makes 2 courts, a 4-person poll makes 1, a 12-person poll makes 3, etc. Matchups are listed by set, not by court, because the whole group is re-drawn for each set — you move courts as well as partners.
-- **Rotation**: each set is scored on the pairings it repeats, and the lowest-repeat draw wins. Within a session nobody partners the same person twice, and where the court count allows it you don't face the same opponents twice either. With 2 courts a complete swap would just put the same four people back together, so half the players stay put and the foursomes reshuffle instead.
-- **Freshness across weeks**: partners and opponents from the last 3 weeks are remembered in `pair-history.json` and counted against repeat pairings, weighted so last week's pairing matters about twice as much as one from two weeks ago. Over six weekly 8-person polls this typically uses all 28 possible partnerships before repeating any of them. Deleting the file is harmless — draws just go back to being unbiased.
-- **Even courts**: the draw also tries to keep the two pairing ratings on a court within **0.49** of each other (see [Player ratings](#player-ratings)). With 8 or more players this essentially always succeeds while still avoiding every repeat pairing. The ratings themselves aren't printed with the matchups — use `!ratings` to see them.
-- **Conflicts**: if two people vote for the same numbered slot, the bot posts a heads-up naming who needs to switch, and won't generate matchups until every slot has exactly one voter.
+- **Courts**: Players are split 4 to a court (8 players = 2 courts, 12 players = 3 courts, etc.).
+- **Rotations**: Lowest-repeat draws ensure players partner with different teammates each set and face different opponents.
+- **Freshness across weeks**: Past partnerships from the last 3 weeks are remembered in `pair-history.json` and weighted to avoid repeat pairings across sessions.
+- **Even courts**: The draw balances pairings so court rating sums are within **0.49** of each other.
+- **Slot Conflicts**: In fixed-spot polls, if multiple voters pick the same number, the bot alerts the group to switch slots before generating matchups.
 
-Related commands:
-- `!cancelpoll` — stop the current poll from auto-generating matchups (e.g. if plans changed)
-- `!rematch` — re-run matchup generation from the same poll's final votes (useful if someone drops out and you want fresh pairings among the rest — you'd still need to manually adjust the player list logic if the group size changes). A rematch replaces that poll's entry in the pairing history rather than adding a second one, so re-rolling doesn't make the session count double against future draws.
+---
 
-**Note on phrasing**: poll creation is triggered by any `@tenbot` message containing the word "poll" plus a number — it's a simple keyword match, not full natural-language understanding. `@tenbot create a poll for 8` works; something like `@tenbot what was that poll about pizza last week` would also trigger it, but only when it contains a number too, so it's a narrow enough phrase in practice not to misfire on typical group chatter. If you want a stricter phrase, edit the regex in `getResponse()` in `index.js`.
+## Player Ratings
 
-## Other commands
+Every player carries a rating between **2.50 and 4.50**, formatted to two decimals:
+- **Initial Rating**: When a player is first encountered, the bot looks up their estimated dynamic rating or NTRP benchmark rating on [TennisRecord.com](https://www.tennisrecord.com/). If not found, their rating starts at **3.49**.
+- **User Rating Adjustments**: Users can update their own rating anytime:
+  - `@tenbot my rating is 4.0` or `@tenbot set my rating to 3.5`
+  - Command: `!setrating 4.0` (or `!myrating 4.0`)
+- **Rating Movement**: Ratings adjust dynamically after match scores are reported:
+  - Higher-rated pairing wins: `0.01 × game margin`
+  - Underdog wins (upset): `gap × (game margin / 12)`
+- Ratings are saved in `ratings.json` and viewed with `!ratings`.
+
+---
+
+## Reporting Results in Plain Words
+
+Results can be logged using `!score` or in plain conversational text addressed to `@tenbot`:
+
+```
+@tenbot Mike & Sara beat John & Alex 6-4 6-2   → recorded as written
+@tenbot John & Alex lost to Mike & Sara 6-4    → same result, sides swapped
+@tenbot Mike & Sara vs John & Alex 4-6 6-3     → neutral, winner parsed from score
+@tenbot Mike beat John                         → no score given, 6-3 assumed
+@tenbot Mike & Sara won                        → opponents filled in from today's draw
+@tenbot we beat John & Alex 6-1                → "we" resolves to sender and partner
+```
+
+---
+
+## Command Reference
 
 | Command | What it does |
 |---|---|
@@ -78,91 +142,25 @@ Related commands:
 | `!free` | Shows everyone currently marked as free |
 | `!notfree` | Removes you from the availability list |
 | `!clearfree` | Clears the whole availability list |
-| `!score <winner> def <loser> <score>` | Records a match and updates ratings, e.g. `!score Mike & Sara def John & Alex 6-4 6-2`. You can also [tell the bot in words](#reporting-results-in-plain-words) instead of using the command |
+| `!score <winner> def <loser> <score>` | Records a match and updates ratings, e.g. `!score Mike & Sara def John & Alex 6-4 6-2` |
 | `!leaderboard` | Shows the win/loss leaderboard |
-| `!ratings` | Shows player ratings, strongest first |
-| `!weather [location]` | 3-day forecast; defaults to `DEFAULT_LOCATION` if you don't specify one |
-| `!reset` | Clears the bot's conversation memory for this chat |
+| `!ratings` | Shows all player ratings, strongest first |
+| `!setrating <rating>` | Sets or updates your player rating (`2.50`–`4.50`), e.g. `!setrating 4.0` |
+| `!matchups` / `!draw` / `!rematch` | Generates matchups from Yes votes in an opt-in poll, or re-draws an existing match |
+| `!cancelpoll` | Cancels the active poll |
+| `!pollstatus` | Debug: shows raw vote tallies and voter lists for active polls |
+| `!cleanuppolls` | Debug: removes expired/completed polls |
+| `!weather [location]` | 3-day forecast for outdoor play (defaults to San Jose, CA) |
+| `!reset` | Clears the bot's conversation memory for the chat |
 | `!ping` / `!help` | Health check / command list |
-| `@tenbot <question>` | Ask anything — answered by Claude, with live availability/leaderboard/poll data as context |
+| `@tenbot <message>` | Ask anything — answered by Claude with live group, poll, and ratings context |
 
-The `@tenbot` prefix keeps the bot from replying to every single message. Change or remove it via `TRIGGER_PREFIX` in `index.js`.
+---
 
-## Player ratings
+## Data & Persistence
 
-Every player carries a rating between **2.50 and 4.50**, to two decimals, starting at **3.49**. A **pairing's rating is the sum of its two players'**, so two fresh players pair at 6.98. Ratings are stored in `ratings.json` and shown by `!ratings`; a player is seeded at the starting rating the first time a poll they're in fills up.
-
-Ratings do two things: they balance the draw (courts aim to be within 0.49, see above), and they move when a result is recorded — either with `!score` or by [telling the bot in words](#reporting-results-in-plain-words).
-
-**How a set moves ratings** — each set in a recorded score is applied in order, and what happens depends on the pairing ratings going into that set:
-
-| Outcome | Movement per player |
-|---|---|
-| Higher-rated pairing wins | `0.01 × game margin` — up for the winners, down for the losers |
-| Lower-rated pairing wins (upset) | `pairing-rating gap × (game margin / 12)` — up for the winners, down for the losers |
-
-So a 6-4 win by the favourites moves everyone 0.02. The same 6-4 as an upset, with a 0.40 gap between the pairings, moves everyone `0.40 × 2/12 = 0.07` — beating a stronger pairing is worth more, and worth most when you beat them convincingly. Deltas are rounded to the nearest 0.01 and every rating is capped to the 2.50–4.50 band. Equal pairing ratings count as a favourite win, since there'd be no gap for the upset formula to divide up. A tied set (e.g. `6-6`) moves nobody.
-
-Multi-set scores are applied set by set, each seeing the ratings the previous set left behind — so the favourite can change partway through a match, as in `!score Mike & Sara def John & Alex 4-6 6-2`.
-
-## Reporting results in plain words
-
-Results don't have to go through `!score`. Tell the bot in ordinary language and it records the same thing — it just has to be addressed to the bot, like anything else it acts on:
-
-```
-@tenbot Mike & Sara beat John & Alex 6-4 6-2   → recorded as written
-@tenbot John & Alex lost to Mike & Sara 6-4    → same result, sides swapped
-@tenbot Mike & Sara vs John & Alex 4-6 6-3     → neutral, so the score says who won
-@tenbot Mike beat John                         → no score given, so 6-3 is assumed
-@tenbot Mike & Sara won                        → opponents filled in from today's draw
-@tenbot we beat John & Alex 6-1                → "we" is the sender and their partner
-@tenbot Great match! Mike & Sara beat John & Alex 6-4
-```
-
-**A message with no score at all counts as a 6-3 set** — the shorthand for "we played a set and this is who won". The bot says which parts it filled in when it replies.
-
-Results said to the group without addressing the bot are **not** recorded. That's deliberate: the bot stays out of ordinary chatter, and nothing moves anyone's rating unless someone asked for it.
-
-Within an addressed message it's still strict about what counts as a result, so `@tenbot` questions and requests aren't mistaken for one. It ignores anything containing a `?`, so `@tenbot did Mike beat John?` gets answered rather than recorded. Every name has to be someone it already knows — a rated player, someone in the current poll, or someone on the availability list — so `@tenbot Mike won the lottery` and `@tenbot Bob beat Charlie 6-4` (Bob being nobody in the group) fall through to a normal reply. Anything left over after the names has to be filler like "in the first set", not arbitrary text. And an identical result restated within 10 minutes is treated as the same set, not a second one.
-
-Two forms only work when the draw settles them. `Mike & Sara won` needs that exact pairing in the current session to know who they beat. A lone player (`Mike won`, `we won`) has to belong to exactly one pairing in the draw — in a normal two-set session a player has two different partners, so the bot stays quiet rather than guess which set you meant. Naming the opponents resolves it (`we beat John & Alex 6-1`), and so does naming the pairing.
-
-`!score` stays the explicit route and is looser about names: it takes whatever you give it, which is how a player who's never been in a poll gets their first result logged. It also works without the `@tenbot` prefix, like every other `!` command.
-
-**One wrinkle worth knowing if you change `TRIGGER_PREFIX`**: this group has a player called *tenbot*, the same word as the trigger. The bot strips its own name from a message wherever it appears, which would delete that player from a result — so result parsing tries the message untouched first, then with just a leading `@tenbot` removed, taking the least-edited reading that makes sense. `@tenbot PI & tenbot beat Latha & Prasanna 6-4` records correctly. (A side effect of the same trigger matching: a message naming that player counts as addressing the bot, so `PI & tenbot beat Latha & Prasanna 6-4` is recorded even without the prefix.)
-
-## How data is stored
-
-Availability and match results are saved to a local `data.json` file (created automatically on first use) so they survive restarts. Recent partner/opponent pairings go in `pair-history.json` (see "Freshness across weeks" above), pruned to the last 3 weeks each time it's written. Player ratings live in `ratings.json`.
-
-**Polls are different**: poll state (who's voted for what, whether it's resolved) lives in memory only, not in `data.json`, because the data involves WhatsApp's internal message/vote objects which don't serialize cleanly to JSON. This means **if the bot restarts while a poll is still open, that poll's vote progress is lost** — people would need to re-vote, or you'd create a new poll. For a same-day, same-session use case (create the poll, everyone votes over the next hour, matchups get posted) this isn't a practical issue, but it's worth knowing if you're planning to leave polls open across bot restarts.
-
-## Grounding the LLM in real data
-
-When someone asks the bot something via `@tenbot`, it includes a live snapshot of current availability, the top of the leaderboard, recent match results, and the status of any active poll in the system prompt — so questions like "who's free this weekend?" or "has the poll filled up yet?" get answered from your actual group data instead of the model guessing. The instructions also tell it to say so if the answer isn't in that data, rather than making something up.
-
-## Weather
-
-Uses [Open-Meteo](https://open-meteo.com) — free, no API key needed. It geocodes whatever location you give it (or `DEFAULT_LOCATION` if none), then pulls a 3-day forecast with expected temps and rain probability.
-
-## Session persistence
-
-The bot uses `useMultiFileAuthState`, saving your login session to a local `auth_info_baileys/` folder after the first QR scan. If you ever get logged out, delete that folder and re-scan.
-
-## Troubleshooting
-
-- **QR code not scanning / times out**: restart the bot and try again; make sure your phone has an internet connection.
-- **Connection keeps closing and reconnecting in a loop**: usually a stale session — delete `auth_info_baileys/` and re-scan.
-- **Bot not responding in group**: double check `TARGET_GROUP_NAME` matches the group name exactly (case-sensitive — currently `"Bot-testing"`), and that your message uses a valid command or starts with `@tenbot`.
-- **`!score` says it couldn't parse the message**: the format is strict — `!score <winner> def <loser> <score>`, with scores as space-separated `N-N` pairs (e.g. `6-4 6-2`).
-- **Weather lookup fails**: usually means the location name didn't match anything in the geocoding lookup — try a more specific or differently-spelled name.
-- **A result told to the bot in words wasn't picked up**: first check it was addressed to the bot — results said to the group without `@tenbot` are ignored on purpose. Otherwise the console logs every report it understands, so look there next. The usual causes are a name the bot doesn't know yet (it only trusts rated players, poll players and the availability list), a `?` somewhere in the message, extra words it can't account for, or a lone-player report like `we won` that the current draw doesn't pin down — see [Reporting results in plain words](#reporting-results-in-plain-words). `!score` always works as the fallback.
-- **Poll doesn't trigger matchups even though it looks full**: check the console log for a conflict warning — if two people picked the same number, the bot is waiting for one of them to switch before it'll generate matchups. Also confirm the poll size was a multiple of 4 when created.
-- **Voter shows up as "Player (1234)" instead of their name**: the bot labels voters using names it's seen from their regular text messages in the group. If someone votes in a poll without ever having sent a text message the bot saw, it won't have a name for them yet — ask them to send any message in the group once, and future polls will show their name correctly.
-
-## Ideas to extend further
-
-- **Persist poll state properly** — swap the in-memory poll tracking for a lightweight database if you want polls to survive restarts
-- **Court booking reminders** — combine with `node-cron` to auto-create the daily poll at a set time each morning
-- **Head-to-head stats** — extend `getLeaderboard()` in `lib/storage.js` to show win/loss records between specific pairs of players
-- **Rain-check auto-nudge** — check `!weather` automatically the morning of a scheduled match and warn the group if rain is likely
+- **Polls**: Tracked in `poll-state.json` and survives bot restarts.
+- **Availability & Leaderboard**: Saved in `data.json`.
+- **Pairing History**: Saved in `pair-history.json`.
+- **Ratings**: Saved in `ratings.json`.
+- **WhatsApp Session**: Stored in `auth_info_baileys/`.
