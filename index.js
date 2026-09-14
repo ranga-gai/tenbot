@@ -264,13 +264,7 @@ const chatHistories = new Map();
 // Cache of group metadata (id -> metadata) so we don't refetch on every message
 const groupMetadataCache = new Map();
 
-// Bidirectional LID <-> Phone Number JID mappings
-const lidToPn = new Map();
-const pnToLid = new Map();
-
-// Best-effort JID -> display name map, built up from messages we see.
-// Poll votes only carry a JID, not a name, so this is how we label voters.
-const knownNames = new Map();
+// Bidirectional LID <-> Phone Number JID mappings and knownNames loaded from pollStore below
 
 // Generic placeholder names that shouldn't match across different users by name alone
 const GENERIC_NAMES = new Set(['someone', 'player', 'player 1', 'player 2', 'player 3', 'player 4', 'me']);
@@ -286,19 +280,21 @@ const FREEFORM_DUPLICATE_WINDOW_MS = 10 * 60 * 1000;
 // Active WhatsApp socket reference
 let botSock = null;
 
-// Poll-related state is persisted to poll-state.json so polls survive a bot
-// restart. Loaded once here at startup; storeKey() below is used both for
-// the in-memory maps and as the persisted key format.
+// Poll-related state and voter display name mappings are persisted to poll-state.json
+// so voter identities survive a bot restart.
 const {
   messageStore,   // `${remoteJid}:${id}` -> stored WAMessage content, needed for getMessage() and vote decoding
   activePolls,    // pollId -> { remoteJid, size, type, when, playAt, status, creator, lastConflictSignature, voteBuffer, lastPlayers, isManual }
-  latestPollIdByChat // chatId -> pollId, so "!cancelpoll"/"!rematch"/"!pollstatus" know which poll to act on
+  latestPollIdByChat, // chatId -> pollId, so "!cancelpoll"/"!rematch"/"!pollstatus" know which poll to act on
+  knownNames,     // JID/LID -> display name mapping
+  lidToPn,        // LID -> Phone Number JID mapping
+  pnToLid         // Phone Number JID -> LID mapping
 } = pollStore.load();
 
 const storeKey = (remoteJid, id) => `${remoteJid}:${id}`;
 
 function persistPolls() {
-  pollStore.save({ messageStore, activePolls, latestPollIdByChat });
+  pollStore.save({ messageStore, activePolls, latestPollIdByChat, knownNames, lidToPn, pnToLid });
 }
 
 function escapeRegex(str) {
@@ -660,16 +656,19 @@ function stripLeadingTrigger(text) {
  */
 function recordName(jid, name) {
   if (!jid || !name) return;
+  const trimmed = String(name).trim();
+  if (!trimmed) return;
   const raw = jid;
   const norm = jidNormalizedUser(jid);
-  knownNames.set(raw, name);
+  knownNames.set(raw, trimmed);
   if (norm) {
-    knownNames.set(norm, name);
+    knownNames.set(norm, trimmed);
     const pn = lidToPn.get(norm);
-    if (pn) knownNames.set(pn, name);
+    if (pn) knownNames.set(pn, trimmed);
     const lid = pnToLid.get(norm);
-    if (lid) knownNames.set(lid, name);
+    if (lid) knownNames.set(lid, trimmed);
   }
+  persistPolls();
 }
 
 /**
@@ -788,9 +787,14 @@ async function getGroupMetadata(sock, remoteJid) {
     for (const p of metadata.participants) {
       const pn = jidNormalizedUser(p.id || p.jid);
       const lid = jidNormalizedUser(p.lid);
+      const name = p.name || p.notify || p.verifiedName;
       if (pn && lid) {
         lidToPn.set(lid, pn);
         pnToLid.set(pn, lid);
+      }
+      if (name) {
+        if (pn) recordName(pn, name);
+        if (lid) recordName(lid, name);
       }
     }
   }
@@ -993,6 +997,24 @@ async function startBot() {
   }
 
   sock.ev.on('creds.update', saveCreds);
+
+  sock.ev.on('contacts.upsert', (contacts) => {
+    for (const c of contacts) {
+      const name = c.name || c.notify || c.verifiedName;
+      if (name && c.id) {
+        recordName(c.id, name);
+      }
+    }
+  });
+
+  sock.ev.on('contacts.update', (updates) => {
+    for (const c of updates) {
+      const name = c.name || c.notify || c.verifiedName;
+      if (name && c.id) {
+        recordName(c.id, name);
+      }
+    }
+  });
 
   sock.ev.on('connection.update', (update) => {
     const { connection, lastDisconnect, qr } = update;
@@ -1906,8 +1928,15 @@ async function processPollVoteEvent(sock, pollMessageKey, rawPollUpdates) {
       continue;
     }
 
+    const rawParticipantPn = u.pollUpdateMessageKey?.participantPn ? jidNormalizedUser(u.pollUpdateMessageKey.participantPn) : null;
+    if (voterNormalized && rawParticipantPn) {
+      if (voterNormalized.endsWith('@lid') && rawParticipantPn.endsWith('@s.whatsapp.net')) {
+        lidToPn.set(voterNormalized, rawParticipantPn);
+        pnToLid.set(rawParticipantPn, voterNormalized);
+      }
+    }
     const voterLid = pnToLid.get(voterNormalized) || (voterNormalized?.endsWith('@lid') ? voterNormalized : null);
-    const voterPn = lidToPn.get(voterNormalized) || (voterNormalized?.endsWith('@s.whatsapp.net') ? voterNormalized : null);
+    const voterPn = rawParticipantPn || lidToPn.get(voterNormalized) || (voterNormalized?.endsWith('@s.whatsapp.net') ? voterNormalized : null);
 
     const voterCandidates = [
       voterNormalized,
@@ -2198,10 +2227,24 @@ function nameFor(jid) {
     return 'Me';
   }
   const norm = jidNormalizedUser(jid) || jid;
-  const pn = lidToPn.get(norm) || norm;
+  const pn = lidToPn.get(norm) || (norm?.endsWith('@s.whatsapp.net') ? norm : null);
+  const lid = pnToLid.get(norm) || (norm?.endsWith('@lid') ? norm : null);
+
   if (knownNames.has(norm)) return knownNames.get(norm);
-  if (knownNames.has(pn)) return knownNames.get(pn);
+  if (pn && knownNames.has(pn)) return knownNames.get(pn);
+  if (lid && knownNames.has(lid)) return knownNames.get(lid);
   if (knownNames.has(jid)) return knownNames.get(jid);
+
+  // Check if this JID matches any creator or voter in activePolls
+  for (const [, pollState] of activePolls.entries()) {
+    if (pollState.creator?.jid && (pollState.creator.jid === norm || pollState.creator.jid === pn || pollState.creator.jid === lid)) {
+      if (pollState.creator.name) {
+        recordName(norm, pollState.creator.name);
+        return pollState.creator.name;
+      }
+    }
+  }
+
   const digits = (pn || norm || jid).split('@')[0].replace(/\D/g, '');
   if (digits.length >= 4) {
     return `Player (${digits.slice(-4)})`;
