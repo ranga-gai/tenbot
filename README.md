@@ -27,7 +27,7 @@ Authors:
    - Time resolution is anchored to San Jose, CA (`America/Los_Angeles` / Pacific Time).
 
 4. **Confirm your target group name**
-   - `TARGET_GROUP_NAME` in `index.js` is set to `"Bot-testing"` (or your group name in production) — the bot only listens in a group with that exact name.
+   - `TARGET_GROUP_NAME` in `index.js` is set to your group name — the bot only listens in a group with that exact name.
    - Scan the QR code that appears in your terminal (WhatsApp app → Settings → Linked Devices → Link a Device).
    - If you rename the group or want to point at a different one, set `TARGET_GROUP_NAME` to `null`, restart, and send any message in the group you want — its name prints to the console — then copy that exact name back into `index.js`.
 
@@ -55,12 +55,16 @@ If no number of players is specified (e.g. `@tenbot create a poll for tomorrow 9
 - Since the total number of players is not fixed ahead of time, the bot waits for a user prompt to generate matchups.
 - When ready, say `@tenbot generate matchups` (or `!matchups`, `!draw`, `!rematch`), and the bot generates singles (for 2 Yes voters) or doubles rotations (for 4, 8, 12... Yes voters), ignoring anyone who voted "No".
 
-### 3. Manually Created Tennis Match Polls (Passive Tracking & Creator Inclusion)
+### 3. Manually Created Tennis Match Polls (Passive Tracking & Extra Player Resolution)
 If a poll for scheduling matches is created manually by a user directly in WhatsApp:
 - The bot **passively tracks** the match poll and its votes without making any changes to the poll or sending slot conflict warnings.
 - The bot **will not automatically create matchups** when the poll is filled.
 - The bot answers questions about the poll (e.g. `@tenbot who has voted for Saturday's poll?`, `@tenbot who is playing?`, `@tenbot how many spots left?`).
-- **Creator Inclusion & Player Count Resolution**: When answering who is playing (both while voting is in progress before all votes are in, and when voting is completed) or when generating matchups, if the number of players who have voted does not meet a valid total player count configuration (2 for singles, or a multiple of 4 for doubles), the bot **includes the creator of the poll as one of the players**.
+- **Poll Labels & Player Resolution Rules**:
+  - **Label Check First (Starting Slot > 1)**: The bot performs a label check first. If the first label doesn't start with the first player (e.g. text like `3` or `Player 3`), the bot includes extra players equal to one less than the first label (e.g. `3 - 1 = 2` extra players: `cname`, `cname 2`).
+  - **Valid Total Player Count Check (First Label Index 1 Only)**: Only if the first vote label has index 1 (starts with slot 1 / `Player 1` / opt-in) is the valid total player count check applied (2 for singles, multiples of 4 for doubles), and **only if all vote slots have been filled**. If voting is still in progress and not all slots are filled, extra players are not added.
+  - **Extra Player Naming**: Extra player names are generated using the poll creator's name (`cname`): the first extra player is `cname`, the second is `cname 2`, the third is `cname 3`, and so on.
+  - **Do Not Always Include Creator**: If a poll starts at slot 1 and already has a valid player count (e.g. 2 for singles, 4/8/12 for doubles), the creator is not automatically added unless they voted in the poll.
 - **Matchup Generation on Demand**: If and only if users explicitly ask to create matchups on a manually created match poll (e.g. `@tenbot generate matchups`, `!matchups`, or `!draw`), the bot generates matchups using the exact same rules as bot-created polls.
 
 ### 4. Non-Match / General Polls

@@ -20,9 +20,8 @@
  *       - Manually Created Match Polls: The bot passively tracks user-created tennis match polls and their
  *         votes without making any changes or auto-generating matchups. It answers questions about them
  *         (who voted, who is playing, etc.) and generates matchups with the same court-balancing and rating rules
- *         IF AND ONLY IF users explicitly request it. When answering who is playing (both while voting is in progress
- *         and when voting finishes), if the number of players who have voted does not meet a valid total player count
- *         configuration (2 for singles, multiples of 4 for doubles), the bot includes the creator of the poll as one of the players.
+ *         IF AND ONLY IF users explicitly request it. When determining who is playing, the bot performs a label check first
+ *         (if first slot > 1, adds leading extra players); if first slot is 1, it only applies the valid count check if all vote slots are filled.
  *         Non-match polls are not tracked.
  *       - Poll deletions & modifications: When cancelling/deleting a poll or modifying/replacing a poll,
  *         the bot also deletes the older poll message directly from WhatsApp. When a poll is deleted directly in WhatsApp
@@ -115,9 +114,10 @@ const SYSTEM_PROMPT =
   'Non-match polls (such as food, social, or general polls) are not tracked. ' +
   'For tracked manual match polls, do not make any changes or auto-generate matchups when they fill up. ' +
   'Answer questions about manual match polls when asked (who voted, who is playing, current count, etc.). ' +
-  'For manual match polls, when answering who is playing (both while voting is in progress before all votes are in, and when voting is completed), ' +
-  'if the number of players who voted so far does not meet a valid total player count configuration (2 for singles, multiples of 4 for doubles), ' +
-  'always include the creator of the poll as one of the players playing. ' +
+  'For manual match polls, the context blurb below provides the exact "Players currently in/playing" list based on the rules. ' +
+  'When asked who is playing, who has voted, or how many spots are left, rely strictly on the provided "Players currently in/playing" list. ' +
+  'Do NOT include the creator unless they actually voted or are explicitly listed in "Players currently in/playing". ' +
+  'For polls starting at slot 1, extra players / creator are NEVER included while voting is still in progress (only when all vote slots are filled and count is invalid). ' +
   'If and ONLY IF users explicitly ask to create matchups or draw on a user-created manual match poll (e.g. "@tenbot generate matchups", "!matchups", "make the draw for the poll"), ' +
   'call generate_matchups to generate matchups using the exact same rules as bot polls (singles for 2, doubles for multiples of 4, ratings balancing, lowest repeat rotations). ' +
   'Results can be reported to you in plain words ("Mike & Sara ' +
@@ -188,7 +188,7 @@ const CLAUDE_TOOLS = [
   },
   {
     name: 'generate_matchups',
-    description: 'Generates and posts singles/doubles matchups and rotations from current poll votes. Supports bot-created polls, Yes/No opt-in polls, and user-created manual tennis scheduling polls when explicitly requested. For manual match polls, if player count does not match valid configurations (2 or multiples of 4), includes the poll creator.',
+    description: 'Generates and posts singles/doubles matchups and rotations from current poll votes. Supports bot-created polls, Yes/No opt-in polls, and user-created manual tennis scheduling polls when explicitly requested. For manual match polls, uses poll labels and adds creator / extra players (<creatorName>, <creatorName> 2, <creatorName> 3, etc.) until a valid player count configuration (2 or multiples of 4) is reached.',
     input_schema: {
       type: 'object',
       properties: {}
@@ -333,24 +333,103 @@ function isValidPlayerCount(n) {
  * For manually created match polls: if the voting player count does not meet a valid configuration
  * (2 for singles, multiples of 4 for doubles), include the creator of the poll as one of the players.
  */
-function resolveManualPollPlayers(targetPollState, currentPlayers) {
-  const players = [...currentPlayers];
-  if (isValidPlayerCount(players.length)) {
-    return { players, addedCreator: false };
+/**
+ * Returns the next higher valid player count configuration (2 for singles, or multiples of 4 for doubles).
+ */
+function getNextValidPlayerCount(n) {
+  if (n <= 2) return 2;
+  return Math.ceil(n / 4) * 4;
+}
+
+/**
+ * Extracts the slot number from the first option/label if present (e.g. "3", "Player 3", "Spot 3" -> 3).
+ */
+function getFirstSlotNumber(options) {
+  if (!options || options.length === 0) return null;
+  const firstLabel = String(options[0]).trim();
+  const match = firstLabel.match(/^(?:player|spot|slot|court|#|no\.?|num\.?)\s*(\d+)\b/i) ||
+                firstLabel.match(/\b(\d+)\b/);
+  if (match) {
+    const num = parseInt(match[1], 10);
+    if (Number.isFinite(num) && num >= 1) return num;
   }
+  return null;
+}
 
-  const creatorName = targetPollState.creator?.name || (targetPollState.creator?.jid ? nameFor(targetPollState.creator.jid) : 'Creator');
+/**
+ * Adds the next available player name for the creator:
+ * 1st: "<cname>", 2nd: "<cname> 2", 3rd: "<cname> 3", etc.
+ */
+function addNextCreatorPlayer(players, creatorName) {
   const creatorKey = ratings.keyFor(creatorName);
-  let addedCreator = false;
-
-  // Include the creator of the poll as one of the players if not already in the list
   const isCreatorInList = players.some((p) => ratings.keyFor(p) === creatorKey);
   if (!isCreatorInList && !GENERIC_NAMES.has(creatorKey)) {
     players.push(creatorName);
-    addedCreator = true;
+    return creatorName;
   }
 
-  return { players, addedCreator };
+  let suffix = 2;
+  while (true) {
+    const candidate = `${creatorName} ${suffix}`;
+    const candidateKey = ratings.keyFor(candidate);
+    if (!players.some((p) => ratings.keyFor(p) === candidateKey)) {
+      players.push(candidate);
+      return candidate;
+    }
+    suffix++;
+  }
+}
+
+/**
+ * For manually created match polls:
+ * 1. Perform label check first: if the first label doesn't start with first player (e.g. 3 or Player 3),
+ *    include extra players to count of one less than the first label (e.g. 3 - 1 = 2: "cname", "cname 2").
+ * 2. Add current voters/players.
+ * 3. For Valid Total Player Count Check (First Label Index 1 Only): only apply the valid count check
+ *    for extra players if all vote slots have been filled (or for opt-in Yes/No polls).
+ * 4. Extra player names are generated using the creator name: "cname", "cname 2", "cname 3", etc.
+ */
+function resolveManualPollPlayers(targetPollState, currentPlayers) {
+  const creatorName = targetPollState.creator?.name || (targetPollState.creator?.jid ? nameFor(targetPollState.creator.jid) : 'Creator');
+  const options = targetPollState.options || [];
+  const firstSlotNum = getFirstSlotNumber(options);
+
+  const players = [];
+  const addedFromLabel = [];
+  const addedFromValidCount = [];
+
+  // 1. Perform label check first: if first label starts at slot > 1 (e.g. 3 or Player 3 -> needs (3-1)=2 leading extra players)
+  if (firstSlotNum && firstSlotNum > 1) {
+    const leadingNeeded = firstSlotNum - 1;
+    for (let i = 0; i < leadingNeeded; i++) {
+      const name = addNextCreatorPlayer(players, creatorName);
+      addedFromLabel.push(name);
+    }
+  }
+
+  // 2. Add current voters/players
+  for (const p of currentPlayers) {
+    if (!players.some((existing) => ratings.keyFor(existing) === ratings.keyFor(p))) {
+      players.push(p);
+    }
+  }
+
+  // 3. ONLY if first vote label has index 1 AND all vote slots have been filled, apply valid total player count check
+  const isOptIn = targetPollState.type === 'opt_in' || options.some((o) => /^yes$/i.test(o));
+  const isFirstVoteLabelSlot1 = firstSlotNum === 1 || (firstSlotNum === null && isOptIn);
+  const allSlotsFilled = isOptIn || (options.length > 0 && currentPlayers.length >= options.length);
+
+  if (isFirstVoteLabelSlot1 && allSlotsFilled && !isValidPlayerCount(players.length)) {
+    const targetCount = getNextValidPlayerCount(players.length);
+    while (players.length < targetCount) {
+      const name = addNextCreatorPlayer(players, creatorName);
+      addedFromValidCount.push(name);
+    }
+  }
+
+  const addedExtra = [...addedFromLabel, ...addedFromValidCount];
+  const addedCreator = addedExtra.includes(creatorName);
+  return { players, addedCreator, addedExtra, addedFromLabel, addedFromValidCount };
 }
 
 /**
@@ -951,25 +1030,40 @@ async function startBot() {
 
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
     for (const msg of messages) {
+      const remoteJid = msg.key?.remoteJid;
+      const isGroup = remoteJid && remoteJid.endsWith('@g.us');
+      if (!isGroup) continue;
+
+      const metadata = await getGroupMetadata(sock, remoteJid);
+      const groupName = metadata?.subject || remoteJid;
+
+      if (!TARGET_GROUP_NAME) {
+        console.log(`[Group seen] "${groupName}" (id: ${remoteJid})`);
+        continue;
+      }
+
+      if (groupName !== TARGET_GROUP_NAME) {
+        continue; // Ignore messages not meant for TARGET_GROUP_NAME
+      }
+
       // Check for message revocation (deleted for everyone in WhatsApp)
       const protocolMsg = msg.message?.protocolMessage;
       if (protocolMsg && (protocolMsg.type === 0 || protocolMsg.key?.id)) {
         const deletedId = protocolMsg.key?.id;
         if (deletedId && activePolls.has(deletedId)) {
-          handlePollDeleted(msg.key?.remoteJid || protocolMsg.key?.remoteJid, deletedId);
+          handlePollDeleted(remoteJid || protocolMsg.key?.remoteJid, deletedId);
         }
       }
 
       // Remember voter's display name if present
-      if (msg.pushName && (msg.key.participant || msg.key.remoteJid)) {
-        const rawJid = msg.key.participant || msg.key.remoteJid;
+      if (msg.pushName && (msg.key.participant || remoteJid)) {
+        const rawJid = msg.key.participant || remoteJid;
         recordName(rawJid, msg.pushName);
       }
 
       // Check for incoming poll creation message (bot-created or user-created in group)
       const pollCreation = msg.message?.pollCreationMessage || msg.message?.pollCreationMessageV2 || msg.message?.pollCreationMessageV3;
       if (pollCreation) {
-        const remoteJid = msg.key.remoteJid;
         const pollId = msg.key.id;
 
         // If not already tracked by bot, check if this manually created poll is for tennis match scheduling
@@ -985,7 +1079,7 @@ async function startBot() {
 
           messageStore.set(storeKey(remoteJid, pollId), msg.message);
           const creatorName = msg.pushName || (msg.key.participant ? nameFor(msg.key.participant) : 'Someone');
-          const creatorJid = msg.key.participant || msg.key.remoteJid || null;
+          const creatorJid = msg.key.participant || remoteJid || null;
 
           const dayMatch = pollName.match(/\b(today|tonight|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tue|wed|thu|fri|sat|sun)\b/i);
           const timeMatch = pollName.match(/\b(\d{1,2}(?::\d{2})?\s*(?:am|pm))\b/i);
@@ -1040,7 +1134,7 @@ async function startBot() {
       if (type !== 'notify') continue;
 
       try {
-        await handleMessage(sock, msg);
+        await handleMessage(sock, msg, groupName);
       } catch (err) {
         console.error('Error handling message:', err && err.message ? err.message : err);
         console.error(err && err.stack ? err.stack : '(no stack trace available)');
@@ -1051,11 +1145,19 @@ async function startBot() {
   // Poll votes and message revocations also arrive here on some Baileys setups.
   sock.ev.on('messages.update', async (updates) => {
     for (const { key, update } of updates) {
+      const remoteJid = key?.remoteJid || update.key?.remoteJid;
+      if (!remoteJid || !remoteJid.endsWith('@g.us')) continue;
+      if (TARGET_GROUP_NAME) {
+        const metadata = await getGroupMetadata(sock, remoteJid);
+        const groupName = metadata?.subject || remoteJid;
+        if (groupName !== TARGET_GROUP_NAME) continue;
+      }
+
       // Check if a tracked poll message was revoked/deleted (message set to null)
       if (update && update.message === null) {
         const deletedId = key?.id || update.key?.id;
         if (deletedId && activePolls.has(deletedId)) {
-          handlePollDeleted(key?.remoteJid || update.key?.remoteJid, deletedId);
+          handlePollDeleted(remoteJid, deletedId);
         }
       }
 
@@ -1073,6 +1175,13 @@ async function startBot() {
 
   // Handle message deletion events emitted by Baileys
   sock.ev.on('messages.delete', async (item) => {
+    const jid = item.jid || (Array.isArray(item.keys) && item.keys[0]?.remoteJid);
+    if (jid && jid.endsWith('@g.us') && TARGET_GROUP_NAME) {
+      const metadata = await getGroupMetadata(sock, jid);
+      const groupName = metadata?.subject || jid;
+      if (groupName !== TARGET_GROUP_NAME) return;
+    }
+
     if (item.all && item.jid) {
       for (const [pollId, pollState] of [...activePolls.entries()]) {
         if (pollState.remoteJid === item.jid) {
@@ -1089,25 +1198,10 @@ async function startBot() {
   });
 }
 
-async function handleMessage(sock, msg) {
+async function handleMessage(sock, msg, groupName) {
   if (!msg.message || msg.key.fromMe) return;
 
   const remoteJid = msg.key.remoteJid;
-  const isGroup = remoteJid && remoteJid.endsWith('@g.us');
-  if (!isGroup) return;
-
-  const metadata = await getGroupMetadata(sock, remoteJid);
-  const groupName = metadata?.subject || remoteJid;
-
-  console.log(`Received message from group ${groupName}`);
-
-  if (!TARGET_GROUP_NAME) {
-    console.log(`[Group seen] "${groupName}" (id: ${remoteJid})`);
-    return;
-  }
-
-  if (groupName !== TARGET_GROUP_NAME) return;
-
   const text = extractText(msg.message);
   if (!text) return;
 
@@ -2054,14 +2148,13 @@ async function generateMatchupsFromPoll(sock, chatId) {
     const { interestedPlayers, yesOption } = getPollVoters(targetPollId, targetPollState, mePn);
     players = interestedPlayers;
 
-    // For manually created match polls: if player count does not meet valid configuration,
-    // include the creator of the poll as one of the players
-    if (targetPollState.isManual && !isValidPlayerCount(players.length)) {
-      const { players: adjustedPlayers, addedCreator } = resolveManualPollPlayers(targetPollState, players);
-      if (addedCreator) {
-        console.log(`[poll] Adjusted manual poll players: included creator "${targetPollState.creator?.name}" -> total ${adjustedPlayers.length} player(s)`);
-        players = adjustedPlayers;
+    // For manually created match polls: resolve players using label check and valid count check
+    if (targetPollState.isManual) {
+      const { players: adjustedPlayers, addedExtra } = resolveManualPollPlayers(targetPollState, players);
+      if (addedExtra && addedExtra.length > 0) {
+        console.log(`[poll] Adjusted manual poll players: added extra [${addedExtra.join(', ')}] -> total ${adjustedPlayers.length} player(s)`);
       }
+      players = adjustedPlayers;
     }
   }
 
@@ -2135,8 +2228,13 @@ function pollStatusText(chatId) {
     if (pollState.isManual) {
       const { aggregated, interestedPlayers } = getPollVoters(pollId, pollState, mePn);
       const optionSummaries = aggregated.map((opt) => `${opt.name} (${opt.voters.length}): ${opt.voters.map(nameFor).join(', ') || '(none)'}`);
-      const { players: playingPlayers, addedCreator } = resolveManualPollPlayers(pollState, interestedPlayers);
+      const { players: playingPlayers, addedFromLabel, addedFromValidCount } = resolveManualPollPlayers(pollState, interestedPlayers);
       const creatorName = pollState.creator?.name || 'Someone';
+
+      let additionNotes = [];
+      if (addedFromLabel.length > 0) additionNotes.push(`${addedFromLabel.join(', ')} from poll slot labels`);
+      if (addedFromValidCount.length > 0) additionNotes.push(`${addedFromValidCount.join(', ')} to reach valid player count`);
+      const additionStr = additionNotes.length > 0 ? ` (includes ${additionNotes.join(' and ')})` : '';
 
       const lines = [
         `Poll ${pollId}: User-Created Manual Match Poll "${pollState.name || 'Match Poll'}".`,
@@ -2146,7 +2244,7 @@ function pollStatusText(chatId) {
         `Total votes buffered: ${pollState.voteBuffer.size}`,
         `Options & Votes:\n  ${optionSummaries.length ? optionSummaries.join('\n  ') : '(none)'}`,
         `Voted so far (${interestedPlayers.length}): ${interestedPlayers.length ? interestedPlayers.join(', ') : '(none yet)'}`,
-        `Currently playing (${playingPlayers.length}): ${playingPlayers.join(', ')}${addedCreator ? ` (includes poll creator ${creatorName} because voter count does not meet valid player count)` : ''}`,
+        `Currently playing (${playingPlayers.length}): ${playingPlayers.join(', ')}${additionStr}`,
         'Matchups: Passively tracked -- will generate matchups only upon explicit user request (!matchups or "@tenbot generate matchups")'
       ];
       return lines.join('\n');
@@ -2248,15 +2346,20 @@ function buildContextBlurb(chatId) {
           }
         }
 
-        const { players: playingPlayers, addedCreator } = resolveManualPollPlayers(pollState, interestedPlayers);
+        const { players: playingPlayers, addedFromLabel, addedFromValidCount } = resolveManualPollPlayers(pollState, interestedPlayers);
         const creatorName = pollState.creator?.name || 'Someone';
+
+        let additionNotes = [];
+        if (addedFromLabel.length > 0) additionNotes.push(`[${addedFromLabel.join(', ')}] from poll slot labels`);
+        if (addedFromValidCount.length > 0) additionNotes.push(`[${addedFromValidCount.join(', ')}] to reach valid player count`);
+        const additionSuffix = additionNotes.length > 0 ? ` (includes ${additionNotes.join(' and ')})` : '';
 
         if (pollState.status === 'resolved') {
           return `[Poll ${id}] a user-created manual match poll "${pollState.name || 'Match Poll'}" was resolved with ${playingPlayers.length} players (${playingPlayers.join(', ')}) and matchups were posted`;
         } else if (pollState.status === 'cancelled') {
           return `[Poll ${id}] a user-created manual match poll "${pollState.name || 'Match Poll'}" was cancelled`;
         } else {
-          return `[Poll ${id}] a user-created manual match poll "${pollState.name || 'Match Poll'}" (created by ${creatorName}) is actively tracked. Votes recorded so far (${interestedPlayers.length} voter(s): [${optionDetails.join('; ') || 'no votes yet'}]). Players currently in/playing (${playingPlayers.length}): ${playingPlayers.join(', ')}${addedCreator ? ` (includes poll creator ${creatorName} because the ${interestedPlayers.length} vote(s) so far do not meet a valid player count configuration)` : ''}. (Note: Passively tracked -- when asked who is playing, answer with the currently playing list which includes the creator as shown; do NOT auto-generate matchups unless user explicitly asks for matchups/draw on this poll)`;
+          return `[Poll ${id}] a user-created manual match poll "${pollState.name || 'Match Poll'}" (created by ${creatorName}) is actively tracked. Votes recorded so far (${interestedPlayers.length} voter(s): [${optionDetails.join('; ') || 'no votes yet'}]). Players currently in/playing (${playingPlayers.length}): ${playingPlayers.join(', ')}${additionSuffix}. (Note: Passively tracked -- when asked who is playing, answer strictly with the "Players currently in/playing" list above: [${playingPlayers.join(', ')}]; do NOT add or assume the creator is playing unless they appear in that list; do NOT auto-generate matchups unless user explicitly asks for matchups/draw on this poll)`;
         }
       }
 
