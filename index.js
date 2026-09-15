@@ -1986,6 +1986,12 @@ async function processPollVoteEvent(sock, pollMessageKey, rawPollUpdates) {
       },
       vote: votePayload
     });
+
+    // When recording a vote, if player rating is unavailable, fetch it from TennisRecord
+    const voterName = nameFor(canonicalVoter);
+    if (voterName && !ratings.isPlaceholder(voterName) && !GENERIC_NAMES.has(ratings.keyFor(voterName))) {
+      await ratings.ensureRated([voterName]);
+    }
   }
   persistPolls(); // save vote progress immediately in case of a restart mid-poll
 
