@@ -118,8 +118,9 @@ const SYSTEM_PROMPT =
   'When asked who is playing, who has voted, or how many spots are left, rely strictly on the provided "Players currently in/playing" list. ' +
   'Do NOT include the creator unless they actually voted or are explicitly listed in "Players currently in/playing". ' +
   'For polls starting at slot 1, extra players / creator are NEVER included while voting is still in progress (only when all vote slots are filled and count is invalid). ' +
-  'If and ONLY IF users explicitly ask to create matchups or draw on a user-created manual match poll (e.g. "@tenbot generate matchups", "!matchups", "make the draw for the poll"), ' +
-  'call generate_matchups to generate matchups using the exact same rules as bot polls (singles for 2, doubles for multiples of 4, ratings balancing, lowest repeat rotations). ' +
+  'When a user asks to generate matchups, create the draw, make teams, or rematch for ANY match poll (including manually created match polls, opt-in polls, or previously resolved polls), ' +
+  'ALWAYS call the generate_matchups tool (or rematch tool). NEVER tell the user that a poll has ended, is closed, or is not active when they ask for matchups. ' +
+  'If there are multiple polls or a specific poll is requested (e.g. "for 10am", "Tennis 8am"), pass pollId or pollName to generate_matchups. ' +
   'Results can be reported to you in plain words ("Mike & Sara ' +
   'beat John & Alex 6-4", or "we won" right after a draw) and are logged automatically before ' +
   "you see the message, so don't claim you can't record scores. " +
@@ -188,10 +189,19 @@ const CLAUDE_TOOLS = [
   },
   {
     name: 'generate_matchups',
-    description: 'Generates and posts singles/doubles matchups and rotations from current poll votes. Supports bot-created polls, Yes/No opt-in polls, and user-created manual tennis scheduling polls when explicitly requested. For manual match polls, uses poll labels and adds creator / extra players (<creatorName>, <creatorName> 2, <creatorName> 3, etc.) until a valid player count configuration (2 or multiples of 4) is reached.',
+    description: 'Generates and posts singles/doubles matchups and rotations from current poll votes. Always call this tool when the user asks to generate matchups, draw, or make teams for a poll (whether active, filled, or resolved/rematch). For manual match polls, uses poll labels and adds creator / extra players (<creatorName>, <creatorName> 2, etc.) until a valid player count configuration is reached.',
     input_schema: {
       type: 'object',
-      properties: {}
+      properties: {
+        pollId: {
+          type: 'string',
+          description: 'Optional specific poll ID to generate matchups for if user specified or if multiple polls exist.'
+        },
+        pollName: {
+          type: 'string',
+          description: 'Optional poll name or time keyword (e.g. "8am", "10am", "Tennis 8am") to match the specific poll.'
+        }
+      }
     }
   },
   {
@@ -243,7 +253,16 @@ const CLAUDE_TOOLS = [
     description: 'Regenerates matchups and rotations from the current poll votes.',
     input_schema: {
       type: 'object',
-      properties: {}
+      properties: {
+        pollId: {
+          type: 'string',
+          description: 'Optional specific poll ID to regenerate matchups for.'
+        },
+        pollName: {
+          type: 'string',
+          description: 'Optional poll name or time keyword (e.g. "8am", "10am", "Tennis 8am") to match the specific poll.'
+        }
+      }
     }
   }
 ];
@@ -308,7 +327,7 @@ function escapeRegex(str) {
 function isMatchSchedulingPoll(title = '', options = []) {
   const text = `${title} ${options.join(' ')}`.toLowerCase();
   const matchKeywords = /\b(tennis|match|matches|court|courts|singles|doubles|play|playing|players|player|game|games|drill|drills|session|hit|hitting|schedule|scheduling|scvcc)\b/i;
-  const timeKeywords = /\b(today|tomorrow|tonight|monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tue|wed|thu|fri|sat|sun|morning|evening|afternoon)\b|\b\d{1,2}(?::\d{2})?\s*(?:am|pm)\b/i;
+  const timeKeywords = /\b(today|tomorrow|tonight|monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tue|wed|thu|fri|sat|sun|morning|evening|afternoon)\b|\b\d{1,2}(?:[:.]\d{2})?\s*(?:am|pm)\b|\b\d{1,2}[:.]\d{2}\b/i;
   const slotKeywords = /\b(player|spot|slot|court)\s*\d+|\b\d+\b/i;
   const hasOptInOrSlot = options.some((opt) => /^(yes|no|in|out|playing|can't play)$/i.test(opt.trim()) || slotKeywords.test(opt.trim()));
 
@@ -496,7 +515,7 @@ function parsePollCreationText(text) {
 
   // Extract timeWord first (e.g. 10:30am, 9am, 6:00pm)
   let timeWord = null;
-  const timeMatch = text.match(/\b(\d{1,2}(?::\d{2})?\s*(?:am|pm))\b/i) || text.match(/\b(\d{1,2}:\d{2})\b/i);
+  const timeMatch = text.match(/\b(\d{1,2}(?:[:.]\d{2})?\s*(?:am|pm))\b/i) || text.match(/\b(\d{1,2}[:.]\d{2})\b/i);
   if (timeMatch) {
     timeWord = timeMatch[1].trim();
   }
@@ -524,7 +543,7 @@ function parsePollCreationText(text) {
   if (timeMatch) {
     textWithoutTime = textWithoutTime.replace(timeMatch[0], ' ');
   }
-  textWithoutTime = textWithoutTime.replace(/\b\d{1,2}(?::\d{2})?\s*(?:am|pm)\b/ig, ' ').replace(/\b\d{1,2}:\d{2}\b/g, ' ');
+  textWithoutTime = textWithoutTime.replace(/\b\d{1,2}(?:[:.]\d{2})?\s*(?:am|pm)\b/ig, ' ').replace(/\b\d{1,2}[:.]\d{2}\b/g, ' ');
 
   // Determine size
   let size = null;
@@ -936,13 +955,17 @@ async function cancelOrDeletePoll(sock, remoteJid, pollId) {
  */
 function cleanupExpiredPolls() {
   const now = Date.now();
-  const graceMs = POLL_EXPIRY_GRACE_HOURS * 60 * 60 * 1000;
+  const defaultGraceMs = POLL_EXPIRY_GRACE_HOURS * 60 * 60 * 1000;
+  const manualGraceMs = 24 * 60 * 60 * 1000; // 24 hours grace for manual polls
   const removed = [];
 
   for (const [pollId, pollState] of activePolls.entries()) {
     if (!pollState.playAt) continue; // no play time recorded -- never auto-expire it
     const playAtMs = new Date(pollState.playAt).getTime();
     if (Number.isNaN(playAtMs)) continue;
+
+    // Give manual polls a generous 24-hour grace period so active votes are not discarded prematurely
+    const graceMs = pollState.isManual ? manualGraceMs : defaultGraceMs;
     if (now > playAtMs + graceMs) {
       activePolls.delete(pollId);
       for (const key of messageStore.keys()) {
@@ -1104,7 +1127,7 @@ async function startBot() {
           const creatorJid = msg.key.participant || remoteJid || null;
 
           const dayMatch = pollName.match(/\b(today|tonight|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tue|wed|thu|fri|sat|sun)\b/i);
-          const timeMatch = pollName.match(/\b(\d{1,2}(?::\d{2})?\s*(?:am|pm))\b/i);
+          const timeMatch = pollName.match(/\b(\d{1,2}(?:[:.]\d{2})?\s*(?:am|pm))\b/i) || pollName.match(/\b(\d{1,2}[:.]\d{2})\b/i);
           const playAt = resolvePlayDateTime(dayMatch ? dayMatch[1] : null, timeMatch ? timeMatch[1] : null);
 
           const hasYesNo = options.some((opt) => /^yes$/i.test(opt.trim())) && options.some((opt) => /^no$/i.test(opt.trim()));
@@ -1286,7 +1309,7 @@ async function executeTool(sock, chatId, sender, toolUse, msg) {
     }
   }
   if (name === 'generate_matchups' || name === 'rematch') {
-    const res = await generateMatchupsFromPoll(sock, chatId);
+    const res = await generateMatchupsFromPoll(sock, chatId, input.pollId, input.pollName || input.when);
     return res || 'Matchups generated and posted.';
   }
   if (name === 'set_rating') {
@@ -1312,7 +1335,7 @@ async function executeTool(sock, chatId, sender, toolUse, msg) {
     let targetPollId = input.pollId || null;
     if (!targetPollId) {
       for (const [pollId, pollState] of [...activePolls.entries()].reverse()) {
-        if (pollState.remoteJid === chatId && pollState.status === 'active') {
+        if (pollState.remoteJid === chatId && pollState.status === 'active' && !pollState.isManual) {
           targetPollId = pollId;
           break;
         }
@@ -1739,7 +1762,7 @@ async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWor
     if (dayMatch) effectiveDayWord = dayMatch[1];
   }
   if (!effectiveTimeWord && when) {
-    const timeMatch = when.match(/\b(\d{1,2}(?::\d{2})?\s*(?:am|pm))\b/i);
+    const timeMatch = when.match(/\b(\d{1,2}(?:[:.]\d{2})?\s*(?:am|pm))\b/i) || when.match(/\b(\d{1,2}[:.]\d{2})\b/i);
     if (timeMatch) effectiveTimeWord = timeMatch[1];
   }
 
@@ -1761,7 +1784,7 @@ async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWor
     replacedOldPoll = true;
   } else if (cancelExisting) {
     for (const [pollId, pollState] of [...activePolls.entries()].reverse()) {
-      if (pollState.remoteJid === remoteJid && pollState.status === 'active') {
+      if (pollState.remoteJid === remoteJid && pollState.status === 'active' && !pollState.isManual) {
         await cancelOrDeletePoll(sock, remoteJid, pollId);
         replacedOldPoll = true;
         break;
@@ -2128,20 +2151,47 @@ async function processPollVoteEvent(sock, pollMessageKey, rawPollUpdates) {
  *   includes the creator of the poll as one of the players.
  * - For fixed-size polls / rematches: regenerates matchups from the recorded player list.
  */
-async function generateMatchupsFromPoll(sock, chatId) {
+async function generateMatchupsFromPoll(sock, chatId, specificPollId = null, specificPollName = null) {
   let targetPollId = null;
   let targetPollState = null;
 
-  // 1. Look for active opt-in or manual match poll first
-  for (const [pollId, pollState] of [...activePolls.entries()].reverse()) {
-    if (pollState.remoteJid === chatId && pollState.status === 'active' && (pollState.type === 'opt_in' || pollState.size === null || pollState.isManual)) {
-      targetPollId = pollId;
-      targetPollState = pollState;
-      break;
+  // 1. If a specific poll ID was requested, check if it exists in this chat
+  if (specificPollId && activePolls.has(specificPollId)) {
+    const poll = activePolls.get(specificPollId);
+    if (poll.remoteJid === chatId && poll.status !== 'cancelled') {
+      targetPollId = specificPollId;
+      targetPollState = poll;
     }
   }
 
-  // 2. Look for any active match poll with votes
+  // 2. If a specific poll name / time keyword was requested, search for it
+  if (!targetPollState && specificPollName) {
+    const q = String(specificPollName).toLowerCase().trim();
+    for (const [pollId, pollState] of [...activePolls.entries()].reverse()) {
+      if (pollState.remoteJid === chatId && pollState.status !== 'cancelled') {
+        const pName = (pollState.name || '').toLowerCase();
+        const pWhen = (pollState.when || '').toLowerCase();
+        if (pName.includes(q) || pWhen.includes(q) || q.includes(pName)) {
+          targetPollId = pollId;
+          targetPollState = pollState;
+          break;
+        }
+      }
+    }
+  }
+
+  // 3. Look for active opt-in or manual match poll first
+  if (!targetPollState) {
+    for (const [pollId, pollState] of [...activePolls.entries()].reverse()) {
+      if (pollState.remoteJid === chatId && pollState.status === 'active' && (pollState.type === 'opt_in' || pollState.size === null || pollState.isManual)) {
+        targetPollId = pollId;
+        targetPollState = pollState;
+        break;
+      }
+    }
+  }
+
+  // 4. Look for any active match poll with votes
   if (!targetPollState) {
     for (const [pollId, pollState] of [...activePolls.entries()].reverse()) {
       if (pollState.remoteJid === chatId && pollState.status === 'active' && pollState.voteBuffer.size > 0) {
@@ -2152,10 +2202,10 @@ async function generateMatchupsFromPoll(sock, chatId) {
     }
   }
 
-  // 3. Look for any poll with resolved players (for rematch)
+  // 5. Look for any match poll with players/votes (including resolved, for rematch or re-draw)
   if (!targetPollState) {
     for (const [pollId, pollState] of [...activePolls.entries()].reverse()) {
-      if (pollState.remoteJid === chatId && pollState.lastPlayers) {
+      if (pollState.remoteJid === chatId && pollState.status !== 'cancelled' && (pollState.lastPlayers || pollState.voteBuffer.size > 0)) {
         targetPollId = pollId;
         targetPollState = pollState;
         break;
@@ -2177,13 +2227,9 @@ async function generateMatchupsFromPoll(sock, chatId) {
 
   // Extract players from votes or previous draw
   let players = [];
-  if (targetPollState.lastPlayers && targetPollState.status === 'resolved') {
-    players = targetPollState.lastPlayers;
-  } else {
-    const { interestedPlayers, yesOption } = getPollVoters(targetPollId, targetPollState, mePn);
+  const { interestedPlayers, yesOption } = getPollVoters(targetPollId, targetPollState, mePn);
+  if (interestedPlayers && interestedPlayers.length > 0) {
     players = interestedPlayers;
-
-    // For manually created match polls: resolve players using label check and valid count check
     if (targetPollState.isManual) {
       const { players: adjustedPlayers, addedExtra } = resolveManualPollPlayers(targetPollState, players);
       if (addedExtra && addedExtra.length > 0) {
@@ -2191,6 +2237,8 @@ async function generateMatchupsFromPoll(sock, chatId) {
       }
       players = adjustedPlayers;
     }
+  } else if (targetPollState.lastPlayers && targetPollState.lastPlayers.length > 0) {
+    players = targetPollState.lastPlayers;
   }
 
   if (players.length === 0) {
@@ -2211,7 +2259,7 @@ async function generateMatchupsFromPoll(sock, chatId) {
   targetPollState.lastPlayers = players;
   persistPolls();
 
-  console.log(`[poll] Generating matchups for poll ${targetPollId} (${targetPollState.isManual ? 'manual poll' : targetPollState.type}) with ${players.length} player(s): ${players.join(', ')}`);
+  console.log(`[poll] Generating matchups for poll ${targetPollId} ("${targetPollState.name || targetPollState.type}") with ${players.length} player(s): ${players.join(', ')}`);
 
   await ratings.ensureRated(players);
   const schedule = generateMatchups(players);
@@ -2403,12 +2451,11 @@ function buildContextBlurb(chatId) {
         if (addedFromValidCount.length > 0) additionNotes.push(`[${addedFromValidCount.join(', ')}] to reach valid player count`);
         const additionSuffix = additionNotes.length > 0 ? ` (includes ${additionNotes.join(' and ')})` : '';
 
-        if (pollState.status === 'resolved') {
-          return `[Poll ${id}] a user-created manual match poll "${pollState.name || 'Match Poll'}" was resolved with ${playingPlayers.length} players (${playingPlayers.join(', ')}) and matchups were posted`;
-        } else if (pollState.status === 'cancelled') {
+        if (pollState.status === 'cancelled') {
           return `[Poll ${id}] a user-created manual match poll "${pollState.name || 'Match Poll'}" was cancelled`;
         } else {
-          return `[Poll ${id}] a user-created manual match poll "${pollState.name || 'Match Poll'}" (created by ${creatorName}) is actively tracked. Votes recorded so far (${interestedPlayers.length} voter(s): [${optionDetails.join('; ') || 'no votes yet'}]). Players currently in/playing (${playingPlayers.length}): ${playingPlayers.join(', ')}${additionSuffix}. (Note: Passively tracked -- when asked who is playing, answer strictly with the "Players currently in/playing" list above: [${playingPlayers.join(', ')}]; do NOT add or assume the creator is playing unless they appear in that list; do NOT auto-generate matchups unless user explicitly asks for matchups/draw on this poll)`;
+          const statusNote = pollState.status === 'resolved' ? 'status: resolved/drawn (can generate matchups again / rematch)' : 'status: active';
+          return `[Poll ${id}] a user-created manual match poll "${pollState.name || 'Match Poll'}" (created by ${creatorName}) is tracked with ${interestedPlayers.length} vote(s): [${optionDetails.join('; ') || 'no votes yet'}]. Players currently in/playing (${playingPlayers.length}): ${playingPlayers.join(', ')}${additionSuffix}. (${statusNote} -- when asked to generate matchups or draw, call generate_matchups)`;
         }
       }
 
@@ -2432,24 +2479,22 @@ function buildContextBlurb(chatId) {
           }
         } catch (e) {}
 
-        if (pollState.status === 'resolved') {
-          return `[Poll ${id}] a Yes/No opt-in poll${whenSuffix} was resolved with ${yesCount} players (${yesNames.join(', ')}) and matchups were posted`;
-        } else if (pollState.status === 'cancelled') {
+        if (pollState.status === 'cancelled') {
           return `[Poll ${id}] a Yes/No opt-in poll${whenSuffix} was cancelled`;
         } else {
-          return `[Poll ${id}] a Yes/No opt-in poll${whenSuffix} is active with ${yesCount} "Yes" vote(s) (${yesNames.join(', ') || 'none yet'}) and ${noCount} "No" vote(s). Waiting for user prompt to generate matchups`;
+          const statusNote = pollState.status === 'resolved' ? 'status: resolved/drawn (can rematch)' : 'status: active';
+          return `[Poll ${id}] a Yes/No opt-in poll${whenSuffix} is tracked with ${yesCount} "Yes" vote(s) (${yesNames.join(', ') || 'none yet'}) and ${noCount} "No" vote(s). (${statusNote})`;
         }
       }
 
       const filledCount = pollState.voteBuffer?.size || 0;
       const neededVotes = pollState.creator ? pollState.size - 1 : pollState.size;
       const creatorSuffix = pollState.creator ? ` (created by ${pollState.creator.name || 'Player 1'}, who is Player 1)` : ' (all spots open)';
-      if (pollState.status === 'resolved') {
-        return `[Poll ${id}] a ${pollState.size}-spot poll${whenSuffix} filled up and matchups were posted`;
-      } else if (pollState.status === 'cancelled') {
+      if (pollState.status === 'cancelled') {
         return `[Poll ${id}] a ${pollState.size}-spot poll${whenSuffix} was cancelled`;
       } else {
-        return `[Poll ${id}] a ${pollState.size}-spot poll${whenSuffix}${creatorSuffix} is active with ${filledCount}/${neededVotes} votes needed`;
+        const statusNote = pollState.status === 'resolved' ? 'status: resolved/drawn (can rematch)' : 'status: active';
+        return `[Poll ${id}] a ${pollState.size}-spot poll${whenSuffix}${creatorSuffix} is tracked with ${filledCount}/${neededVotes} votes. (${statusNote})`;
       }
     });
     pollText = pollDescriptions.join('; ');
