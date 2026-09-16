@@ -1192,6 +1192,9 @@ async function startBot() {
     browser: Browsers.ubuntu('Chrome'),
     logger: pino({ level: 'silent' }), // set to 'debug' if you need to see raw protocol traffic
     syncFullHistory: false,
+    keepAliveIntervalMs: 25000,
+    connectTimeoutMs: 60000,
+    defaultQueryTimeoutMs: 60000,
     // Required by Baileys to decrypt incoming poll votes -- it needs to be
     // able to look back up the original poll creation message by its key.
     getMessage: async (key) => {
@@ -1256,15 +1259,17 @@ async function startBot() {
       const errorMsg = lastDisconnect?.error?.message || 'unknown error';
       const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
 
+      const reasonDesc = statusCode === 428
+        ? 'Connection Terminated / closed by WhatsApp (routine transient disconnect)'
+        : (statusCode === DisconnectReason.restartRequired ? 'Restart required by server' : errorMsg);
+
       console.log(
-        `⚠️ [${new Date().toISOString()}] Connection closed (status: ${statusCode || 'unknown'}, reason: ${errorMsg}).`,
+        `⚠️ [${new Date().toISOString()}] Connection closed (status: ${statusCode || 'unknown'}, reason: ${reasonDesc}).`,
         shouldReconnect ? 'Reconnecting in 3 seconds...' : 'Logged out -- delete auth_info_baileys/ and re-scan to log in again.'
       );
 
       if (shouldReconnect) {
-        setTimeout(() => {
-          launchBot();
-        }, 3000);
+        scheduleReconnect(3000);
       }
     } else if (connection === 'open') {
       const currMeName = sock.user?.name || sock.authState?.creds?.me?.name;
@@ -2861,21 +2866,37 @@ async function callClaude(sock, chatId, sender, promptText, msg) {
 }
 
 let isStarting = false;
+let reconnectTimeout = null;
+
+function scheduleReconnect(delayMs = 3000) {
+  if (reconnectTimeout) {
+    clearTimeout(reconnectTimeout);
+  }
+  reconnectTimeout = setTimeout(() => {
+    reconnectTimeout = null;
+    launchBot();
+  }, delayMs);
+}
+
 async function launchBot() {
   if (isStarting) return;
   isStarting = true;
   try {
+    if (botSock) {
+      try {
+        botSock.ev.removeAllListeners();
+        botSock.end(undefined);
+      } catch (e) {}
+      botSock = null;
+    }
     await startBot();
   } catch (err) {
     console.error(`💥 [${new Date().toISOString()}] Error during startBot():`, err && err.stack ? err.stack : err);
     console.log('🔄 Retrying in 5 seconds...');
-    setTimeout(() => {
-      isStarting = false;
-      launchBot();
-    }, 5000);
-    return;
+    scheduleReconnect(5000);
+  } finally {
+    isStarting = false;
   }
-  isStarting = false;
 }
 
 launchBot();
