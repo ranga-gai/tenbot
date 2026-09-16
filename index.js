@@ -116,6 +116,10 @@ const POLL_EXPIRY_GRACE_HOURS = 3;
 // How often to sweep for and delete completed/cancelled/expired polls.
 const POLL_CLEANUP_INTERVAL_MINUTES = 15;
 
+// Powers of 2 hours away from match playtime for sending reminders
+const POWERS_OF_2_REMINDER_HOURS = [64, 32, 16, 8, 4, 2, 1];
+const POLL_REMINDER_CHECK_INTERVAL_MS = 60 * 1000;
+
 // System prompt controlling the bot's personality/behavior
 const SYSTEM_PROMPT =
   'You are a helpful assistant in a WhatsApp group chat for a group of tennis ' +
@@ -1007,6 +1011,139 @@ function cleanupExpiredPolls() {
 cleanupExpiredPolls();
 setInterval(cleanupExpiredPolls, POLL_CLEANUP_INTERVAL_MINUTES * 60 * 1000);
 
+/**
+ * Builds engaging, creative, and escalating reminder text as match time gets closer.
+ */
+function buildPollReminderText(H, pollState, openSpots, totalSpots, playerList) {
+  const whenStr = pollState.when ? pollState.when : (pollState.name || 'today');
+  const spotWord = openSpots === 1 ? 'spot' : 'spots';
+  const playerWord = openSpots === 1 ? 'player' : 'players';
+
+  if (H >= 32) {
+    return `🎾 *Match Alert:* The match poll for *${whenStr}* still has *${openSpots} open ${spotWord}* (${openSpots}/${totalSpots} needed).\n` +
+      `Current players: ${playerList}\n` +
+      `Vote in the poll above to lock in your spot!`;
+  }
+  if (H >= 16) {
+    return `⏰ *${H} Hours to Playtime!* We have *${openSpots} ${spotWord} remaining* for *${whenStr}* (${openSpots}/${totalSpots} needed).\n` +
+      `Roster so far: ${playerList}\n` +
+      `Don't miss out — cast your vote above to join the court!`;
+  }
+  if (H >= 8) {
+    return `🎾 *8 Hours to Match Time!* We still need *${openSpots} more ${playerWord}* to complete the court for *${whenStr}* (${totalSpots} total spots).\n` +
+      `Current lineup: ${playerList}\n` +
+      `Who's ready to hit some winners today? Claim your spot!`;
+  }
+  if (H >= 4) {
+    return `🔥 *4 Hours Until Court Time!* Only *${openSpots} ${spotWord} left* for *${whenStr}*!\n` +
+      `Lined up to play: ${playerList}\n` +
+      `Racquets ready? Grab the open ${spotWord} before it fills up! 🎾⚡`;
+  }
+  if (H >= 2) {
+    return `⚡ *2 HOURS TO GO!* We only need *${openSpots} more ${playerWord}* to make the match happen at *${whenStr}*!\n` +
+      `Ready on court: ${playerList}\n` +
+      `Don't leave the squad hanging — step up and claim the final ${spotWord}! 🎾🏃‍♂️💨`;
+  }
+  return `🚨 *FINAL CALL: 1 HOUR LEFT!* Just *${openSpots} ${spotWord} open* for *${whenStr}*!\n` +
+    `Current roster: ${playerList}\n` +
+    `Who's coming through in the clutch? Vote now and let's play! 🏆🎾🔥`;
+}
+
+/**
+ * Sweeps active fixed-spot polls and sends escalating reminders at every power of 2
+ * hours (64h, 32h, 16h, 8h, 4h, 2h, 1h) away from playtime.
+ * Strictly restricted between 8am and 9pm in San Jose, CA (Pacific Time).
+ */
+async function checkAndSendPollReminders(sock) {
+  if (!sock) return;
+  try {
+    const sjNow = getSanJoseNow();
+    const currentHour = sjNow.getHours();
+
+    // Only send reminders between 8am - 9pm (8:00 AM to 8:59 PM, hour < 21)
+    if (currentHour < 8 || currentHour >= 21) return;
+
+    const now = Date.now();
+    const mePn = jidNormalizedUser(sock.user?.id || sock.authState?.creds?.me?.id || '');
+
+    for (const [pollId, pollState] of activePolls.entries()) {
+      if (pollState.status !== 'active') continue;
+      if (!pollState.playAt) continue;
+
+      // Check if this is a fixed spot poll (not an opt-in Yes/No poll)
+      const isOptIn = pollState.type === 'opt_in' || pollState.options?.some((o) => /^yes$/i.test(o));
+      if (isOptIn) continue;
+
+      const playAtMs = new Date(pollState.playAt).getTime();
+      if (Number.isNaN(playAtMs)) continue;
+      const diffMs = playAtMs - now;
+      if (diffMs <= 0) continue; // match time is happening now or in the past
+
+      // Determine total spots and open spots
+      let totalSpots = 0;
+      let neededVotes = 0;
+      let openSpots = 0;
+
+      if (pollState.size) {
+        totalSpots = pollState.size;
+        neededVotes = pollState.creator ? pollState.size - 1 : pollState.size;
+        const filledVotes = pollState.voteBuffer ? pollState.voteBuffer.size : 0;
+        openSpots = Math.max(0, neededVotes - filledVotes);
+      } else if (pollState.options && pollState.options.length > 0) {
+        totalSpots = pollState.options.length;
+        neededVotes = pollState.options.length;
+        const filledVotes = pollState.voteBuffer ? pollState.voteBuffer.size : 0;
+        openSpots = Math.max(0, neededVotes - filledVotes);
+      }
+
+      if (openSpots <= 0) continue; // poll is completely filled
+
+      const hoursRemaining = diffMs / (60 * 60 * 1000);
+      if (!Array.isArray(pollState.sentReminders)) {
+        pollState.sentReminders = [];
+      }
+
+      // Check powers of 2 in descending order (64, 32, 16, 8, 4, 2, 1)
+      for (const H of POWERS_OF_2_REMINDER_HOURS) {
+        if (hoursRemaining <= H && !pollState.sentReminders.includes(H)) {
+          // Mark all larger powers of 2 as skipped so we don't send duplicates
+          for (const largerH of POWERS_OF_2_REMINDER_HOURS) {
+            if (largerH >= H && !pollState.sentReminders.includes(largerH)) {
+              pollState.sentReminders.push(largerH);
+            }
+          }
+          persistPolls();
+
+          // Extract current player list
+          const { interestedPlayers } = getPollVoters(pollId, pollState, mePn);
+          let players = [...interestedPlayers];
+          if (pollState.creator?.name && !players.includes(pollState.creator.name)) {
+            players.unshift(pollState.creator.name);
+          }
+          const playerList = players.length > 0 ? players.join(', ') : 'None yet';
+
+          const reminderText = buildPollReminderText(H, pollState, openSpots, totalSpots, playerList);
+          console.log(`[poll] Sending ${H}h reminder for poll ${pollId} ("${pollState.name || pollState.when}") in ${pollState.remoteJid}: ${openSpots} spot(s) open`);
+
+          try {
+            await sock.sendMessage(pollState.remoteJid, { text: reminderText });
+          } catch (sendErr) {
+            console.error(`[poll] Failed to send reminder for poll ${pollId}:`, sendErr.message);
+          }
+          break; // Only send one reminder per poll per check cycle
+        }
+      }
+    }
+  } catch (err) {
+    console.error(`⚠️ [${new Date().toISOString()}] Error in checkAndSendPollReminders:`, err);
+  }
+}
+
+// Check and send reminders for unfilled fixed spot polls every minute
+setInterval(() => {
+  if (botSock) checkAndSendPollReminders(botSock);
+}, POLL_REMINDER_CHECK_INTERVAL_MS);
+
 
 async function startBot() {
   const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
@@ -1097,6 +1234,7 @@ async function startBot() {
         if (currMeLid) recordName(currMeLid, currMeName);
       }
       console.log(`✅ Tennis group bot is ready and listening for group ${TARGET_GROUP_NAME}.`);
+      checkAndSendPollReminders(sock);
     }
   });
 
@@ -1160,6 +1298,9 @@ async function startBot() {
           const hasYesNo = options.some((opt) => /^yes$/i.test(opt.trim())) && options.some((opt) => /^no$/i.test(opt.trim()));
           const pollType = hasYesNo ? 'opt_in' : 'manual';
 
+          const initialManualHours = (playAt.getTime() - Date.now()) / (60 * 60 * 1000);
+          const manualSentReminders = POWERS_OF_2_REMINDER_HOURS.filter((h) => h > initialManualHours);
+
           activePolls.set(pollId, {
             remoteJid,
             name: pollName,
@@ -1173,7 +1314,8 @@ async function startBot() {
             creator: { name: creatorName, jid: creatorJid },
             lastConflictSignature: null,
             voteBuffer: new Map(),
-            lastPlayers: null
+            lastPlayers: null,
+            sentReminders: manualSentReminders
           });
           latestPollIdByChat.set(remoteJid, pollId);
           persistPolls();
@@ -1903,6 +2045,9 @@ async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWor
   const pollId = sent.key.id;
 
   messageStore.set(storeKey(sent.key.remoteJid, pollId), sent.message);
+  const initialHours = (playAt.getTime() - Date.now()) / (60 * 60 * 1000);
+  const sentReminders = POWERS_OF_2_REMINDER_HOURS.filter((h) => h > initialHours);
+
   activePolls.set(pollId, {
     remoteJid,
     name: `${titlePrefix} (${matchType}${suffix})`,
@@ -1916,7 +2061,8 @@ async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWor
     creator: shouldIncludeCreator ? { name: creatorName || 'Player 1', jid: creatorJid || null } : null,
     lastConflictSignature: null,
     voteBuffer: new Map(), // voterJid -> raw pollUpdate entry
-    lastPlayers: null
+    lastPlayers: null,
+    sentReminders
   });
   latestPollIdByChat.set(remoteJid, pollId);
   persistPolls();
