@@ -318,6 +318,7 @@ const FREEFORM_DUPLICATE_WINDOW_MS = 10 * 60 * 1000;
 
 // Active WhatsApp socket reference
 let botSock = null;
+let targetGroupJid = null;
 
 // Poll-related state and voter display name mappings are persisted to poll-state.json
 // so voter identities survive a bot restart.
@@ -693,21 +694,39 @@ function stripLeadingTrigger(text) {
 /**
  * Associates a JID / LID with a display name across all formats.
  */
-function recordName(jid, name) {
-  if (!jid || !name) return;
+function recordName(jid, name, shouldPersist = true) {
+  if (!jid || !name) return false;
   const trimmed = String(name).trim();
-  if (!trimmed) return;
+  if (!trimmed) return false;
   const raw = jid;
   const norm = jidNormalizedUser(jid);
-  knownNames.set(raw, trimmed);
-  if (norm) {
-    knownNames.set(norm, trimmed);
-    const pn = lidToPn.get(norm);
-    if (pn) knownNames.set(pn, trimmed);
-    const lid = pnToLid.get(norm);
-    if (lid) knownNames.set(lid, trimmed);
+  let changed = false;
+
+  if (knownNames.get(raw) !== trimmed) {
+    knownNames.set(raw, trimmed);
+    changed = true;
   }
-  persistPolls();
+  if (norm) {
+    if (knownNames.get(norm) !== trimmed) {
+      knownNames.set(norm, trimmed);
+      changed = true;
+    }
+    const pn = lidToPn.get(norm);
+    if (pn && knownNames.get(pn) !== trimmed) {
+      knownNames.set(pn, trimmed);
+      changed = true;
+    }
+    const lid = pnToLid.get(norm);
+    if (lid && knownNames.get(lid) !== trimmed) {
+      knownNames.set(lid, trimmed);
+      changed = true;
+    }
+  }
+
+  if (changed && shouldPersist) {
+    persistPolls();
+  }
+  return changed;
 }
 
 /**
@@ -814,28 +833,46 @@ async function getGroupMetadata(sock, remoteJid) {
   if (!remoteJid || !remoteJid.endsWith('@g.us')) return null;
   let metadata = groupMetadataCache.get(remoteJid);
   if (!metadata) {
-    try {
-      metadata = await sock.groupMetadata(remoteJid);
-      groupMetadataCache.set(remoteJid, metadata);
-    } catch (err) {
-      console.error(`Failed to fetch group metadata for ${remoteJid}:`, err.message);
-      return null;
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        metadata = await sock.groupMetadata(remoteJid);
+        if (metadata) {
+          groupMetadataCache.set(remoteJid, metadata);
+          if (metadata.subject === TARGET_GROUP_NAME) {
+            targetGroupJid = remoteJid;
+          }
+          break;
+        }
+      } catch (err) {
+        if (attempt === 1) {
+          await new Promise((r) => setTimeout(r, 300));
+        } else {
+          console.error(`Failed to fetch group metadata for ${remoteJid}:`, err.message);
+        }
+      }
     }
   }
-  if (metadata?.participants) {
+
+  // Only record participant name and LID mappings for the target group
+  const isTarget = (targetGroupJid && remoteJid === targetGroupJid) || (metadata?.subject === TARGET_GROUP_NAME);
+  if (isTarget && metadata?.participants) {
+    let changed = false;
     for (const p of metadata.participants) {
-      const pn = jidNormalizedUser(p.id || p.jid);
-      const lid = jidNormalizedUser(p.lid);
+      const rawPn = p.id || p.jid;
+      const rawLid = p.lid;
+      const pn = rawPn && rawPn.endsWith('@s.whatsapp.net') ? jidNormalizedUser(rawPn) : null;
+      const lid = rawLid && rawLid.endsWith('@lid') ? jidNormalizedUser(rawLid) : (rawPn && rawPn.endsWith('@lid') ? jidNormalizedUser(rawPn) : null);
       const name = p.name || p.notify || p.verifiedName;
-      if (pn && lid) {
-        lidToPn.set(lid, pn);
-        pnToLid.set(pn, lid);
+      if (pn && lid && pn !== lid) {
+        if (lidToPn.get(lid) !== pn) { lidToPn.set(lid, pn); changed = true; }
+        if (pnToLid.get(pn) !== lid) { pnToLid.set(pn, lid); changed = true; }
       }
       if (name) {
-        if (pn) recordName(pn, name);
-        if (lid) recordName(lid, name);
+        if (pn) changed = recordName(pn, name, false) || changed;
+        if (lid) changed = recordName(lid, name, false) || changed;
       }
     }
+    if (changed) persistPolls();
   }
   return metadata;
 }
@@ -1176,12 +1213,14 @@ async function startBot() {
 
   sock.ev.on('contacts.upsert', (contacts) => {
     try {
+      let changed = false;
       for (const c of contacts) {
         const name = c.name || c.notify || c.verifiedName;
         if (name && c.id) {
-          recordName(c.id, name);
+          changed = recordName(c.id, name, false) || changed;
         }
       }
+      if (changed) persistPolls();
     } catch (err) {
       console.error(`⚠️ [${new Date().toISOString()}] Error in contacts.upsert:`, err);
     }
@@ -1189,18 +1228,20 @@ async function startBot() {
 
   sock.ev.on('contacts.update', (updates) => {
     try {
+      let changed = false;
       for (const c of updates) {
         const name = c.name || c.notify || c.verifiedName;
         if (name && c.id) {
-          recordName(c.id, name);
+          changed = recordName(c.id, name, false) || changed;
         }
       }
+      if (changed) persistPolls();
     } catch (err) {
       console.error(`⚠️ [${new Date().toISOString()}] Error in contacts.update:`, err);
     }
   });
 
-  sock.ev.on('connection.update', (update) => {
+  sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
 
     if (qr) {
@@ -1233,7 +1274,44 @@ async function startBot() {
         if (currMeId) recordName(currMeId, currMeName);
         if (currMeLid) recordName(currMeLid, currMeName);
       }
+
+      // Pre-warm group metadata cache so the very first message is recognized instantly
+      try {
+        const groups = await sock.groupFetchAllParticipating();
+        for (const [gId, gMeta] of Object.entries(groups)) {
+          groupMetadataCache.set(gId, gMeta);
+          if (gMeta.subject === TARGET_GROUP_NAME) {
+            targetGroupJid = gId;
+            console.log(`[target-group] Pre-cached target group "${gMeta.subject}" (id: ${gId})`);
+
+            // Only map participants for the TARGET_GROUP_NAME
+            if (gMeta.participants) {
+              let changed = false;
+              for (const p of gMeta.participants) {
+                const rawPn = p.id || p.jid;
+                const rawLid = p.lid;
+                const pn = rawPn && rawPn.endsWith('@s.whatsapp.net') ? jidNormalizedUser(rawPn) : null;
+                const lid = rawLid && rawLid.endsWith('@lid') ? jidNormalizedUser(rawLid) : (rawPn && rawPn.endsWith('@lid') ? jidNormalizedUser(rawPn) : null);
+                const name = p.name || p.notify || p.verifiedName;
+                if (pn && lid && pn !== lid) {
+                  if (lidToPn.get(lid) !== pn) { lidToPn.set(lid, pn); changed = true; }
+                  if (pnToLid.get(pn) !== lid) { pnToLid.set(pn, lid); changed = true; }
+                }
+                if (name) {
+                  if (pn) changed = recordName(pn, name, false) || changed;
+                  if (lid) changed = recordName(lid, name, false) || changed;
+                }
+              }
+              if (changed) persistPolls();
+            }
+          }
+        }
+      } catch (err) {
+        console.error('[groups] Failed to pre-fetch groups on connection open:', err.message);
+      }
+
       console.log(`✅ Tennis group bot is ready and listening for group ${TARGET_GROUP_NAME}.`);
+
       checkAndSendPollReminders(sock);
     }
   });
@@ -1246,13 +1324,14 @@ async function startBot() {
 
       const metadata = await getGroupMetadata(sock, remoteJid);
       const groupName = metadata?.subject || remoteJid;
+      const isTargetGroup = (targetGroupJid && remoteJid === targetGroupJid) || (groupName === TARGET_GROUP_NAME);
 
       if (!TARGET_GROUP_NAME) {
         console.log(`[Group seen] "${groupName}" (id: ${remoteJid})`);
         continue;
       }
 
-      if (groupName !== TARGET_GROUP_NAME) {
+      if (!isTargetGroup) {
         continue; // Ignore messages not meant for TARGET_GROUP_NAME
       }
 
@@ -1345,7 +1424,7 @@ async function startBot() {
         continue;
       }
 
-      if (type !== 'notify') continue;
+      // Process all incoming message types (notify and append)
 
       try {
         await handleMessage(sock, msg, groupName);
@@ -1443,11 +1522,21 @@ async function handleMessage(sock, msg, groupName) {
 }
 
 function extractText(message) {
+  if (!message) return null;
+  const msg = message.ephemeralMessage?.message ||
+              message.viewOnceMessage?.message ||
+              message.viewOnceMessageV2?.message ||
+              message.documentWithCaptionMessage?.message ||
+              message;
   return (
-    message.conversation ||
-    message.extendedTextMessage?.text ||
-    message.imageMessage?.caption ||
-    message.videoMessage?.caption ||
+    msg.conversation ||
+    msg.extendedTextMessage?.text ||
+    msg.imageMessage?.caption ||
+    msg.videoMessage?.caption ||
+    msg.documentMessage?.caption ||
+    msg.buttonsResponseMessage?.selectedButtonId ||
+    msg.listResponseMessage?.singleSelectReply?.selectedRowId ||
+    msg.templateButtonReplyMessage?.selectedId ||
     null
   );
 }
