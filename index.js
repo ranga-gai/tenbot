@@ -46,6 +46,22 @@
  */
 
 require('dotenv').config();
+
+// Global error handlers to keep the process alive and log detailed diagnostics
+process.on('uncaughtException', (err, origin) => {
+  const timestamp = new Date().toISOString();
+  console.error(`\n🚨 [${timestamp}] Uncaught Exception (${origin}):`, err && err.stack ? err.stack : err);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  const timestamp = new Date().toISOString();
+  console.error(`\n🚨 [${timestamp}] Unhandled Promise Rejection:`, reason && reason.stack ? reason.stack : reason);
+});
+
+process.on('warning', (warning) => {
+  console.warn(`⚠️ [${new Date().toISOString()}] Node.js Warning:`, warning.name, warning.message);
+});
+
 const makeWASocket = require('@whiskeysockets/baileys').default;
 const {
   useMultiFileAuthState,
@@ -1022,20 +1038,28 @@ async function startBot() {
   sock.ev.on('creds.update', saveCreds);
 
   sock.ev.on('contacts.upsert', (contacts) => {
-    for (const c of contacts) {
-      const name = c.name || c.notify || c.verifiedName;
-      if (name && c.id) {
-        recordName(c.id, name);
+    try {
+      for (const c of contacts) {
+        const name = c.name || c.notify || c.verifiedName;
+        if (name && c.id) {
+          recordName(c.id, name);
+        }
       }
+    } catch (err) {
+      console.error(`⚠️ [${new Date().toISOString()}] Error in contacts.upsert:`, err);
     }
   });
 
   sock.ev.on('contacts.update', (updates) => {
-    for (const c of updates) {
-      const name = c.name || c.notify || c.verifiedName;
-      if (name && c.id) {
-        recordName(c.id, name);
+    try {
+      for (const c of updates) {
+        const name = c.name || c.notify || c.verifiedName;
+        if (name && c.id) {
+          recordName(c.id, name);
+        }
       }
+    } catch (err) {
+      console.error(`⚠️ [${new Date().toISOString()}] Error in contacts.update:`, err);
     }
   });
 
@@ -1051,15 +1075,18 @@ async function startBot() {
       const statusCode = lastDisconnect?.error instanceof Boom
         ? lastDisconnect.error.output?.statusCode
         : null;
+      const errorMsg = lastDisconnect?.error?.message || 'unknown error';
       const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
 
       console.log(
-        `⚠️  Connection closed (status ${statusCode || 'unknown'}).`,
-        shouldReconnect ? 'Reconnecting...' : 'Logged out -- delete auth_info_baileys/ and re-scan to log in again.'
+        `⚠️ [${new Date().toISOString()}] Connection closed (status: ${statusCode || 'unknown'}, reason: ${errorMsg}).`,
+        shouldReconnect ? 'Reconnecting in 3 seconds...' : 'Logged out -- delete auth_info_baileys/ and re-scan to log in again.'
       );
 
       if (shouldReconnect) {
-        startBot();
+        setTimeout(() => {
+          launchBot();
+        }, 3000);
       }
     } else if (connection === 'open') {
       const currMeName = sock.user?.name || sock.authState?.creds?.me?.name;
@@ -1189,7 +1216,8 @@ async function startBot() {
 
   // Poll votes and message revocations also arrive here on some Baileys setups.
   sock.ev.on('messages.update', async (updates) => {
-    for (const { key, update } of updates) {
+    try {
+      for (const { key, update } of updates) {
       const remoteJid = key?.remoteJid || update.key?.remoteJid;
       if (!remoteJid || !remoteJid.endsWith('@g.us')) continue;
       if (TARGET_GROUP_NAME) {
@@ -1216,11 +1244,15 @@ async function startBot() {
         console.error(err && err.stack ? err.stack : '(no stack trace available)');
       }
     }
+    } catch (err) {
+      console.error(`⚠️ [${new Date().toISOString()}] Error in messages.update outer loop:`, err);
+    }
   });
 
   // Handle message deletion events emitted by Baileys
   sock.ev.on('messages.delete', async (item) => {
-    const jid = item.jid || (Array.isArray(item.keys) && item.keys[0]?.remoteJid);
+    try {
+      const jid = item.jid || (Array.isArray(item.keys) && item.keys[0]?.remoteJid);
     if (jid && jid.endsWith('@g.us') && TARGET_GROUP_NAME) {
       const metadata = await getGroupMetadata(sock, jid);
       const groupName = metadata?.subject || jid;
@@ -1239,6 +1271,9 @@ async function startBot() {
           handlePollDeleted(key.remoteJid, key.id);
         }
       }
+    }
+    } catch (err) {
+      console.error(`⚠️ [${new Date().toISOString()}] Error in messages.delete:`, err);
     }
   });
 }
@@ -2590,4 +2625,22 @@ async function callClaude(sock, chatId, sender, promptText, msg) {
   return replyText;
 }
 
-startBot();
+let isStarting = false;
+async function launchBot() {
+  if (isStarting) return;
+  isStarting = true;
+  try {
+    await startBot();
+  } catch (err) {
+    console.error(`💥 [${new Date().toISOString()}] Error during startBot():`, err && err.stack ? err.stack : err);
+    console.log('🔄 Retrying in 5 seconds...');
+    setTimeout(() => {
+      isStarting = false;
+      launchBot();
+    }, 5000);
+    return;
+  }
+  isStarting = false;
+}
+
+launchBot();
