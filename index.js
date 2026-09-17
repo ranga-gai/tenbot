@@ -1586,11 +1586,12 @@ async function executeTool(sock, chatId, sender, toolUse, msg) {
   if (name === 'set_rating') {
     const newRating = input.rating;
     const targetPlayer = input.player || (sender !== 'Someone' ? sender : (msg?.key?.participant ? nameFor(msg.key.participant) : null));
+    const targetJid = !input.player ? (msg?.key?.participant || msg?.key?.remoteJid || null) : null;
     if (!targetPlayer) return 'Could not identify player to update rating for.';
     if (typeof newRating !== 'number' || newRating < ratings.MIN_RATING || newRating > ratings.MAX_RATING) {
       return `Rating must be a number between ${ratings.MIN_RATING} and ${ratings.MAX_RATING}.`;
     }
-    const updated = ratings.setRating(targetPlayer, newRating);
+    const updated = ratings.setRating(targetPlayer, newRating, { jid: targetJid });
     return `Updated rating for ${targetPlayer} to ${ratings.formatRating(updated)}.`;
   }
   if (name === 'get_weather') {
@@ -1675,7 +1676,8 @@ async function getResponse(sock, text, chatId, sender, msg) {
       return `Please provide a valid rating between ${ratings.MIN_RATING} and ${ratings.MAX_RATING}, e.g. "!setrating 3.5" or "${TRIGGER_PREFIX} set my rating to 4.0".`;
     }
     const targetPlayer = sender !== 'Someone' ? sender : (msg?.key?.participant ? nameFor(msg.key.participant) : 'Player');
-    const updated = ratings.setRating(targetPlayer, val);
+    const targetJid = msg?.key?.participant || msg?.key?.remoteJid || null;
+    const updated = ratings.setRating(targetPlayer, val, { jid: targetJid });
     return `Updated rating for ${targetPlayer} to ${ratings.formatRating(updated)}.`;
   }
 
@@ -2288,7 +2290,11 @@ async function processPollVoteEvent(sock, pollMessageKey, rawPollUpdates) {
     // When recording a vote, if player rating is unavailable, fetch it from TennisRecord
     const voterName = nameFor(canonicalVoter);
     if (voterName && !ratings.isPlaceholder(voterName) && !GENERIC_NAMES.has(ratings.keyFor(voterName))) {
-      await ratings.ensureRated([voterName]);
+      await ratings.ensureRated([{
+        name: voterName,
+        jid: canonicalVoter,
+        lid: authenticatingVoter && authenticatingVoter.endsWith('@lid') ? authenticatingVoter : null
+      }]);
     }
   }
   persistPolls(); // save vote progress immediately in case of a restart mid-poll
