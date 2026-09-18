@@ -1182,6 +1182,22 @@ setInterval(() => {
   if (botSock) checkAndSendPollReminders(botSock);
 }, POLL_REMINDER_CHECK_INTERVAL_MS);
 
+// Bi-weekly player rating refresh from TennisRecord.com (every 2 weeks)
+const RATINGS_REFRESH_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000; // Check every 6 hours for players due (>= 14 days)
+
+async function checkPeriodicRatingsSweep() {
+  try {
+    await ratings.refreshPeriodicRatings();
+  } catch (err) {
+    console.error(`⚠️ [${new Date().toISOString()}] Error in checkPeriodicRatingsSweep:`, err);
+  }
+}
+
+setTimeout(() => {
+  checkPeriodicRatingsSweep();
+  setInterval(checkPeriodicRatingsSweep, RATINGS_REFRESH_CHECK_INTERVAL_MS);
+}, 20 * 1000);
+
 
 async function startBot() {
   const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
@@ -1737,6 +1753,11 @@ async function getResponse(sock, text, chatId, sender, msg) {
     return formatRatings();
   }
 
+  if (lower === '!refreshratings') {
+    const { checkedCount, updatedCount } = await ratings.refreshPeriodicRatings({ force: true });
+    return `Checked ${checkedCount} player(s) on TennisRecord.com: updated ${updatedCount} rating(s).`;
+  }
+
   // --- Weather ---
   if (lower.startsWith('!weather')) {
     const location = text.slice('!weather'.length).trim() || DEFAULT_LOCATION;
@@ -1846,6 +1867,7 @@ function helpText() {
     `  (or tell me in words: "${TRIGGER_PREFIX} Mike & Sara beat John & Alex 6-4", or "${TRIGGER_PREFIX} we won" after a draw – no score means 6-3)`,
     '!leaderboard – show the win/loss leaderboard',
     '!ratings – show player ratings used to balance the courts',
+    '!refreshratings – refresh player ratings from TennisRecord.com now',
     `!setrating <rating> (or ${TRIGGER_PREFIX} my rating is <rating>) – set or update your rating (${ratings.MIN_RATING}–${ratings.MAX_RATING})`,
     '!weather [location] – forecast for outdoor play (defaults to ' + DEFAULT_LOCATION + ')',
     `${TRIGGER_PREFIX} create a poll [for <N>] [when] – post a match poll (N spots for singles/doubles, or Yes/No opt-in if N is omitted)`,
