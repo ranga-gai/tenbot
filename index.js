@@ -90,6 +90,7 @@ const { parseLineup } = require('./lib/lineupParser');
 const pairHistory = require('./lib/pairHistory');
 const ratings = require('./lib/ratings');
 const pollStore = require('./lib/pollStore');
+const messageHistory = require('./lib/messageHistory');
 const { resolvePlayDateTime, getSanJoseNow } = require('./lib/pollTime');
 
 // ---- CONFIG ----
@@ -118,7 +119,9 @@ const POLL_EXPIRY_GRACE_HOURS = 3;
 const POLL_CLEANUP_INTERVAL_MINUTES = 15;
 
 // Powers of 2 hours away from match playtime for sending reminders
-const POWERS_OF_2_REMINDER_HOURS = [64, 32, 16, 8, 4, 2, 1];
+// Reminder intervals away from match playtime: 10m (0.1667h), 1h, 2h, 4h, 8h, 16h, 32h, 64h
+const POLL_REMINDER_HOURS = [0.1667, 1, 2, 4, 8, 16, 32, 64];
+const POWERS_OF_2_REMINDER_HOURS = POLL_REMINDER_HOURS;
 const POLL_REMINDER_CHECK_INTERVAL_MS = 60 * 1000;
 
 // System prompt controlling the bot's personality/behavior
@@ -1051,11 +1054,43 @@ setInterval(cleanupExpiredPolls, POLL_CLEANUP_INTERVAL_MINUTES * 60 * 1000);
 
 /**
  * Builds engaging, creative, and escalating reminder text as match time gets closer.
+ * Supports both fixed-spot and Yes/No opt-in match polls.
  */
-function buildPollReminderText(H, pollState, openSpots, totalSpots, playerList) {
+function buildPollReminderText(H, pollState, openSpots, totalSpots, playerList, isOptIn = false, yesCount = 0) {
   const whenStr = pollState.when ? pollState.when : (pollState.name || 'today');
   const spotWord = openSpots === 1 ? 'spot' : 'spots';
   const playerWord = openSpots === 1 ? 'player' : 'players';
+
+  if (isOptIn) {
+    if (H >= 16) {
+      return `⏰ *${H} Hours to Playtime!* We have *${yesCount} player(s) in* so far for *${whenStr}*.\n` +
+        `Players in: ${playerList}\n` +
+        `Don't miss out — cast your vote above to join the match!`;
+    }
+    if (H >= 8) {
+      return `🎾 *8 Hours to Match Time!* We currently have *${yesCount} player(s) in* for *${whenStr}*.\n` +
+        `Current lineup: ${playerList}\n` +
+        `Who else is ready to play? Vote Yes in the poll above! 🎾⚡`;
+    }
+    if (H >= 4) {
+      return `🔥 *4 Hours Until Court Time!* *${yesCount} player(s)* lined up for *${whenStr}*!\n` +
+        `Roster: ${playerList}\n` +
+        `Cast your vote above if you want in on today's session!`;
+    }
+    if (H >= 2) {
+      return `⚡ *2 HOURS TO GO!* *${yesCount} player(s)* confirmed for *${whenStr}*!\n` +
+        `Ready on court: ${playerList}\n` +
+        `Vote Yes now before teams and matchups are drawn! 🎾🏃‍♂️💨`;
+    }
+    if (H >= 1) {
+      return `🚨 *FINAL CALL: 1 HOUR LEFT!* *${yesCount} player(s) in* for *${whenStr}*!\n` +
+        `Current roster: ${playerList}\n` +
+        `Last chance to vote Yes before match time! 🏆🎾🔥`;
+    }
+    return `⚡ *10 MINUTES REMAINING!* *${yesCount} player(s) in* for *${whenStr}*!\n` +
+      `Current roster: ${playerList}\n` +
+      `Final countdown to vote Yes before matchups are locked in! 🏆🎾⚡`;
+  }
 
   if (H >= 32) {
     return `🎾 *Match Alert:* The match poll for *${whenStr}* still has *${openSpots} open ${spotWord}* (${openSpots}/${totalSpots} needed).\n` +
@@ -1082,15 +1117,20 @@ function buildPollReminderText(H, pollState, openSpots, totalSpots, playerList) 
       `Ready on court: ${playerList}\n` +
       `Don't leave the squad hanging — step up and claim the final ${spotWord}! 🎾🏃‍♂️💨`;
   }
-  return `🚨 *FINAL CALL: 1 HOUR LEFT!* Just *${openSpots} ${spotWord} open* for *${whenStr}*!\n` +
-    `Current roster: ${playerList}\n` +
-    `Who's coming through in the clutch? Vote now and let's play! 🏆🎾🔥`;
+  if (H >= 1) {
+    return `🚨 *FINAL CALL: 1 HOUR LEFT!* Just *${openSpots} ${spotWord} open* for *${whenStr}*!\n` +
+      `Current roster: ${playerList}\n` +
+      `Who's coming through in the clutch? Vote now and let's play! 🏆🎾🔥`;
+  }
+  return `⚡ *10 MINUTES TO GO!* Still need *${openSpots} more ${playerWord}* for *${whenStr}*!\n` +
+    `Current lineup: ${playerList}\n` +
+    `Last chance to grab the remaining ${spotWord} before match time! 🏆🎾⚡`;
 }
 
 /**
- * Sweeps active fixed-spot polls and sends escalating reminders at every power of 2
+ * Sweeps active polls and sends escalating reminders at every power of 2
  * hours (64h, 32h, 16h, 8h, 4h, 2h, 1h) away from playtime.
- * Strictly restricted between 8am and 9pm in San Jose, CA (Pacific Time).
+ * Always silenced between 10pm and 8am in San Jose, CA (Pacific Time).
  */
 async function checkAndSendPollReminders(sock) {
   if (!sock) return;
@@ -1098,8 +1138,8 @@ async function checkAndSendPollReminders(sock) {
     const sjNow = getSanJoseNow();
     const currentHour = sjNow.getHours();
 
-    // Only send reminders between 8am - 9pm (8:00 AM to 8:59 PM, hour < 21)
-    if (currentHour < 8 || currentHour >= 21) return;
+    // Always silence reminders between 10pm and 8am (Pacific Time)
+    if (currentHour >= 22 || currentHour < 8) return;
 
     const now = Date.now();
     const mePn = jidNormalizedUser(sock.user?.id || sock.authState?.creds?.me?.id || '');
@@ -1108,68 +1148,70 @@ async function checkAndSendPollReminders(sock) {
       if (pollState.status !== 'active') continue;
       if (!pollState.playAt) continue;
 
-      // Check if this is a fixed spot poll (not an opt-in Yes/No poll)
-      const isOptIn = pollState.type === 'opt_in' || pollState.options?.some((o) => /^yes$/i.test(o));
-      if (isOptIn) continue;
-
       const playAtMs = new Date(pollState.playAt).getTime();
       if (Number.isNaN(playAtMs)) continue;
       const diffMs = playAtMs - now;
-      if (diffMs <= 0) continue; // match time is happening now or in the past
-
-      // Determine total spots and open spots
-      let totalSpots = 0;
-      let neededVotes = 0;
-      let openSpots = 0;
-
-      if (pollState.size) {
-        totalSpots = pollState.size;
-        neededVotes = pollState.creator ? pollState.size - 1 : pollState.size;
-        const filledVotes = pollState.voteBuffer ? pollState.voteBuffer.size : 0;
-        openSpots = Math.max(0, neededVotes - filledVotes);
-      } else if (pollState.options && pollState.options.length > 0) {
-        totalSpots = pollState.options.length;
-        neededVotes = pollState.options.length;
-        const filledVotes = pollState.voteBuffer ? pollState.voteBuffer.size : 0;
-        openSpots = Math.max(0, neededVotes - filledVotes);
-      }
-
-      if (openSpots <= 0) continue; // poll is completely filled
+      if (diffMs <= 0) continue; // match time has passed
 
       const hoursRemaining = diffMs / (60 * 60 * 1000);
+      const isOptIn = pollState.type === 'opt_in' || pollState.options?.some((o) => /^yes$/i.test(o));
+
+      // Find the most immediate matching power-of-2 reminder bucket (smallest H where hoursRemaining <= H)
+      const targetH = POWERS_OF_2_REMINDER_HOURS.find((h) => hoursRemaining <= h);
+      if (!targetH) continue; // more than 64 hours away
+
       if (!Array.isArray(pollState.sentReminders)) {
         pollState.sentReminders = [];
       }
 
-      // Check powers of 2 in descending order (64, 32, 16, 8, 4, 2, 1)
-      for (const H of POWERS_OF_2_REMINDER_HOURS) {
-        if (hoursRemaining <= H && !pollState.sentReminders.includes(H)) {
-          // Mark all larger powers of 2 as skipped so we don't send duplicates
-          for (const largerH of POWERS_OF_2_REMINDER_HOURS) {
-            if (largerH >= H && !pollState.sentReminders.includes(largerH)) {
-              pollState.sentReminders.push(largerH);
-            }
-          }
-          persistPolls();
+      if (pollState.sentReminders.includes(targetH)) continue;
 
-          // Extract current player list
-          const { interestedPlayers } = getPollVoters(pollId, pollState, mePn);
-          let players = [...interestedPlayers];
-          if (pollState.creator?.name && !players.includes(pollState.creator.name)) {
-            players.unshift(pollState.creator.name);
-          }
-          const playerList = players.length > 0 ? players.join(', ') : 'None yet';
+      // Determine spots and voters
+      let totalSpots = 0;
+      let neededVotes = 0;
+      let openSpots = 0;
+      let yesCount = 0;
 
-          const reminderText = buildPollReminderText(H, pollState, openSpots, totalSpots, playerList);
-          console.log(`[poll] Sending ${H}h reminder for poll ${pollId} ("${pollState.name || pollState.when}") in ${pollState.remoteJid}: ${openSpots} spot(s) open`);
+      const { interestedPlayers } = getPollVoters(pollId, pollState, mePn);
+      let players = [...interestedPlayers];
+      if (pollState.creator?.name && !players.includes(pollState.creator.name)) {
+        players.unshift(pollState.creator.name);
+      }
+      const playerList = players.length > 0 ? players.join(', ') : 'None yet';
 
-          try {
-            await sock.sendMessage(pollState.remoteJid, { text: reminderText });
-          } catch (sendErr) {
-            console.error(`[poll] Failed to send reminder for poll ${pollId}:`, sendErr.message);
-          }
-          break; // Only send one reminder per poll per check cycle
+      if (isOptIn) {
+        yesCount = interestedPlayers.length;
+      } else {
+        if (pollState.size) {
+          totalSpots = pollState.size;
+          neededVotes = pollState.creator ? pollState.size - 1 : pollState.size;
+          const filledVotes = pollState.voteBuffer ? pollState.voteBuffer.size : 0;
+          openSpots = Math.max(0, neededVotes - filledVotes);
+        } else if (pollState.options && pollState.options.length > 0) {
+          totalSpots = pollState.options.length;
+          neededVotes = pollState.options.length;
+          const filledVotes = pollState.voteBuffer ? pollState.voteBuffer.size : 0;
+          openSpots = Math.max(0, neededVotes - filledVotes);
         }
+
+        if (openSpots <= 0) continue; // fixed spot poll is already full
+      }
+
+      // Mark this bucket and all LARGER buckets as sent so we never back-send stale hours
+      for (const h of POWERS_OF_2_REMINDER_HOURS) {
+        if (h >= targetH && !pollState.sentReminders.includes(h)) {
+          pollState.sentReminders.push(h);
+        }
+      }
+      persistPolls();
+
+      const reminderText = buildPollReminderText(targetH, pollState, openSpots, totalSpots, playerList, isOptIn, yesCount);
+      console.log(`[poll] Sending ${targetH < 1 ? "10m" : targetH + "h"} reminder for poll ${pollId} ("${pollState.name || pollState.when}") in ${pollState.remoteJid}`);
+
+      try {
+        await sock.sendMessage(pollState.remoteJid, { text: reminderText });
+      } catch (sendErr) {
+        console.error(`[poll] Failed to send reminder for poll ${pollId}:`, sendErr.message);
       }
     }
   } catch (err) {
@@ -1412,7 +1454,7 @@ async function startBot() {
           const pollType = hasYesNo ? 'opt_in' : 'manual';
 
           const initialManualHours = (playAt.getTime() - Date.now()) / (60 * 60 * 1000);
-          const manualSentReminders = POWERS_OF_2_REMINDER_HOURS.filter((h) => h > initialManualHours);
+          const manualSentReminders = POWERS_OF_2_REMINDER_HOURS.filter((h) => h > initialManualHours && h > 1);
 
           activePolls.set(pollId, {
             remoteJid,
@@ -1547,10 +1589,20 @@ async function handleMessage(sock, msg, groupName) {
     recordName(msg.key.participant, sender);
   }
 
+  // Record all target group messages in persistent 2-week history
+  messageHistory.recordMessage(
+    remoteJid,
+    sender,
+    text,
+    msg.messageTimestamp ? Number(msg.messageTimestamp) * 1000 : Date.now(),
+    false
+  );
+
   console.log(`[${groupName}] ${sender}: ${text}`);
 
   const reply = await getResponse(sock, text.trim(), remoteJid, sender, msg);
   if (reply) {
+    messageHistory.recordMessage(remoteJid, 'tenbot', reply, Date.now(), true);
     await sock.sendMessage(remoteJid, { text: reply });
   }
 }
@@ -1706,7 +1758,8 @@ async function getResponse(sock, text, chatId, sender, msg) {
 
   if (lower === '!reset') {
     chatHistories.delete(chatId);
-    return 'Conversation history cleared.';
+    messageHistory.clear(chatId);
+    return 'Conversation history and recent 2-week group message logs cleared.';
   }
 
   // --- Availability ---
@@ -2222,7 +2275,7 @@ async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWor
 
   messageStore.set(storeKey(sent.key.remoteJid, pollId), sent.message);
   const initialHours = (playAt.getTime() - Date.now()) / (60 * 60 * 1000);
-  const sentReminders = POWERS_OF_2_REMINDER_HOURS.filter((h) => h > initialHours);
+  const sentReminders = POWERS_OF_2_REMINDER_HOURS.filter((h) => h > initialHours && h > 1);
 
   activePolls.set(pollId, {
     remoteJid,
@@ -2866,13 +2919,16 @@ function buildContextBlurb(chatId) {
     ? rated.map((p) => `${p.name}: ${ratings.formatRating(p.rating)}`).join(', ')
     : 'nobody rated yet';
 
+  const groupChatLog = messageHistory.formatRecentMessagesForContext(chatId);
+
   return (
     `Current time in San Jose, CA (Pacific Time): ${sjTimeStr}\n` +
     `Current availability: ${availabilityText}\n` +
     `Leaderboard (top 5): ${leaderboardText}\n` +
     `Recent matches: ${recentText}\n` +
     `Player ratings (${ratings.formatRating(ratings.MIN_RATING)}-${ratings.MAX_RATING}, a pairing's rating is the sum of its two players'): ${ratingsText}\n` +
-    `Active poll: ${pollText}`
+    `Active poll: ${pollText}\n\n` +
+    `--- Group Chat History (Past 2 Weeks) ---\n${groupChatLog}\n--- End of Group Chat History ---`
   );
 }
 
