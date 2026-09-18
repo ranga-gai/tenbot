@@ -1214,12 +1214,24 @@ async function startBot() {
 
   sock.ev.on('creds.update', saveCreds);
 
+  function isTargetGroupContact(contactId) {
+    if (!contactId || !targetGroupJid) return false;
+    const norm = jidNormalizedUser(contactId);
+    const targetMeta = groupMetadataCache.get(targetGroupJid);
+    if (!targetMeta?.participants) return false;
+    return targetMeta.participants.some((p) => {
+      const pPn = jidNormalizedUser(p.id || p.jid);
+      const pLid = jidNormalizedUser(p.lid);
+      return pPn === norm || pLid === norm || contactId === p.id || contactId === p.lid;
+    });
+  }
+
   sock.ev.on('contacts.upsert', (contacts) => {
     try {
       let changed = false;
       for (const c of contacts) {
         const name = c.name || c.notify || c.verifiedName;
-        if (name && c.id) {
+        if (name && c.id && isTargetGroupContact(c.id)) {
           changed = recordName(c.id, name, false) || changed;
         }
       }
@@ -1234,7 +1246,7 @@ async function startBot() {
       let changed = false;
       for (const c of updates) {
         const name = c.name || c.notify || c.verifiedName;
-        if (name && c.id) {
+        if (name && c.id && isTargetGroupContact(c.id)) {
           changed = recordName(c.id, name, false) || changed;
         }
       }
