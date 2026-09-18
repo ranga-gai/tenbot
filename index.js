@@ -86,6 +86,7 @@ const {
   findMatchupFor
 } = require('./lib/matchups');
 const { parseScoreReport } = require('./lib/scoreReport');
+const { parseLineup } = require('./lib/lineupParser');
 const pairHistory = require('./lib/pairHistory');
 const ratings = require('./lib/ratings');
 const pollStore = require('./lib/pollStore');
@@ -1640,6 +1641,45 @@ async function executeTool(sock, chatId, sender, toolUse, msg) {
  * commands first, direct poll creation parsing, then the LLM with tool support for free-form queries,
  * questions, etc.
  */
+
+/**
+ * Records a manually published lineup in the chat into the active poll state
+ * and pair history so score reports and partner memory work seamlessly.
+ */
+async function handleManualLineup(sock, chatId, sender, lineup) {
+  let targetPollId = null;
+  let targetPollState = null;
+
+  for (const [pollId, pollState] of [...activePolls.entries()].reverse()) {
+    if (pollState.remoteJid === chatId && pollState.status === 'active') {
+      targetPollId = pollId;
+      targetPollState = pollState;
+      break;
+    }
+  }
+
+  if (!targetPollState) {
+    targetPollId = latestPollIdByChat.get(chatId);
+    targetPollState = targetPollId && activePolls.get(targetPollId);
+  }
+
+  if (targetPollState) {
+    targetPollState.status = 'resolved';
+    targetPollState.lastPlayers = lineup.players;
+    targetPollState.lastSchedule = lineup;
+    pairHistory.recordDraw(targetPollId, lineup);
+    await ratings.ensureRated(lineup.players);
+    persistPolls();
+    console.log(`[lineup] Recorded manual lineup for poll ${targetPollId} in ${chatId} (${lineup.players.length} players: ${lineup.players.join(', ')})`);
+    return `📋 Got it! Recorded lineup for ${lineup.players.length} players (${lineup.players.join(', ')}). Results can be reported anytime!`;
+  } else {
+    pairHistory.recordDraw(`manual_${Date.now()}`, lineup);
+    await ratings.ensureRated(lineup.players);
+    console.log(`[lineup] Recorded standalone manual lineup in ${chatId} (${lineup.players.length} players: ${lineup.players.join(', ')})`);
+    return `📋 Got it! Recorded lineup for ${lineup.players.length} players (${lineup.players.join(', ')}). Results can be reported anytime!`;
+  }
+}
+
 async function getResponse(sock, text, chatId, sender, msg) {
   const lower = text.toLowerCase();
 
@@ -1707,6 +1747,12 @@ async function getResponse(sock, text, chatId, sender, msg) {
       console.error('Weather lookup failed:', err.message);
       return `Couldn't get the weather for "${location}": ${err.message}`;
     }
+  }
+
+  // --- Check for manually published lineup ---
+  const manualLineup = parseLineup(text, knownPlayers(chatId));
+  if (manualLineup) {
+    return await handleManualLineup(sock, chatId, sender, manualLineup);
   }
 
   // --- Direct Command Poll creation (!createpoll / !poll / !makepoll / !newpoll) ---
