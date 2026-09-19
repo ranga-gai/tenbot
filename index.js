@@ -615,10 +615,11 @@ async function handleDirectPollCreation(sock, chatId, sender, msg, parsed) {
   const { size, when, dayWord, timeWord, includeCreator, cancelExisting } = parsed;
   const creatorName = sender !== 'Someone' ? sender : (msg?.key?.participant ? nameFor(msg.key.participant) : 'Player 1');
   const creatorJid = msg?.key?.participant || msg?.key?.remoteJid || null;
+  const targetChatId = chatId.endsWith('@g.us') ? chatId : (await getTargetGroupJid(sock) || chatId);
 
   const res = await createMatchPoll(
     sock,
-    chatId,
+    targetChatId,
     size,
     when,
     dayWord,
@@ -748,11 +749,32 @@ function recordName(jid, name, shouldPersist = true) {
 /**
  * Checks if a user is an admin or superadmin in a group.
  */
-async function isUserAdmin(sock, remoteJid, senderJid) {
-  if (!sock || !remoteJid || !senderJid) return false;
-  if (!remoteJid.endsWith('@g.us')) return true; // Direct message / non-group
+/**
+ * Retrieves the target group JID (caching if necessary).
+ */
+async function getTargetGroupJid(sock) {
+  if (targetGroupJid) return targetGroupJid;
   try {
-    const metadata = await getGroupMetadata(sock, remoteJid);
+    const groups = await sock.groupFetchAllParticipating();
+    for (const [gId, gMeta] of Object.entries(groups)) {
+      groupMetadataCache.set(gId, gMeta);
+      if (gMeta.subject === TARGET_GROUP_NAME) {
+        targetGroupJid = gId;
+        return gId;
+      }
+    }
+  } catch (err) {
+    console.error('Failed to fetch participating groups:', err.message);
+  }
+  return null;
+}
+
+async function isUserAdmin(sock, remoteJid, senderJid) {
+  if (!sock || !senderJid) return false;
+  const targetJid = (remoteJid && remoteJid.endsWith('@g.us')) ? remoteJid : (await getTargetGroupJid(sock));
+  if (!targetJid) return false;
+  try {
+    const metadata = await getGroupMetadata(sock, targetJid);
     if (!metadata?.participants) return false;
 
     const normUser = jidNormalizedUser(senderJid);
@@ -1434,20 +1456,38 @@ async function startBot() {
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
     for (const msg of messages) {
       const remoteJid = msg.key?.remoteJid;
-      const isGroup = remoteJid && remoteJid.endsWith('@g.us');
-      if (!isGroup) continue;
+      if (!remoteJid) continue;
 
-      const metadata = await getGroupMetadata(sock, remoteJid);
-      const groupName = metadata?.subject || remoteJid;
-      const isTargetGroup = (targetGroupJid && remoteJid === targetGroupJid) || (groupName === TARGET_GROUP_NAME);
+      const isGroup = remoteJid.endsWith('@g.us');
+      const isDirect = !isGroup && (remoteJid.endsWith('@s.whatsapp.net') || remoteJid.endsWith('@lid'));
 
-      if (!TARGET_GROUP_NAME) {
-        console.log(`[Group seen] "${groupName}" (id: ${remoteJid})`);
-        continue;
-      }
+      if (!isGroup && !isDirect) continue;
 
-      if (!isTargetGroup) {
-        continue; // Ignore messages not meant for TARGET_GROUP_NAME
+      let groupName = 'Direct Message';
+      let isTargetGroup = false;
+
+      if (isGroup) {
+        const metadata = await getGroupMetadata(sock, remoteJid);
+        groupName = metadata?.subject || remoteJid;
+        isTargetGroup = (targetGroupJid && remoteJid === targetGroupJid) || (groupName === TARGET_GROUP_NAME);
+
+        if (!TARGET_GROUP_NAME) {
+          console.log(`[Group seen] "${groupName}" (id: ${remoteJid})`);
+          continue;
+        }
+
+        if (!isTargetGroup) {
+          continue; // Ignore messages not meant for TARGET_GROUP_NAME
+        }
+      } else if (isDirect) {
+        // Direct message: only allowed if sender is an admin of TARGET_GROUP_NAME
+        const targetJid = await getTargetGroupJid(sock);
+        const isAdmin = await isUserAdmin(sock, targetJid, remoteJid);
+        if (!isAdmin) {
+          console.log(`[DM] Ignored direct message from non-admin user ${remoteJid}`);
+          continue;
+        }
+        console.log(`[DM] Authorized admin direct message received from ${remoteJid} (${msg.pushName || 'Admin'})`);
       }
 
       // Check for message revocation (deleted for everyone in WhatsApp)
@@ -1681,8 +1721,9 @@ async function executeTool(sock, chatId, sender, toolUse, msg) {
     const replacePollId = input.replacePollId || null;
     const creatorName = sender !== 'Someone' ? sender : (msg?.key?.participant ? nameFor(msg.key.participant) : 'Player 1');
     const creatorJid = msg?.key?.participant || msg?.key?.remoteJid || null;
+    const targetChatId = chatId.endsWith('@g.us') ? chatId : (await getTargetGroupJid(sock) || chatId);
 
-    const res = await createMatchPoll(sock, chatId, size, when, dayWord, timeWord, creatorName, creatorJid, includeCreator, replacePollId, cancelExisting);
+    const res = await createMatchPoll(sock, targetChatId, size, when, dayWord, timeWord, creatorName, creatorJid, includeCreator, replacePollId, cancelExisting);
     if (res?.err) {
       return `Could not create poll: ${res.err}`;
     }
@@ -1953,7 +1994,11 @@ async function getResponse(sock, text, chatId, sender, msg) {
   const meLid = jidNormalizedUser(sock?.user?.lid || sock?.authState?.creds?.me?.lid || '');
   const botJids = [mePn, meLid].filter(Boolean);
 
-  const { addressed, promptText } = isAddressedToBot(text, msg, botJids);
+  const isDM = !chatId.endsWith('@g.us');
+  const { addressed, promptText } = isDM
+    ? { addressed: true, promptText: stripLeadingTrigger(text) }
+    : isAddressedToBot(text, msg, botJids);
+
   if (TRIGGER_PREFIX && !addressed) {
     return null; // not addressed to the bot with @, stay quiet
   }
