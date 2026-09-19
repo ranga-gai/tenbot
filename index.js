@@ -374,6 +374,8 @@ const {
 const storeKey = (remoteJid, id) => `${remoteJid}:${id}`;
 
 // Ensure all rated players exist in names.json on startup
+namesStore.deduplicateWithPnMap(pnToLid);
+ratings.deduplicateRatingsWithLidMap(pnToLid);
 ratings.syncRatingsWithNames();
 
 function persistPolls() {
@@ -746,14 +748,10 @@ function recordName(jid, name, shouldPersist = true) {
   const norm = jidNormalizedUser(jid);
   let changed = false;
 
-  namesStore.setName(raw, trimmed);
-  if (norm) {
-    namesStore.setName(norm, trimmed);
-    const pn = lidToPn.get(norm);
-    if (pn) namesStore.setName(pn, trimmed);
-    const lid = pnToLid.get(norm);
-    if (lid) namesStore.setName(lid, trimmed);
-  }
+  const lid = (norm && pnToLid.get(norm)) || (raw && pnToLid.get(raw)) || (norm?.endsWith('@lid') ? norm : null);
+  const canonicalJid = lid || norm || raw;
+
+  namesStore.setName(canonicalJid, trimmed);
 
   if (knownNames.get(raw) !== trimmed) {
     knownNames.set(raw, trimmed);
