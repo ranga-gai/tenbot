@@ -397,6 +397,109 @@ function isMatchSchedulingPoll(title = '', options = []) {
 }
 
 /**
+ * Uses LLM (Claude) to interpret manually created polls so there are no mistakes
+ * in identifying whether it's a match scheduling poll, the scheduled day/time,
+ * poll type, and spot count.
+ */
+async function interpretManualPollWithLLM(pollName, options, creatorName) {
+  const fallback = () => {
+    const isMatchScheduling = isMatchSchedulingPoll(pollName, options);
+    const dayMatch = pollName.match(/\b(today|tonight|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tue|wed|thu|fri|sat|sun)\b/i);
+    const timeMatch = pollName.match(/\b(\d{1,2}(?:[:.]\d{2})?\s*(?:am|pm))\b/i) || pollName.match(/\b(\d{1,2}[:.]\d{2})\b/i);
+    const hasYesNo = options.some((opt) => /^yes$/i.test(opt.trim())) && options.some((opt) => /^no$/i.test(opt.trim()));
+    return {
+      isMatchScheduling,
+      dayWord: dayMatch ? dayMatch[1] : null,
+      timeWord: timeMatch ? timeMatch[1] : null,
+      when: pollName,
+      type: hasYesNo ? 'opt_in' : 'manual',
+      size: hasYesNo ? null : (options.length > 0 ? options.length : null)
+    };
+  };
+
+  if (!process.env.ANTHROPIC_API_KEY) {
+    return fallback();
+  }
+
+  const sjTimeStr = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/Los_Angeles',
+    weekday: 'long',
+    year: 'numeric',
+    month: 'short',
+    day: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+    hour12: true
+  }).format(new Date());
+
+  const prompt = `You are a specialized interpreter for a tennis group chat bot in San Jose, CA (Pacific Time).
+Current local time in San Jose: ${sjTimeStr}.
+
+A user has just created a WhatsApp poll in the tennis group.
+Poll Details:
+- Title: "${pollName}"
+- Options: [${options.map((o) => `"${o}"`).join(', ')}]
+- Creator: "${creatorName}"
+
+Please analyze this poll:
+1. Is this poll for scheduling/organizing a tennis match, practice session, hitting, drill, or court play? (isMatchScheduling: true/false).
+   (Note: Social polls, food orders, equipment banter, or non-tennis topics should be isMatchScheduling: false).
+2. What day is it scheduled for? (e.g. "today", "tomorrow", "saturday", "sunday", or null if not mentioned).
+3. What time is it scheduled for? (e.g. "9am", "6:30pm", "10am", or null if not mentioned).
+4. Provide a clean human-readable when string (e.g. "Tomorrow 9am", "Saturday 6pm", "Today 8:30am", or null).
+5. Poll type: "opt_in" for Yes/No polls, or "manual" for fixed/numbered slots.
+6. Poll size: number of player spots (or null if opt-in).
+
+Respond ONLY with a JSON object in this exact format, with no other text or markdown formatting:
+{
+  "isMatchScheduling": boolean,
+  "dayWord": string or null,
+  "timeWord": string or null,
+  "when": string or null,
+  "type": "opt_in" | "manual",
+  "size": number or null
+}`;
+
+  try {
+    const response = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': process.env.ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01'
+      },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        max_tokens: 300,
+        messages: [{ role: 'user', content: prompt }]
+      })
+    });
+
+    if (!response.ok) {
+      console.warn(`[poll-llm] Anthropic API returned ${response.status}, falling back to regex parser.`);
+      return fallback();
+    }
+
+    const data = await response.json();
+    const rawContent = data.content?.filter((b) => b.type === 'text').map((b) => b.text).join('').trim();
+    const cleanedJson = rawContent.replace(/^\`\`\`json\s*/i, '').replace(/\s*\`\`\`$/i, '').trim();
+    const parsed = JSON.parse(cleanedJson);
+
+    return {
+      isMatchScheduling: Boolean(parsed.isMatchScheduling),
+      dayWord: parsed.dayWord || null,
+      timeWord: parsed.timeWord || null,
+      when: parsed.when || pollName,
+      type: parsed.type === 'opt_in' ? 'opt_in' : 'manual',
+      size: typeof parsed.size === 'number' ? parsed.size : (parsed.type === 'opt_in' ? null : (options.length > 0 ? options.length : null))
+    };
+  } catch (err) {
+    console.error('[poll-llm] Failed to interpret poll with LLM, using fallback:', err.message);
+    return fallback();
+  }
+}
+
+/**
  * Checks whether a given count of players is valid for standard matchups
  * (2 for singles, or any positive multiple of 4: 4, 8, 12, 16... for doubles).
  */
@@ -1505,23 +1608,22 @@ async function startBot() {
         if (!activePolls.has(pollId)) {
           const pollName = pollCreation.name || 'Match Poll';
           const options = (pollCreation.options || []).map((o) => o.optionName);
+          const creatorName = msg.pushName || (msg.key.participant ? nameFor(msg.key.participant) : 'Someone');
+          const creatorJid = msg.key.participant || remoteJid || null;
 
-          const isMatchScheduling = isMatchSchedulingPoll(pollName, options);
-          if (!isMatchScheduling) {
-            console.log(`[poll] Ignoring non-match poll ${pollId} ("${pollName}") in ${remoteJid}`);
+          // Interpret manually created poll using LLM to avoid mistakes
+          const interpretation = await interpretManualPollWithLLM(pollName, options, creatorName);
+          if (!interpretation.isMatchScheduling) {
+            console.log(`[poll] LLM interpreted poll ${pollId} ("${pollName}") as non-match scheduling in ${remoteJid}. Ignoring.`);
             continue; // Do not track non-match polls
           }
 
           messageStore.set(storeKey(remoteJid, pollId), msg.message);
-          const creatorName = msg.pushName || (msg.key.participant ? nameFor(msg.key.participant) : 'Someone');
-          const creatorJid = msg.key.participant || remoteJid || null;
 
-          const dayMatch = pollName.match(/\b(today|tonight|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tue|wed|thu|fri|sat|sun)\b/i);
-          const timeMatch = pollName.match(/\b(\d{1,2}(?:[:.]\d{2})?\s*(?:am|pm))\b/i) || pollName.match(/\b(\d{1,2}[:.]\d{2})\b/i);
-          const playAt = resolvePlayDateTime(dayMatch ? dayMatch[1] : null, timeMatch ? timeMatch[1] : null);
-
-          const hasYesNo = options.some((opt) => /^yes$/i.test(opt.trim())) && options.some((opt) => /^no$/i.test(opt.trim()));
-          const pollType = hasYesNo ? 'opt_in' : 'manual';
+          const playAt = resolvePlayDateTime(interpretation.dayWord, interpretation.timeWord);
+          const pollType = interpretation.type || (options.some((opt) => /^yes$/i.test(opt.trim())) ? 'opt_in' : 'manual');
+          const pollSize = interpretation.size !== undefined && interpretation.size !== null ? interpretation.size : (pollType === 'opt_in' ? null : (options.length > 0 ? options.length : null));
+          const resolvedWhen = interpretation.when || pollName;
 
           const initialManualHours = (playAt.getTime() - Date.now()) / (60 * 60 * 1000);
           const manualSentReminders = POWERS_OF_2_REMINDER_HOURS.filter((h) => h > initialManualHours && h > 1);
@@ -1530,9 +1632,9 @@ async function startBot() {
             remoteJid,
             name: pollName,
             options,
-            size: hasYesNo ? null : (options.length > 0 ? options.length : null),
+            size: pollSize,
             type: pollType,
-            when: pollName,
+            when: resolvedWhen,
             playAt: playAt.toISOString(),
             status: 'active',
             isManual: true, // user-created manual match poll, passively tracked
@@ -1544,7 +1646,7 @@ async function startBot() {
           });
           latestPollIdByChat.set(remoteJid, pollId);
           persistPolls();
-          console.log(`[poll] Passively tracking manually-created match poll ${pollId} ("${pollName}") by ${creatorName} in ${remoteJid}`);
+          console.log(`[poll] LLM verified & passively tracking manually-created match poll ${pollId} ("${pollName}", when: "${resolvedWhen}", type: ${pollType}, size: ${pollSize}) by ${creatorName} in ${remoteJid}`);
         } else {
           messageStore.set(storeKey(remoteJid, pollId), msg.message);
         }
