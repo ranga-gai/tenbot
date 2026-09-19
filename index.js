@@ -343,7 +343,6 @@ const chatHistories = new Map();
 // Cache of group metadata (id -> metadata) so we don't refetch on every message
 const groupMetadataCache = new Map();
 
-// Bidirectional LID <-> Phone Number JID mappings and knownNames loaded from pollStore below
 
 // Generic placeholder names that shouldn't match across different users by name alone
 const GENERIC_NAMES = new Set(['someone', 'player', 'player 1', 'player 2', 'player 3', 'player 4', 'me']);
@@ -365,20 +364,16 @@ let targetGroupJid = null;
 const {
   messageStore,   // `${remoteJid}:${id}` -> stored WAMessage content, needed for getMessage() and vote decoding
   activePolls,    // pollId -> { remoteJid, size, type, when, playAt, status, creator, lastConflictSignature, voteBuffer, lastPlayers, isManual }
-  latestPollIdByChat, // chatId -> pollId, so "!cancelpoll"/"!rematch"/"!pollstatus" know which poll to act on
-  knownNames,     // JID/LID -> display name mapping
-  lidToPn,        // LID -> Phone Number JID mapping
-  pnToLid         // Phone Number JID -> LID mapping
+  latestPollIdByChat // chatId -> pollId, so "!cancelpoll"/"!rematch"/"!pollstatus" know which poll to act on
 } = pollStore.load();
 
 const storeKey = (remoteJid, id) => `${remoteJid}:${id}`;
 
-// Ensure all rated players exist in names.json on startup
-namesStore.syncFromPollStore({ lidToPn, pnToLid, knownNames });
+// Ensure all players in names.json have ratings on startup
 ratings.syncRatingsWithNames();
 
 function persistPolls() {
-  pollStore.save({ messageStore, activePolls, latestPollIdByChat, knownNames, lidToPn, pnToLid });
+  pollStore.save({ messageStore, activePolls, latestPollIdByChat });
 }
 
 function escapeRegex(str) {
@@ -739,44 +734,17 @@ function stripLeadingTrigger(text) {
 /**
  * Associates a JID / LID with a display name across all formats.
  */
-function recordName(jid, name, shouldPersist = true) {
+function recordName(jid, name) {
   if (!jid || !name) return false;
   const trimmed = String(name).trim();
   if (!trimmed) return false;
   const raw = jid;
   const norm = jidNormalizedUser(jid);
-  let changed = false;
 
-  const lid = (norm && pnToLid.get(norm)) || (raw && pnToLid.get(raw)) || (norm?.endsWith('@lid') ? norm : null);
-  const canonicalJid = lid || norm || raw;
-
-  namesStore.setName(canonicalJid, trimmed);
-
-  if (knownNames.get(raw) !== trimmed) {
-    knownNames.set(raw, trimmed);
-    changed = true;
-  }
-  if (norm) {
-    if (knownNames.get(norm) !== trimmed) {
-      knownNames.set(norm, trimmed);
-      changed = true;
-    }
-    const pn = lidToPn.get(norm);
-    if (pn && knownNames.get(pn) !== trimmed) {
-      knownNames.set(pn, trimmed);
-      changed = true;
-    }
-    const lid = pnToLid.get(norm);
-    if (lid && knownNames.get(lid) !== trimmed) {
-      knownNames.set(lid, trimmed);
-      changed = true;
-    }
-  }
-
-  if (changed && shouldPersist) {
-    persistPolls();
-  }
-  return changed;
+  const canonicalId = namesStore.resolveCanonicalId(norm || raw);
+  const pn = norm?.endsWith('@s.whatsapp.net') ? norm : (raw?.endsWith('@s.whatsapp.net') ? raw : null);
+  namesStore.setName(canonicalId, trimmed, [], pn);
+  return true;
 }
 
 /**
@@ -814,8 +782,8 @@ async function isUserAdmin(sock, remoteJid, senderJid) {
     if (!metadata?.participants) return false;
 
     const normUser = jidNormalizedUser(senderJid);
-    const pnUser = lidToPn.get(normUser) || (normUser?.endsWith('@s.whatsapp.net') ? normUser : null);
-    const lidUser = pnToLid.get(normUser) || (normUser?.endsWith('@lid') ? normUser : null);
+    const pnUser = namesStore.getPnByLid(normUser) || (normUser?.endsWith('@s.whatsapp.net') ? normUser : null);
+    const lidUser = namesStore.resolveCanonicalId(normUser) || (normUser?.endsWith('@lid') ? normUser : null);
 
     const participant = metadata.participants.find((p) => {
       const pPn = jidNormalizedUser(p.id || p.jid);
@@ -845,11 +813,8 @@ function isSameUser(jid1, jid2, name1, name2) {
   const norm1 = jidNormalizedUser(jid1);
   const norm2 = jidNormalizedUser(jid2);
   if (norm1 && norm2 && norm1 === norm2) return true;
-  const pn1 = lidToPn.get(norm1) || (norm1?.endsWith('@s.whatsapp.net') ? norm1 : null);
-  const pn2 = lidToPn.get(norm1) || (norm2?.endsWith('@s.whatsapp.net') ? norm2 : null);
-  if (pn1 && pn2 && pn1 === pn2) return true;
-  const lid1 = pnToLid.get(norm1) || (norm1?.endsWith('@lid') ? norm1 : null);
-  const lid2 = pnToLid.get(norm2) || (norm2?.endsWith('@lid') ? norm2 : null);
+  const lid1 = namesStore.resolveCanonicalId(norm1);
+  const lid2 = namesStore.resolveCanonicalId(norm2);
   if (lid1 && lid2 && lid1 === lid2) return true;
   return false;
 }
@@ -959,7 +924,6 @@ async function getGroupMetadata(sock, remoteJid) {
   // Only record participant name and LID mappings for the target group
   const isTarget = (targetGroupJid && remoteJid === targetGroupJid) || (metadata?.subject === TARGET_GROUP_NAME);
   if (isTarget && metadata?.participants) {
-    let changed = false;
     for (const p of metadata.participants) {
       const rawPn = p.id || p.jid;
       const rawLid = p.lid;
@@ -967,15 +931,12 @@ async function getGroupMetadata(sock, remoteJid) {
       const lid = rawLid && rawLid.endsWith('@lid') ? jidNormalizedUser(rawLid) : (rawPn && rawPn.endsWith('@lid') ? jidNormalizedUser(rawPn) : null);
       const name = p.name || p.notify || p.verifiedName;
       if (pn && lid && pn !== lid) {
-        if (lidToPn.get(lid) !== pn) { lidToPn.set(lid, pn); changed = true; }
-        if (pnToLid.get(pn) !== lid) { pnToLid.set(pn, lid); changed = true; }
-      }
-      if (name) {
-        if (pn) changed = recordName(pn, name, false) || changed;
-        if (lid) changed = recordName(lid, name, false) || changed;
+        namesStore.setMapping(lid, pn, name);
+      } else if (name) {
+        if (pn) recordName(pn, name);
+        if (lid) recordName(lid, name);
       }
     }
-    if (changed) persistPolls();
   }
   return metadata;
 }
@@ -1388,10 +1349,9 @@ async function startBot() {
       for (const c of contacts) {
         const name = c.name || c.notify || c.verifiedName;
         if (name && c.id && isTargetGroupContact(c.id)) {
-          changed = recordName(c.id, name, false) || changed;
+          recordName(c.id, name);
         }
       }
-      if (changed) persistPolls();
     } catch (err) {
       console.error(`⚠️ [${new Date().toISOString()}] Error in contacts.upsert:`, err);
     }
@@ -1403,10 +1363,9 @@ async function startBot() {
       for (const c of updates) {
         const name = c.name || c.notify || c.verifiedName;
         if (name && c.id && isTargetGroupContact(c.id)) {
-          changed = recordName(c.id, name, false) || changed;
+          recordName(c.id, name);
         }
       }
-      if (changed) persistPolls();
     } catch (err) {
       console.error(`⚠️ [${new Date().toISOString()}] Error in contacts.update:`, err);
     }
@@ -1459,7 +1418,6 @@ async function startBot() {
 
             // Only map participants for the TARGET_GROUP_NAME
             if (gMeta.participants) {
-              let changed = false;
               for (const p of gMeta.participants) {
                 const rawPn = p.id || p.jid;
                 const rawLid = p.lid;
@@ -1467,15 +1425,12 @@ async function startBot() {
                 const lid = rawLid && rawLid.endsWith('@lid') ? jidNormalizedUser(rawLid) : (rawPn && rawPn.endsWith('@lid') ? jidNormalizedUser(rawPn) : null);
                 const name = p.name || p.notify || p.verifiedName;
                 if (pn && lid && pn !== lid) {
-                  if (lidToPn.get(lid) !== pn) { lidToPn.set(lid, pn); changed = true; }
-                  if (pnToLid.get(pn) !== lid) { pnToLid.set(pn, lid); changed = true; }
-                }
-                if (name) {
-                  if (pn) changed = recordName(pn, name, false) || changed;
-                  if (lid) changed = recordName(lid, name, false) || changed;
+                  namesStore.setMapping(lid, pn, name);
+                } else if (name) {
+                  if (pn) recordName(pn, name);
+                  if (lid) recordName(lid, name);
                 }
               }
-              if (changed) persistPolls();
             }
           }
         }
@@ -2206,8 +2161,8 @@ async function canUserManagePlayerAlias(sock, chatId, senderJid, senderName, tar
     const match = namesStore.findIdByNameOrAlias(targetPlayer);
     if (match) {
       const normSender = jidNormalizedUser(senderJid);
-      const pn = lidToPn.get(normSender) || (normSender?.endsWith('@s.whatsapp.net') ? normSender : null);
-      const lid = pnToLid.get(normSender) || (normSender?.endsWith('@lid') ? normSender : null);
+      const pn = namesStore.getPnByLid(normSender) || (normSender?.endsWith('@s.whatsapp.net') ? normSender : null);
+      const lid = namesStore.resolveCanonicalId(normSender) || (normSender?.endsWith('@lid') ? normSender : null);
 
       if (match.id === normSender || match.id === pn || match.id === lid) return true;
       if (match.entry?.name && ratings.keyFor(match.entry.name) === ratings.keyFor(senderName)) return true;
@@ -2389,7 +2344,6 @@ function knownPlayers(chatId) {
   for (const p of ratings.getAllRatings()) add(p.name, p.name);
   for (const p of storage.getLeaderboard()) add(p.name, p.name);
   for (const a of storage.getAvailability()) add(a.player, a.player);
-  for (const name of knownNames.values()) add(name, name);
 
   for (const [, pollState] of activePolls.entries()) {
     if (pollState.remoteJid === chatId) {
@@ -2697,8 +2651,8 @@ async function processPollVoteEvent(sock, pollMessageKey, rawPollUpdates) {
     meLid,
     mePn,
     pollMessageKey.participant ? jidNormalizedUser(pollMessageKey.participant) : null,
-    pollMessageKey.participant && pnToLid.get(jidNormalizedUser(pollMessageKey.participant)),
-    pollMessageKey.participant && lidToPn.get(jidNormalizedUser(pollMessageKey.participant)),
+    pollMessageKey.participant && namesStore.resolveCanonicalId(jidNormalizedUser(pollMessageKey.participant)),
+    pollMessageKey.participant && namesStore.getPnByLid(jidNormalizedUser(pollMessageKey.participant)),
     pollMessageKey.remoteJid ? jidNormalizedUser(pollMessageKey.remoteJid) : null
   ];
 
@@ -2714,12 +2668,11 @@ async function processPollVoteEvent(sock, pollMessageKey, rawPollUpdates) {
     const rawParticipantPn = u.pollUpdateMessageKey?.participantPn ? jidNormalizedUser(u.pollUpdateMessageKey.participantPn) : null;
     if (voterNormalized && rawParticipantPn) {
       if (voterNormalized.endsWith('@lid') && rawParticipantPn.endsWith('@s.whatsapp.net')) {
-        lidToPn.set(voterNormalized, rawParticipantPn);
-        pnToLid.set(rawParticipantPn, voterNormalized);
+        namesStore.setMapping(voterNormalized, rawParticipantPn);
       }
     }
-    const voterLid = pnToLid.get(voterNormalized) || (voterNormalized?.endsWith('@lid') ? voterNormalized : null);
-    const voterPn = rawParticipantPn || lidToPn.get(voterNormalized) || (voterNormalized?.endsWith('@s.whatsapp.net') ? voterNormalized : null);
+    const voterLid = namesStore.resolveCanonicalId(voterNormalized) || (voterNormalized?.endsWith('@lid') ? voterNormalized : null);
+    const voterPn = rawParticipantPn || namesStore.getPnByLid(voterNormalized) || (voterNormalized?.endsWith('@s.whatsapp.net') ? voterNormalized : null);
 
     const voterCandidates = [
       voterNormalized,
@@ -2758,7 +2711,7 @@ async function processPollVoteEvent(sock, pollMessageKey, rawPollUpdates) {
     }
 
     votePayload = normalizeVotePayload(votePayload);
-    const canonicalVoter = lidToPn.get(authenticatingVoter) || authenticatingVoter;
+    const canonicalVoter = voterLid || authenticatingVoter;
 
     pollState.voteBuffer.set(canonicalVoter, {
       ...u,
@@ -3045,20 +2998,12 @@ function nameFor(jid) {
     return 'Me';
   }
   const norm = jidNormalizedUser(jid) || jid;
-  const pn = lidToPn.get(norm) || (norm?.endsWith('@s.whatsapp.net') ? norm : null);
-  const lid = pnToLid.get(norm) || (norm?.endsWith('@lid') ? norm : null);
-
-  const registeredName = namesStore.getName(norm) || (pn && namesStore.getName(pn)) || (lid && namesStore.getName(lid)) || namesStore.getName(jid);
+  const registeredName = namesStore.getName(norm) || namesStore.getName(jid);
   if (registeredName) return registeredName;
 
-  if (knownNames.has(norm)) return knownNames.get(norm);
-  if (pn && knownNames.has(pn)) return knownNames.get(pn);
-  if (lid && knownNames.has(lid)) return knownNames.get(lid);
-  if (knownNames.has(jid)) return knownNames.get(jid);
-
-  // Check if this JID matches any creator or voter in activePolls
+  // Check if this JID matches any creator in activePolls
   for (const [, pollState] of activePolls.entries()) {
-    if (pollState.creator?.jid && (pollState.creator.jid === norm || pollState.creator.jid === pn || pollState.creator.jid === lid)) {
+    if (pollState.creator?.jid && (pollState.creator.jid === norm || pollState.creator.jid === jid)) {
       if (pollState.creator.name) {
         recordName(norm, pollState.creator.name);
         return pollState.creator.name;
@@ -3066,6 +3011,7 @@ function nameFor(jid) {
     }
   }
 
+  const pn = namesStore.getPnByLid(norm);
   const digits = (pn || norm || jid).split('@')[0].replace(/\D/g, '');
   if (digits.length >= 4) {
     return `Player (${digits.slice(-4)})`;
