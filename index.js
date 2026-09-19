@@ -2037,6 +2037,7 @@ function knownPlayers(chatId) {
   for (const p of ratings.getAllRatings()) add(p.name);
   for (const p of storage.getLeaderboard()) add(p.name);
   for (const a of storage.getAvailability()) add(a.player);
+  for (const name of knownNames.values()) add(name);
 
   for (const [, pollState] of activePolls.entries()) {
     if (pollState.remoteJid === chatId) {
