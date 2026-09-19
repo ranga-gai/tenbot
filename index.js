@@ -373,6 +373,9 @@ const {
 
 const storeKey = (remoteJid, id) => `${remoteJid}:${id}`;
 
+// Ensure all rated players exist in names.json on startup
+ratings.syncRatingsWithNames();
+
 function persistPolls() {
   pollStore.save({ messageStore, activePolls, latestPollIdByChat, knownNames, lidToPn, pnToLid });
 }
