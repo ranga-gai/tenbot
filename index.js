@@ -89,6 +89,7 @@ const { parseScoreReport } = require('./lib/scoreReport');
 const { parseLineup } = require('./lib/lineupParser');
 const pairHistory = require('./lib/pairHistory');
 const ratings = require('./lib/ratings');
+const tennisRecord = require('./lib/tennisRecord');
 const pollStore = require('./lib/pollStore');
 const namesStore = require('./lib/names');
 const messageHistory = require('./lib/messageHistory');
@@ -282,6 +283,7 @@ const CLAUDE_TOOLS = [
       required: ['fullName']
     }
   },
+
   {
     name: 'set_rating',
     description: 'Sets or updates the rating for the user who sent the message (or for a named player if specified). Rating must be a number between 2.5 and 4.5.',
@@ -1899,6 +1901,7 @@ async function executeTool(sock, chatId, sender, toolUse, msg) {
     const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
     return await handleSetFullName(sock, chatId, senderJid, sender, player, fullName);
   }
+
   if (name === 'set_rating') {
     const newRating = input.rating;
     const targetPlayer = input.player || (sender !== 'Someone' ? sender : (msg?.key?.participant ? nameFor(msg.key.participant) : null));
@@ -2122,6 +2125,32 @@ async function getResponse(sock, text, chatId, sender, msg) {
 
   if (lower === '!ratings') {
     return formatRatings();
+  }
+
+  // --- TennisRecord Certificate Check Management ---
+  if (lower === '!suspendcert' || lower === '!suspendcertcheck' || lower === '!certcheck suspend' || lower === '!certcheck off') {
+    const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
+    const isAdmin = await isUserAdmin(sock, chatId, senderJid);
+    if (!isAdmin) {
+      return '⚠️ Only group admins can change SSL certificate verification settings.';
+    }
+    tennisRecord.suspendCertCheck();
+    return '🔓 TennisRecord SSL certificate validation suspended. Lookups will proceed even if certificates are expired or invalid.';
+  }
+
+  if (lower === '!resumecert' || lower === '!resumecertcheck' || lower === '!certcheck resume' || lower === '!certcheck on') {
+    const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
+    const isAdmin = await isUserAdmin(sock, chatId, senderJid);
+    if (!isAdmin) {
+      return '⚠️ Only group admins can change SSL certificate verification settings.';
+    }
+    tennisRecord.resumeCertCheck();
+    return '🔒 TennisRecord SSL certificate validation resumed (strict verification enabled).';
+  }
+
+  if (lower === '!certstatus' || lower === '!certcheck' || lower === '!sslstatus') {
+    const isSuspended = tennisRecord.getCertCheckSuspended();
+    return `🔒 TennisRecord SSL certificate check status: ${isSuspended ? 'SUSPENDED (insecure / expired certs allowed)' : 'ACTIVE (strict verification enabled)'}.`;
   }
 
   if (lower === '!refreshratings') {
