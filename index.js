@@ -265,6 +265,24 @@ const CLAUDE_TOOLS = [
     }
   },
   {
+    name: 'set_full_name',
+    description: 'Sets or updates the full name for a player (or for the sender if player is omitted) and initializes/refreshes their rating from TennisRecord.com using the full name.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        fullName: {
+          type: 'string',
+          description: 'The complete full name of the player (e.g. "Pramod Immaneni", "John Smith").'
+        },
+        player: {
+          type: 'string',
+          description: 'Optional display name or alias of the player to update. If omitted, updates the sender.'
+        }
+      },
+      required: ['fullName']
+    }
+  },
+  {
     name: 'set_rating',
     description: 'Sets or updates the rating for the user who sent the message (or for a named player if specified). Rating must be a number between 2.5 and 4.5.',
     input_schema: {
@@ -1876,6 +1894,11 @@ async function executeTool(sock, chatId, sender, toolUse, msg) {
     }
     return `Alias "${targetAlias}" was not found.`;
   }
+  if (name === 'set_full_name') {
+    const { fullName, player } = input;
+    const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
+    return await handleSetFullName(sock, chatId, senderJid, sender, player, fullName);
+  }
   if (name === 'set_rating') {
     const newRating = input.rating;
     const targetPlayer = input.player || (sender !== 'Someone' ? sender : (msg?.key?.participant ? nameFor(msg.key.participant) : null));
@@ -2064,6 +2087,17 @@ async function getResponse(sock, text, chatId, sender, msg) {
     }
   }
 
+  // --- Full Name ---
+  if (lower.startsWith('!setfullname') || lower.startsWith('!fullname')) {
+    const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
+    const senderDisplayName = sender !== 'Someone' ? sender : (senderJid ? nameFor(senderJid) : 'me');
+    const parsed = parseFullNameCommand(text, senderDisplayName);
+    if (!parsed || !parsed.fullName) {
+      return 'Please provide a full name. Use: "!fullname <full name>" or "!setfullname <player name> = <full name>"\ne.g. "!fullname Roger Federer" or "!setfullname John = Johnathan Smith"';
+    }
+    return await handleSetFullName(sock, chatId, senderJid, sender, parsed.name, parsed.fullName);
+  }
+
   // --- Scores / leaderboard ---
   if (lower.startsWith('!score')) {
     return handleScoreCommand(text);
@@ -2231,6 +2265,7 @@ function helpText() {
     '!alias <alias> (or !alias <name> = <alias>) – add an alias for yourself or another player, e.g. "!alias PK" or "!alias John = JD"',
     '!deletealias <name> = <alias> (or !deletealias <alias>) – remove an alias for a player',
     '!aliases – list all registered players and their aliases',
+    '!fullname <full name> (or !setfullname <name> = <full name>) – set your full name and lookup initial TennisRecord rating',
     '!refreshratings – (Admin only) refresh player ratings from TennisRecord.com now',
     `!setrating <rating> (or ${TRIGGER_PREFIX} my rating is <rating>) – set or update your rating (${ratings.MIN_RATING}–${ratings.MAX_RATING})`,
     '!weather [location] – forecast for outdoor play (defaults to ' + DEFAULT_LOCATION + ')',
@@ -2273,6 +2308,60 @@ async function canUserManagePlayerAlias(sock, chatId, senderJid, senderName, tar
   }
 
   return await isUserAdmin(sock, chatId, senderJid);
+}
+
+
+async function handleSetFullName(sock, chatId, senderJid, senderName, playerName, fullName) {
+  const cleanFull = typeof fullName === 'string' ? fullName.trim() : '';
+  if (!cleanFull) return 'Please provide a valid full name.';
+
+  const targetPlayer = playerName || senderName || (senderJid ? nameFor(senderJid) : 'me');
+  const canManage = await canUserManagePlayerAlias(sock, chatId, senderJid, senderName, targetPlayer);
+  if (!canManage) {
+    return '⚠️ Only group admins can update the full name for other players. You can set your own full name.';
+  }
+
+  let targetId = null;
+  const match = namesStore.findIdByNameOrAlias(targetPlayer);
+  if (match) {
+    targetId = match.id;
+  } else if (senderJid) {
+    targetId = namesStore.resolveCanonicalId(jidNormalizedUser(senderJid));
+  } else {
+    targetId = targetPlayer;
+  }
+
+  const updatedEntry = namesStore.setFullName(targetId, cleanFull);
+  const resolvedDisplayName = updatedEntry?.name || targetPlayer;
+
+  const trResult = await ratings.updateRatingFromFullName(targetId, cleanFull, { jid: senderJid });
+  let ratingNote = '';
+  if (trResult) {
+    const locStr = trResult.tennisRecordLocation ? ` (${trResult.tennisRecordLocation})` : '';
+    const urlStr = trResult.tennisRecordUrl ? ` -> ${trResult.tennisRecordUrl}` : '';
+    ratingNote = ` Initial rating from TennisRecord set to ${ratings.formatRating(trResult.rating)}${locStr}${urlStr}.`;
+  }
+
+  return `✅ Updated full name for "${resolvedDisplayName}" to "${cleanFull}".${ratingNote}`;
+}
+
+function parseFullNameCommand(text, defaultSenderName = null) {
+  const raw = text.replace(/^!(?:setfullname|fullname)\s*/i, '').trim();
+  if (!raw) return null;
+
+  if (/\bfor\b/i.test(raw)) {
+    const forMatch = raw.match(/^(.+?)\s+\bfor\b\s+(.+)$/i);
+    if (forMatch) {
+      return { name: forMatch[2].trim(), fullName: forMatch[1].trim() };
+    }
+  }
+
+  const delimMatch = raw.match(/^(.+?)\s*(?:=|:|->|\bas\b|\bto\b)\s*(.+)$/i);
+  if (delimMatch) {
+    return { name: delimMatch[1].trim(), fullName: delimMatch[2].trim() };
+  }
+
+  return { name: defaultSenderName || 'me', fullName: raw };
 }
 
 function parseAliasCommand(text, defaultSenderName = null) {
