@@ -369,7 +369,8 @@ const {
 
 const storeKey = (remoteJid, id) => `${remoteJid}:${id}`;
 
-// Ensure all players in names.json have ratings on startup
+// Ensure all players in names.json have full names defaulted and ratings on startup
+namesStore.defaultMissingFullNames();
 ratings.syncRatingsWithNames();
 
 function persistPolls() {
