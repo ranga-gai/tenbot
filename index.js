@@ -374,7 +374,7 @@ const {
 const storeKey = (remoteJid, id) => `${remoteJid}:${id}`;
 
 // Ensure all rated players exist in names.json on startup
-namesStore.deduplicateWithPnMap(pnToLid);
+namesStore.syncFromPollStore({ lidToPn, pnToLid, knownNames });
 ratings.deduplicateRatingsWithLidMap(pnToLid);
 ratings.syncRatingsWithNames();
 
