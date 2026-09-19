@@ -90,6 +90,7 @@ const { parseLineup } = require('./lib/lineupParser');
 const pairHistory = require('./lib/pairHistory');
 const ratings = require('./lib/ratings');
 const pollStore = require('./lib/pollStore');
+const namesStore = require('./lib/names');
 const messageHistory = require('./lib/messageHistory');
 const { resolvePlayDateTime, getSanJoseNow } = require('./lib/pollTime');
 
@@ -704,6 +705,15 @@ function recordName(jid, name, shouldPersist = true) {
   const raw = jid;
   const norm = jidNormalizedUser(jid);
   let changed = false;
+
+  namesStore.setName(raw, trimmed);
+  if (norm) {
+    namesStore.setName(norm, trimmed);
+    const pn = lidToPn.get(norm);
+    if (pn) namesStore.setName(pn, trimmed);
+    const lid = pnToLid.get(norm);
+    if (lid) namesStore.setName(lid, trimmed);
+  }
 
   if (knownNames.get(raw) !== trimmed) {
     knownNames.set(raw, trimmed);
@@ -2038,6 +2048,10 @@ function knownPlayers(chatId) {
   for (const p of storage.getLeaderboard()) add(p.name);
   for (const a of storage.getAvailability()) add(a.player);
   for (const name of knownNames.values()) add(name);
+  for (const entry of namesStore.getAllEntries()) {
+    if (entry.name) add(entry.name);
+    for (const alias of entry.aliases || []) add(alias);
+  }
 
   for (const [, pollState] of activePolls.entries()) {
     if (pollState.remoteJid === chatId) {
@@ -2695,6 +2709,9 @@ function nameFor(jid) {
   const norm = jidNormalizedUser(jid) || jid;
   const pn = lidToPn.get(norm) || (norm?.endsWith('@s.whatsapp.net') ? norm : null);
   const lid = pnToLid.get(norm) || (norm?.endsWith('@lid') ? norm : null);
+
+  const registeredName = namesStore.getName(norm) || (pn && namesStore.getName(pn)) || (lid && namesStore.getName(lid)) || namesStore.getName(jid);
+  if (registeredName) return registeredName;
 
   if (knownNames.has(norm)) return knownNames.get(norm);
   if (pn && knownNames.has(pn)) return knownNames.get(pn);
