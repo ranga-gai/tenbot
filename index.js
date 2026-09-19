@@ -110,10 +110,9 @@ const TRIGGER_PREFIX = '@tenbot'; // e.g. "@tenbot who's free this weekend?"
 const DEFAULT_LOCATION = 'San Jose, CA'; // change to wherever the group usually plays
 
 // How long after a poll's scheduled play time to keep it around before
-// automatically deleting it -- gives some slack for "!rematch"/"!pollstatus"
-// to still work for a while after play starts, rather than vanishing the
-// instant the clock crosses the play time.
-const POLL_EXPIRY_GRACE_HOURS = 3;
+// automatically deleting it (kept for 2 weeks / 14 days so past draws, rematches,
+// and matchup contexts remain accessible).
+const POLL_EXPIRY_GRACE_DAYS = 14;
 
 // How often to sweep for and delete completed/cancelled/expired polls.
 const POLL_CLEANUP_INTERVAL_MINUTES = 15;
@@ -1016,8 +1015,7 @@ async function cancelOrDeletePoll(sock, remoteJid, pollId) {
  */
 function cleanupExpiredPolls() {
   const now = Date.now();
-  const defaultGraceMs = POLL_EXPIRY_GRACE_HOURS * 60 * 60 * 1000;
-  const manualGraceMs = 24 * 60 * 60 * 1000; // 24 hours grace for manual polls
+  const graceMs = POLL_EXPIRY_GRACE_DAYS * 24 * 60 * 60 * 1000; // Keep polls for 2 weeks (14 days)
   const removed = [];
 
   for (const [pollId, pollState] of activePolls.entries()) {
@@ -1025,9 +1023,8 @@ function cleanupExpiredPolls() {
     const playAtMs = new Date(pollState.playAt).getTime();
     if (Number.isNaN(playAtMs)) continue;
 
-    // Give manual polls a generous 24-hour grace period so active votes are not discarded prematurely
-    const graceMs = pollState.isManual ? manualGraceMs : defaultGraceMs;
     if (now > playAtMs + graceMs) {
+      console.log(`[poll] Expiring poll ${pollId} ("${pollState.name || pollState.when}"): playAt=${pollState.playAt}, now=${new Date(now).toISOString()} (exceeded 2-week retention)`);
       activePolls.delete(pollId);
       for (const key of messageStore.keys()) {
         if (key.endsWith(`:${pollId}`)) {
@@ -1043,7 +1040,7 @@ function cleanupExpiredPolls() {
 
   if (removed.length > 0) {
     persistPolls();
-    console.log(`[poll] Cleaned up ${removed.length} expired/completed poll(s): ${removed.join(', ')}`);
+    console.log(`[poll] Cleaned up ${removed.length} expired/completed poll(s) older than 2 weeks: ${removed.join(', ')}`);
   }
   return removed;
 }
@@ -2751,7 +2748,7 @@ function pollStatusText(chatId) {
         `Poll ${pollId}: User-Created Manual Match Poll "${pollState.name || 'Match Poll'}".`,
         `Creator: ${creatorName}`,
         `Status: ${pollState.status} (Passively tracked)`,
-        `Play time: ${playAtLocal} (auto-deleted ${POLL_EXPIRY_GRACE_HOURS}h after this if not already gone)`,
+        `Play time: ${playAtLocal} (kept for 2 weeks after scheduled play time)`,
         `Total votes buffered: ${pollState.voteBuffer.size}`,
         `Options & Votes:\n  ${optionSummaries.length ? optionSummaries.join('\n  ') : '(none)'}`,
         `Voted so far (${interestedPlayers.length}): ${interestedPlayers.length ? interestedPlayers.join(', ') : '(none yet)'}`,
@@ -2782,7 +2779,7 @@ function pollStatusText(chatId) {
       const lines = [
         `Poll ${pollId}${pollState.when ? ` (${pollState.when})` : ''}: Opt-in (Yes/No).`,
         `Status: ${pollState.status}`,
-        `Play time: ${playAtLocal} (auto-deleted ${POLL_EXPIRY_GRACE_HOURS}h after this if not already gone)`,
+        `Play time: ${playAtLocal} (kept for 2 weeks after scheduled play time)`,
         `Yes votes (${yesVoters.length}): ${yesVoters.length ? yesVoters.join(', ') : '(none yet)'}`,
         `No votes (${noVoters.length}): ${noVoters.length ? noVoters.join(', ') : '(none yet)'}`,
         'Matchups: Waiting for user prompt (!matchups or "@tenbot generate matchups")'
@@ -2796,7 +2793,7 @@ function pollStatusText(chatId) {
       `Poll ${pollId}${pollState.when ? ` (${pollState.when})` : ''}: ${pollState.size} spots (${pollState.size === 2 ? 'Singles' : 'Doubles'}).`,
       pollState.creator ? `Creator (Player 1): ${pollState.creator.name || 'Player 1'}` : 'Creator: None (all spots open)',
       `Status: ${pollState.status}`,
-      `Play time: ${playAtLocal} (auto-deleted ${POLL_EXPIRY_GRACE_HOURS}h after this if not already gone)`,
+      `Play time: ${playAtLocal} (kept for 2 weeks after scheduled play time)`,
       `Raw votes recorded: ${pollState.voteBuffer.size}/${neededVotes} needed`,
       `Voters seen so far: ${voters.length ? voters.join(', ') : '(none yet)'}`
     ];
