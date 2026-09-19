@@ -745,6 +745,38 @@ function recordName(jid, name, shouldPersist = true) {
 /**
  * Checks if two identities (JID and/or display name) represent the same user.
  */
+/**
+ * Checks if a user is an admin or superadmin in a group.
+ */
+async function isUserAdmin(sock, remoteJid, senderJid) {
+  if (!sock || !remoteJid || !senderJid) return false;
+  if (!remoteJid.endsWith('@g.us')) return true; // Direct message / non-group
+  try {
+    const metadata = await getGroupMetadata(sock, remoteJid);
+    if (!metadata?.participants) return false;
+
+    const normUser = jidNormalizedUser(senderJid);
+    const pnUser = lidToPn.get(normUser) || (normUser?.endsWith('@s.whatsapp.net') ? normUser : null);
+    const lidUser = pnToLid.get(normUser) || (normUser?.endsWith('@lid') ? normUser : null);
+
+    const participant = metadata.participants.find((p) => {
+      const pPn = jidNormalizedUser(p.id || p.jid);
+      const pLid = jidNormalizedUser(p.lid);
+      return (
+        pPn === normUser ||
+        pLid === normUser ||
+        (pnUser && (pPn === pnUser || pLid === pnUser)) ||
+        (lidUser && (pPn === lidUser || pLid === lidUser))
+      );
+    });
+
+    return participant?.admin === 'admin' || participant?.admin === 'superadmin';
+  } catch (err) {
+    console.error('Failed to check admin status:', err.message);
+    return false;
+  }
+}
+
 function isSameUser(jid1, jid2, name1, name2) {
   const k1 = ratings.keyFor(name1);
   const k2 = ratings.keyFor(name2);
@@ -1705,6 +1737,16 @@ async function executeTool(sock, chatId, sender, toolUse, msg) {
       targetPollId = latestPollIdByChat.get(chatId);
     }
     if (!targetPollId || !activePolls.has(targetPollId)) return 'No active poll to cancel.';
+
+    const targetPollState = activePolls.get(targetPollId);
+    const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
+    const isCreator = targetPollState.creator ? isSameUser(targetPollState.creator.jid, senderJid, targetPollState.creator.name, sender) : false;
+    const isAdmin = await isUserAdmin(sock, chatId, senderJid);
+
+    if (!isCreator && !isAdmin) {
+      return '⚠️ Only the poll creator or group admins can cancel this poll.';
+    }
+
     await cancelOrDeletePoll(sock, chatId, targetPollId);
     return 'Poll cancelled and deleted from WhatsApp successfully.';
   }
@@ -1764,6 +1806,11 @@ async function getResponse(sock, text, chatId, sender, msg) {
   if (lower.startsWith('!help')) return helpText();
 
   if (lower === '!reset') {
+    const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
+    const isAdmin = await isUserAdmin(sock, chatId, senderJid);
+    if (!isAdmin) {
+      return '⚠️ Only group admins can use !reset.';
+    }
     chatHistories.delete(chatId);
     messageHistory.clear(chatId);
     return 'Conversation history and recent 2-week group message logs cleared.';
@@ -1783,6 +1830,11 @@ async function getResponse(sock, text, chatId, sender, msg) {
   }
 
   if (lower === '!clearfree') {
+    const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
+    const isAdmin = await isUserAdmin(sock, chatId, senderJid);
+    if (!isAdmin) {
+      return '⚠️ Only group admins can use !clearfree.';
+    }
     storage.clearAvailability();
     return 'Availability list cleared for everyone.';
   }
@@ -1814,6 +1866,11 @@ async function getResponse(sock, text, chatId, sender, msg) {
   }
 
   if (lower === '!refreshratings') {
+    const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
+    const isAdmin = await isUserAdmin(sock, chatId, senderJid);
+    if (!isAdmin) {
+      return '⚠️ Only group admins can use !refreshratings.';
+    }
     const { checkedCount, updatedCount } = await ratings.refreshPeriodicRatings({ force: true });
     return `Checked ${checkedCount} player(s) on TennisRecord.com: updated ${updatedCount} rating(s).`;
   }
@@ -1857,6 +1914,16 @@ async function getResponse(sock, text, chatId, sender, msg) {
       targetPollId = latestPollIdByChat.get(chatId);
     }
     if (!targetPollId || !activePolls.has(targetPollId)) return 'No active poll to cancel.';
+
+    const targetPollState = activePolls.get(targetPollId);
+    const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
+    const isCreator = targetPollState.creator ? isSameUser(targetPollState.creator.jid, senderJid, targetPollState.creator.name, sender) : false;
+    const isAdmin = await isUserAdmin(sock, chatId, senderJid);
+
+    if (!isCreator && !isAdmin) {
+      return '⚠️ Only the poll creator or group admins can cancel this poll.';
+    }
+
     await cancelOrDeletePoll(sock, chatId, targetPollId);
     return 'Poll cancelled and deleted from WhatsApp -- I won\'t auto-generate matchups from it anymore.';
   }
@@ -1866,6 +1933,11 @@ async function getResponse(sock, text, chatId, sender, msg) {
   }
 
   if (lower === '!cleanuppolls') {
+    const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
+    const isAdmin = await isUserAdmin(sock, chatId, senderJid);
+    if (!isAdmin) {
+      return '⚠️ Only group admins can use !cleanuppolls.';
+    }
     const removed = cleanupExpiredPolls();
     return removed.length
       ? `Cleaned up ${removed.length} old poll(s).`
@@ -1922,21 +1994,21 @@ function helpText() {
     '!free <when> – mark yourself free to play, e.g. "!free Sat 9am"',
     '!free – show who\'s free and when',
     '!notfree – remove yourself from the availability list',
-    '!clearfree – clear the whole availability list',
+    '!clearfree – (Admin only) clear the whole availability list',
     '!score <winner> def <loser> <score> – record a match and update ratings, e.g. "!score Mike & Sara def John & Alex 6-4 6-2"',
     `  (or tell me in words: "${TRIGGER_PREFIX} Mike & Sara beat John & Alex 6-4", or "${TRIGGER_PREFIX} we won" after a draw – no score means 6-3)`,
     '!leaderboard – show the win/loss leaderboard',
     '!ratings – show player ratings used to balance the courts',
-    '!refreshratings – refresh player ratings from TennisRecord.com now',
+    '!refreshratings – (Admin only) refresh player ratings from TennisRecord.com now',
     `!setrating <rating> (or ${TRIGGER_PREFIX} my rating is <rating>) – set or update your rating (${ratings.MIN_RATING}–${ratings.MAX_RATING})`,
     '!weather [location] – forecast for outdoor play (defaults to ' + DEFAULT_LOCATION + ')',
     `${TRIGGER_PREFIX} create a poll [for <N>] [when] – post a match poll (N spots for singles/doubles, or Yes/No opt-in if N is omitted)`,
     '!poll [for <N>] [when] (or !createpoll) – direct command to create a match poll',
     '!matchups (or !draw, !rematch) – generate matchups from active tennis match poll',
-    '!cancelpoll (or !deletepoll) – stop and delete the active poll from WhatsApp',
+    '!cancelpoll (or !deletepoll) – stop and delete the active poll (creator or admin only)',
     '!pollstatus – debug: show raw vote count and voters for active match poll(s)',
-    '!cleanuppolls – debug: force a sweep that deletes expired/completed polls now',
-    '!reset – clear the bot\'s conversation memory',
+    '!cleanuppolls – (Admin only) debug: force a sweep that deletes expired/completed polls now',
+    '!reset – (Admin only) clear the bot\'s conversation memory',
     TRIGGER_PREFIX ? `${TRIGGER_PREFIX} <question> – ask the bot anything (including setting rating, questions)` : '(bot also responds to any message)'
   ].join('\n');
 }
