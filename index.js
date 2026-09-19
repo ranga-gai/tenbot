@@ -229,6 +229,42 @@ const CLAUDE_TOOLS = [
     }
   },
   {
+    name: 'add_alias',
+    description: 'Adds an alias or nickname for a player so the bot recognizes them by either their full name or any of their aliases.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        player: {
+          type: 'string',
+          description: 'The player full display name or existing alias.'
+        },
+        alias: {
+          type: 'string',
+          description: 'The new alias or nickname to associate with this player.'
+        }
+      },
+      required: ['player', 'alias']
+    }
+  },
+  {
+    name: 'remove_alias',
+    description: 'Removes an alias or nickname from a player.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        player: {
+          type: 'string',
+          description: 'Optional player name if known.'
+        },
+        alias: {
+          type: 'string',
+          description: 'The alias or nickname to remove.'
+        }
+      },
+      required: ['alias']
+    }
+  },
+  {
     name: 'set_rating',
     description: 'Sets or updates the rating for the user who sent the message (or for a named player if specified). Rating must be a number between 2.5 and 4.5.',
     input_schema: {
@@ -1744,6 +1780,44 @@ async function executeTool(sock, chatId, sender, toolUse, msg) {
     const res = await generateMatchupsFromPoll(sock, chatId, input.pollId, input.pollName || input.when);
     return res || 'Matchups generated and posted.';
   }
+  if (name === 'add_alias') {
+    const { player, alias } = input;
+    if (!player || !alias) return 'Please provide both player name and alias.';
+    const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
+    const canManage = await canUserManagePlayerAlias(sock, chatId, senderJid, sender, player);
+    if (!canManage) {
+      return '⚠️ Only group admins can add aliases for other players. You can add aliases for yourself.';
+    }
+    const res = namesStore.addAliasForPlayer(player, alias);
+    if (res) {
+      return `Added alias "${alias}" for player "${res.name}". Current aliases: [${res.aliases.join(', ')}].`;
+    }
+    return `Could not add alias for "${player}".`;
+  }
+  if (name === 'remove_alias') {
+    const { player, alias } = input;
+    const targetAlias = alias || player;
+    const targetPlayer = alias ? player : null;
+    if (!targetAlias) return 'Please provide the alias to remove.';
+
+    const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
+    let resolvedPlayer = targetPlayer;
+    if (!resolvedPlayer) {
+      const match = namesStore.findIdByNameOrAlias(targetAlias);
+      if (match) resolvedPlayer = match.entry?.name;
+    }
+
+    const canManage = await canUserManagePlayerAlias(sock, chatId, senderJid, sender, resolvedPlayer || targetAlias);
+    if (!canManage) {
+      return '⚠️ Only group admins can delete aliases for other players. You can delete aliases for yourself.';
+    }
+
+    const res = namesStore.removeAliasForPlayer(targetPlayer, targetAlias);
+    if (res) {
+      return `Removed alias "${res.removed}" from player "${res.name}". Current aliases: [${res.aliases.join(', ')}].`;
+    }
+    return `Alias "${targetAlias}" was not found.`;
+  }
   if (name === 'set_rating') {
     const newRating = input.rating;
     const targetPlayer = input.player || (sender !== 'Someone' ? sender : (msg?.key?.participant ? nameFor(msg.key.participant) : null));
@@ -1878,6 +1952,58 @@ async function getResponse(sock, text, chatId, sender, msg) {
     }
     storage.clearAvailability();
     return 'Availability list cleared for everyone.';
+  }
+
+  // --- Aliases ---
+  if (lower === '!aliases' || lower === '!alias list') {
+    return formatAliases();
+  }
+
+  if (lower.startsWith('!alias') || lower.startsWith('!addalias')) {
+    const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
+    const senderDisplayName = sender !== 'Someone' ? sender : (senderJid ? nameFor(senderJid) : 'me');
+    const parsed = parseAliasCommand(text, senderDisplayName);
+    if (!parsed || !parsed.name || !parsed.alias) {
+      return 'Couldn\'t parse that. Use: "!alias <alias>" (for yourself) or "!alias <player name> = <alias>"\ne.g. "!alias PK" or "!alias Jonathan Doe = JD"';
+    }
+    const canManage = await canUserManagePlayerAlias(sock, chatId, senderJid, sender, parsed.name);
+    if (!canManage) {
+      return '⚠️ Only group admins can add aliases for other players. You can add aliases for yourself (e.g. "!alias <your alias>").';
+    }
+    const res = namesStore.addAliasForPlayer(parsed.name, parsed.alias, senderJid);
+    if (res) {
+      return `✅ Added alias "${parsed.alias}" for player "${res.name}". Current aliases: [${res.aliases.join(', ')}].`;
+    } else {
+      return `Could not add alias for "${parsed.name}".`;
+    }
+  }
+
+  if (/^!(?:deletealias|delalias|removealias|rmalias)\b/i.test(lower)) {
+    const parsed = parseAliasCommand(text) || { name: null, alias: text.replace(/^!(?:deletealias|delalias|removealias|rmalias)\s*/i, '').trim() };
+    if (!parsed || (!parsed.name && !parsed.alias)) {
+      return 'Use: !deletealias <player name> = <alias> or !deletealias <alias>\ne.g. "!deletealias Jonathan Doe = JD" or "!deletealias JD"';
+    }
+    const targetAlias = parsed.alias || parsed.name;
+    const targetPlayer = parsed.alias ? parsed.name : null;
+
+    const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
+    let resolvedPlayer = targetPlayer;
+    if (!resolvedPlayer) {
+      const match = namesStore.findIdByNameOrAlias(targetAlias);
+      if (match) resolvedPlayer = match.entry?.name;
+    }
+
+    const canManage = await canUserManagePlayerAlias(sock, chatId, senderJid, sender, resolvedPlayer || targetAlias);
+    if (!canManage) {
+      return '⚠️ Only group admins can delete aliases for other players. You can delete aliases for yourself (e.g. "!deletealias <your alias>").';
+    }
+
+    const res = namesStore.removeAliasForPlayer(targetPlayer, targetAlias);
+    if (res) {
+      return `✅ Removed alias "${res.removed}" from player "${res.name}". Current aliases: [${res.aliases.join(', ')}].`;
+    } else {
+      return `Alias "${targetAlias}" was not found.`;
+    }
   }
 
   // --- Scores / leaderboard ---
@@ -2044,6 +2170,9 @@ function helpText() {
     `  (or tell me in words: "${TRIGGER_PREFIX} Mike & Sara beat John & Alex 6-4", or "${TRIGGER_PREFIX} we won" after a draw – no score means 6-3)`,
     '!leaderboard – show the win/loss leaderboard',
     '!ratings – show player ratings used to balance the courts',
+    '!alias <alias> (or !alias <name> = <alias>) – add an alias for yourself or another player, e.g. "!alias PK" or "!alias John = JD"',
+    '!deletealias <name> = <alias> (or !deletealias <alias>) – remove an alias for a player',
+    '!aliases – list all registered players and their aliases',
     '!refreshratings – (Admin only) refresh player ratings from TennisRecord.com now',
     `!setrating <rating> (or ${TRIGGER_PREFIX} my rating is <rating>) – set or update your rating (${ratings.MIN_RATING}–${ratings.MAX_RATING})`,
     '!weather [location] – forecast for outdoor play (defaults to ' + DEFAULT_LOCATION + ')',
@@ -2056,6 +2185,88 @@ function helpText() {
     '!reset – (Admin only) clear the bot\'s conversation memory',
     TRIGGER_PREFIX ? `${TRIGGER_PREFIX} <question> – ask the bot anything (including setting rating, questions)` : '(bot also responds to any message)'
   ].join('\n');
+}
+
+/**
+ * Checks if a user has permission to set/add an alias for a given target player.
+ * A user can always add an alias for themselves.
+ * Adding an alias for other players requires group admin permissions.
+ */
+async function canUserManagePlayerAlias(sock, chatId, senderJid, senderName, targetPlayer) {
+  if (!targetPlayer) return false;
+  const tKey = ratings.keyFor(targetPlayer);
+  if (['me', 'myself', 'my', 'i'].includes(tKey)) return true;
+
+  if (senderName && ratings.keyFor(senderName) === tKey) return true;
+
+  if (senderJid) {
+    const senderCanonical = nameFor(senderJid);
+    if (senderCanonical && ratings.keyFor(senderCanonical) === tKey) return true;
+
+    const match = namesStore.findIdByNameOrAlias(targetPlayer);
+    if (match) {
+      const normSender = jidNormalizedUser(senderJid);
+      const pn = lidToPn.get(normSender) || (normSender?.endsWith('@s.whatsapp.net') ? normSender : null);
+      const lid = pnToLid.get(normSender) || (normSender?.endsWith('@lid') ? normSender : null);
+
+      if (match.id === normSender || match.id === pn || match.id === lid) return true;
+      if (match.entry?.name && ratings.keyFor(match.entry.name) === ratings.keyFor(senderName)) return true;
+    }
+  }
+
+  return await isUserAdmin(sock, chatId, senderJid);
+}
+
+function parseAliasCommand(text, defaultSenderName = null) {
+  const raw = text.replace(/^!(?:alias|addalias)\s*/i, '').trim();
+  if (!raw) return null;
+
+  if (/\bfor\b/i.test(raw)) {
+    const forMatch = raw.match(/^(.+?)\s+\bfor\b\s+(.+)$/i);
+    if (forMatch) {
+      return { name: forMatch[2].trim(), alias: forMatch[1].trim() };
+    }
+  }
+
+  const delimMatch = raw.match(/^(.+?)\s*(?:=|:|->|\bas\b|\bto\b)\s*(.+)$/i);
+  if (delimMatch) {
+    return { name: delimMatch[1].trim(), alias: delimMatch[2].trim() };
+  }
+
+  const singleQuoteMatch = raw.match(/^"([^"]+)"$/);
+  if (singleQuoteMatch) {
+    return { name: defaultSenderName || 'me', alias: singleQuoteMatch[1].trim() };
+  }
+
+  const quoteMatch = raw.match(/^"([^"]+)"\s+(.+)$/) || raw.match(/^(.+?)\s+"([^"]+)"$/);
+  if (quoteMatch) {
+    return { name: quoteMatch[1].trim(), alias: quoteMatch[2].trim() };
+  }
+
+  const spaceParts = raw.split(/\s+/);
+  if (spaceParts.length >= 2) {
+    const alias = spaceParts.pop();
+    const name = spaceParts.join(' ');
+    return { name, alias };
+  }
+
+  if (spaceParts.length === 1 && spaceParts[0]) {
+    return { name: defaultSenderName || 'me', alias: spaceParts[0] };
+  }
+
+  return null;
+}
+
+function formatAliases() {
+  const entries = namesStore.getAllEntries();
+  if (entries.length === 0) {
+    return 'No player aliases recorded yet. Use "!alias <name> = <alias>" to add one.';
+  }
+  const lines = entries.map((e) => {
+    const aliasStr = e.aliases && e.aliases.length > 0 ? ` (aliases: ${e.aliases.join(', ')})` : ' (no aliases)';
+    return `• ${e.name}${aliasStr}`;
+  });
+  return `📋 Player Names & Aliases:\n${lines.join('\n')}`;
 }
 
 function formatAvailability() {
@@ -2138,13 +2349,20 @@ function handleScoreCommand(text) {
   }
 
   const [, winner, loser, score] = match;
-  const winners = parseSide(winner);
-  const losers = parseSide(loser);
+  let winners = parseSide(winner);
+  let losers = parseSide(loser);
   const sets = score.trim().split(/[\s,]+/).map((s) => s.split('-').map(Number));
 
   if (winners.length !== losers.length) {
     return `Both sides need the same number of players -- got ${winners.length} vs ${losers.length}.`;
   }
+
+  const resolveCanonical = (n) => {
+    const match = namesStore.findIdByNameOrAlias(n);
+    return (match && match.entry?.name) ? match.entry.name : n;
+  };
+  winners = winners.map(resolveCanonical);
+  losers = losers.map(resolveCanonical);
 
   return applyScoreReport({ winners, losers, sets });
 }
@@ -2156,19 +2374,22 @@ function handleScoreCommand(text) {
  */
 function knownPlayers(chatId) {
   const byKey = new Map();
-  const add = (name) => {
+  const add = (name, canonicalName = null) => {
     const key = ratings.keyFor(name);
-    if (key && !byKey.has(key)) byKey.set(key, String(name).trim());
+    const resolved = canonicalName ? String(canonicalName).trim() : String(name).trim();
+    if (key && !byKey.has(key)) byKey.set(key, resolved);
   };
 
-  for (const p of ratings.getAllRatings()) add(p.name);
-  for (const p of storage.getLeaderboard()) add(p.name);
-  for (const a of storage.getAvailability()) add(a.player);
-  for (const name of knownNames.values()) add(name);
   for (const entry of namesStore.getAllEntries()) {
-    if (entry.name) add(entry.name);
-    for (const alias of entry.aliases || []) add(alias);
+    if (entry.name) add(entry.name, entry.name);
+    for (const alias of entry.aliases || []) {
+      add(alias, entry.name);
+    }
   }
+  for (const p of ratings.getAllRatings()) add(p.name, p.name);
+  for (const p of storage.getLeaderboard()) add(p.name, p.name);
+  for (const a of storage.getAvailability()) add(a.player, a.player);
+  for (const name of knownNames.values()) add(name, name);
 
   for (const [, pollState] of activePolls.entries()) {
     if (pollState.remoteJid === chatId) {
