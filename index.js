@@ -2832,7 +2832,7 @@ async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWor
       if (Math.abs(newPlayTime - existingPlayTime) < CONFLICT_WINDOW_MS) {
         if (isUserInPoll(existingPoll, creatorJid, creatorName)) {
           shouldIncludeCreator = false;
-          const existingWhen = existingPoll.when || new Date(existingPoll.playAt).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+          const existingWhen = existingPoll.when || new Date(existingPoll.playAt).toLocaleTimeString('en-US', { timeZone: 'America/Los_Angeles', hour: 'numeric', minute: '2-digit' });
           excludedReason = `a poll already exists for ${creatorName || 'you'} within 90 minutes of this start time (${existingWhen})`;
           console.log(`[poll] Not auto-adding ${creatorName || 'creator'} as Player 1 in new poll: already in poll ${existingPollId} within 90 minutes`);
           break;
@@ -3435,7 +3435,23 @@ function pollStatusText(chatId = null, opts = {}) {
         }
       }
     }
-    const playAtLocal = pollState.playAt ? `${new Date(pollState.playAt).toLocaleString()}${timeRemainingNote}` : 'unknown';
+    let playAtLocal = 'unknown';
+    if (pollState.playAt) {
+      const playDate = new Date(pollState.playAt);
+      if (!Number.isNaN(playDate.getTime())) {
+        const sjFormatted = new Intl.DateTimeFormat('en-US', {
+          timeZone: 'America/Los_Angeles',
+          year: 'numeric',
+          month: 'numeric',
+          day: 'numeric',
+          hour: 'numeric',
+          minute: '2-digit',
+          second: '2-digit',
+          timeZoneName: 'short'
+        }).format(playDate);
+        playAtLocal = `${sjFormatted}${timeRemainingNote}`;
+      }
+    }
 
     const groupName = isAll
       ? (groupMetadataCache.get(pollState.remoteJid)?.subject || pollState.remoteJid)
