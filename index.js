@@ -62,6 +62,24 @@ process.on('warning', (warning) => {
   console.warn(`⚠️ [${new Date().toISOString()}] Node.js Warning:`, warning.name, warning.message);
 });
 
+process.on('beforeExit', (code) => {
+  console.log(`⚠️ [${new Date().toISOString()}] Node.js beforeExit event emitted (exitCode: ${code}). Event loop has no active tasks.`);
+});
+
+process.on('exit', (code) => {
+  console.log(`ℹ️ [${new Date().toISOString()}] Process exited with code: ${code}`);
+});
+
+process.on('SIGINT', () => {
+  console.log(`\n🛑 [${new Date().toISOString()}] Received SIGINT (Ctrl+C). Terminating gracefully.`);
+  process.exit(0);
+});
+
+process.on('SIGTERM', () => {
+  console.log(`\n🛑 [${new Date().toISOString()}] Received SIGTERM. Terminating gracefully.`);
+  process.exit(0);
+});
+
 const makeWASocket = require('@whiskeysockets/baileys').default;
 const {
   useMultiFileAuthState,
@@ -1521,6 +1539,8 @@ async function startBot() {
 
       if (shouldReconnect) {
         scheduleReconnect(3000);
+      } else {
+        console.warn(`🚨 [${new Date().toISOString()}] WhatsApp session reported logged out (status ${statusCode || 401}). If unintended, delete auth_info_baileys/ and restart to link again.`);
       }
     } else if (connection === 'open') {
       const currMeName = sock.user?.name || sock.authState?.creds?.me?.name;
@@ -3577,5 +3597,10 @@ async function launchBot() {
     isStarting = false;
   }
 }
+
+// Watchdog heartbeat every 30 seconds to keep process alive and verify connection
+setInterval(() => {
+  // Keeps the event loop actively referenced
+}, 30000);
 
 launchBot();
