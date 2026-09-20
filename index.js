@@ -138,8 +138,8 @@ const POLL_EXPIRY_GRACE_DAYS = 14;
 const POLL_CLEANUP_INTERVAL_MINUTES = 15;
 
 // Powers of 2 hours away from match playtime for sending reminders
-// Reminder intervals away from match playtime: 10m (0.1667h), 1h, 2h, 4h, 8h, 16h, 32h, 64h
-const POLL_REMINDER_HOURS = [0.1667, 1, 2, 4, 8, 16, 32, 64];
+// Reminder intervals away from match playtime: 10m (0.1667h), 1h, 2h, 4h, 8h, 16h, 24h, 32h, 64h
+const POLL_REMINDER_HOURS = [0.1667, 1, 2, 4, 8, 16, 24, 32, 64];
 const POWERS_OF_2_REMINDER_HOURS = POLL_REMINDER_HOURS;
 const POLL_REMINDER_CHECK_INTERVAL_MS = 60 * 1000;
 
@@ -1269,6 +1269,11 @@ function buildPollReminderText(H, pollState, openSpots, totalSpots, playerList, 
   const playerWord = openSpots === 1 ? 'player' : 'players';
 
   if (isOptIn) {
+    if (H >= 24) {
+      return `⏰ *${H} Hours (1 Day) to Playtime!* We have *${yesCount} player(s) in* so far for *${whenStr}*.\n` +
+        `Players in: ${playerList}\n` +
+        `Don't miss out — cast your vote above to join the match!`;
+    }
     if (H >= 16) {
       return `⏰ *${H} Hours to Playtime!* We have *${yesCount} player(s) in* so far for *${whenStr}*.\n` +
         `Players in: ${playerList}\n` +
@@ -1303,6 +1308,11 @@ function buildPollReminderText(H, pollState, openSpots, totalSpots, playerList, 
     return `🎾 *Match Alert:* The match poll for *${whenStr}* still has *${openSpots} open ${spotWord}* (${openSpots}/${totalSpots} needed).\n` +
       `Current players: ${playerList}\n` +
       `Vote in the poll above to lock in your spot!`;
+  }
+  if (H >= 24) {
+    return `⏰ *24 Hours (1 Day) to Playtime!* We have *${openSpots} ${spotWord} remaining* for *${whenStr}* (${openSpots}/${totalSpots} needed).\n` +
+      `Roster so far: ${playerList}\n` +
+      `Don't miss out — cast your vote above to join the court!`;
   }
   if (H >= 16) {
     return `⏰ *${H} Hours to Playtime!* We have *${openSpots} ${spotWord} remaining* for *${whenStr}* (${openSpots}/${totalSpots} needed).\n` +
