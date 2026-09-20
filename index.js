@@ -2290,6 +2290,10 @@ async function getResponse(sock, text, chatId, sender, msg) {
       : 'Nothing to clean up yet -- no polls have passed their play time + grace period.';
   }
 
+  if (lower === '!upcomingpolls' || lower === '!upcomingpollstatus' || lower === '!upcoming' || lower === '!activepolls' || lower === '!pollstatus upcoming' || lower === '!pollstatus -u') {
+    return pollStatusText(null, { upcomingOnly: true });
+  }
+
   if (lower === '!allpolls' || lower === '!allpollstatus' || lower === '!pollstatus all' || lower === '!pollstatusall' || lower === '!pollstatus -a') {
     const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
     const isAdmin = await isUserAdmin(sock, chatId, senderJid);
@@ -2371,6 +2375,7 @@ function helpText() {
     '!cancelpoll (or !deletepoll) – stop and delete the active poll (creator or admin only)',
     '!pollstatus – debug: show raw vote count and voters for active match poll(s) in this chat',
     '!allpolls (or !pollstatus all) – (Admin only) debug: show detailed status of all tracked polls',
+    '!upcomingpolls (or !upcoming, !pollstatus upcoming) – list all match polls whose play time has not passed yet',
     '!cleanuppolls – (Admin only) debug: force a sweep that deletes expired/completed polls now',
     '!reset – (Admin only) clear the bot\'s conversation memory',
     TRIGGER_PREFIX ? `${TRIGGER_PREFIX} <question> – ask the bot anything (including setting rating, questions)` : '(bot also responds to any message)'
@@ -3383,13 +3388,30 @@ function nameFor(jid) {
  * active poll(s), straight from the raw vote buffer (not the aggregated tally),
  * so you can tell whether votes are being received at all.
  */
-function pollStatusText(chatId = null) {
+function pollStatusText(chatId = null, opts = {}) {
   const isAll = !chatId;
-  const chatPolls = isAll
-    ? [...activePolls.entries()]
-    : [...activePolls.entries()].filter(([, state]) => state.remoteJid === chatId);
+  const upcomingOnly = opts.upcomingOnly === true;
+  const now = Date.now();
+
+  let chatPolls = [...activePolls.entries()];
+
+  if (!isAll) {
+    chatPolls = chatPolls.filter(([, state]) => state.remoteJid === chatId);
+  }
+
+  if (upcomingOnly) {
+    chatPolls = chatPolls.filter(([, state]) => {
+      if (state.status === 'cancelled') return false;
+      if (!state.playAt) return true;
+      const playAtMs = new Date(state.playAt).getTime();
+      return Number.isNaN(playAtMs) || playAtMs > now;
+    });
+  }
 
   if (chatPolls.length === 0) {
+    if (upcomingOnly) {
+      return '📅 No upcoming match polls on record whose play time has not passed yet.';
+    }
     return isAll
       ? 'No polls on record in bot storage.'
       : 'No poll on record for this chat -- create one with "' + TRIGGER_PREFIX + ' create a poll".';
@@ -3398,7 +3420,22 @@ function pollStatusText(chatId = null) {
   const mePn = jidNormalizedUser(botSock?.user?.id || botSock?.authState?.creds?.me?.id || '');
 
   const sections = chatPolls.map(([pollId, pollState]) => {
-    const playAtLocal = pollState.playAt ? new Date(pollState.playAt).toLocaleString() : 'unknown';
+    let timeRemainingNote = '';
+    if (pollState.playAt) {
+      const playAtMs = new Date(pollState.playAt).getTime();
+      if (!Number.isNaN(playAtMs)) {
+        const diffMs = playAtMs - now;
+        if (diffMs > 0) {
+          const totalMins = Math.round(diffMs / (60 * 1000));
+          const hrs = Math.floor(totalMins / 60);
+          const mins = totalMins % 60;
+          timeRemainingNote = ` (in ${hrs > 0 ? `${hrs}h ` : ''}${mins}m)`;
+        } else {
+          timeRemainingNote = ' (play time passed)';
+        }
+      }
+    }
+    const playAtLocal = pollState.playAt ? `${new Date(pollState.playAt).toLocaleString()}${timeRemainingNote}` : 'unknown';
 
     const groupName = isAll
       ? (groupMetadataCache.get(pollState.remoteJid)?.subject || pollState.remoteJid)
