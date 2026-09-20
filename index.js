@@ -1157,7 +1157,7 @@ function handlePollDeleted(remoteJid, pollId) {
   if (chatId && latestPollIdByChat.get(chatId) === pollId) {
     latestPollIdByChat.delete(chatId);
     for (const [id, state] of [...activePolls.entries()].reverse()) {
-      if (state.remoteJid === chatId && state.status === 'active') {
+      if (state.remoteJid === chatId && (state.status === 'active' || state.status === 'filled')) {
         latestPollIdByChat.set(chatId, id);
         break;
       }
@@ -1168,7 +1168,7 @@ function handlePollDeleted(remoteJid, pollId) {
       if (id === pollId) {
         latestPollIdByChat.delete(cId);
         for (const [otherId, state] of [...activePolls.entries()].reverse()) {
-          if (state.remoteJid === cId && state.status === 'active') {
+          if (state.remoteJid === cId && (state.status === 'active' || state.status === 'filled')) {
             latestPollIdByChat.set(cId, otherId);
             break;
           }
@@ -2965,6 +2965,8 @@ async function processPollVoteEvent(sock, pollMessageKey, rawPollUpdates) {
   if (pollState.isManual) {
     let yesCount = 0;
     let noCount = 0;
+    let filledCount = 0;
+    let totalOptionsCount = pollState.options ? pollState.options.length : 0;
     try {
       const aggregated = getAggregateVotesInPollMessage(
         { message: pollCreationMessage, pollUpdates: merged },
@@ -2974,8 +2976,23 @@ async function processPollVoteEvent(sock, pollMessageKey, rawPollUpdates) {
       const noOpt = aggregated.find((o) => /^no$/i.test(o.name.trim()));
       yesCount = yesOpt ? yesOpt.voters.length : 0;
       noCount = noOpt ? noOpt.voters.length : 0;
+
+      const votingOptions = aggregated.filter((o) => !/^(no|out|can't play|cannot play)$/i.test(o.name.trim()));
+      filledCount = votingOptions.filter((o) => o.voters.length > 0).length;
+      if (totalOptionsCount === 0) totalOptionsCount = votingOptions.length;
     } catch (e) {}
-    console.log(`[poll] Manually-created poll ${pollId} vote updated (${pollState.voteBuffer.size} vote(s) buffered, Yes: ${yesCount}, No: ${noCount}). Passively tracking -- waiting for explicit matchup request.`);
+
+    // When all voting slots are filled and not already resolved, transition status to 'filled'
+    if (pollState.status !== 'resolved' && pollState.status !== 'cancelled') {
+      const isFilled = (pollState.type !== 'opt_in' && totalOptionsCount > 0 && filledCount >= totalOptionsCount);
+      const newStatus = isFilled ? 'filled' : 'active';
+      if (pollState.status !== newStatus) {
+        pollState.status = newStatus;
+        persistPolls();
+      }
+    }
+
+    console.log(`[poll] Manually-created poll ${pollId} vote updated (${pollState.voteBuffer.size} vote(s) buffered, status: ${pollState.status}, filled: ${filledCount}/${totalOptionsCount}, Yes: ${yesCount}, No: ${noCount}). Passively tracking -- waiting for explicit matchup request.`);
     return;
   }
 
@@ -3121,7 +3138,7 @@ async function generateMatchupsFromPoll(sock, chatId, specificPollId = null, spe
   // 3. Look for active opt-in or manual match poll first
   if (!targetPollState) {
     for (const [pollId, pollState] of [...activePolls.entries()].reverse()) {
-      if (pollState.remoteJid === chatId && pollState.status === 'active' && (pollState.type === 'opt_in' || pollState.size === null || pollState.isManual)) {
+      if (pollState.remoteJid === chatId && (pollState.status === 'active' || pollState.status === 'filled') && (pollState.type === 'opt_in' || pollState.size === null || pollState.isManual)) {
         targetPollId = pollId;
         targetPollState = pollState;
         break;
@@ -3132,7 +3149,7 @@ async function generateMatchupsFromPoll(sock, chatId, specificPollId = null, spe
   // 4. Look for any active match poll with votes
   if (!targetPollState) {
     for (const [pollId, pollState] of [...activePolls.entries()].reverse()) {
-      if (pollState.remoteJid === chatId && pollState.status === 'active' && pollState.voteBuffer.size > 0) {
+      if (pollState.remoteJid === chatId && (pollState.status === 'active' || pollState.status === 'filled') && pollState.voteBuffer.size > 0) {
         targetPollId = pollId;
         targetPollState = pollState;
         break;
@@ -3388,7 +3405,7 @@ function buildContextBlurb(chatId) {
         if (pollState.status === 'cancelled') {
           return `[Poll ${id}] a user-created manual match poll "${pollState.name || 'Match Poll'}" was cancelled`;
         } else {
-          const statusNote = pollState.status === 'resolved' ? 'status: resolved/drawn (can generate matchups again / rematch)' : 'status: active';
+          const statusNote = pollState.status === 'resolved' ? 'status: resolved/drawn (can generate matchups again / rematch)' : (pollState.status === 'filled' ? 'status: filled (all voting slots filled, waiting for matchup request)' : 'status: active');
           return `[Poll ${id}] a user-created manual match poll "${pollState.name || 'Match Poll'}" (created by ${creatorName}) is tracked with ${interestedPlayers.length} vote(s): [${optionDetails.join('; ') || 'no votes yet'}]. Players currently in/playing (${playingPlayers.length}): ${playingPlayers.join(', ')}${additionSuffix}. (${statusNote} -- when asked to generate matchups or draw, call generate_matchups)`;
         }
       }
