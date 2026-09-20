@@ -485,7 +485,7 @@ Please analyze this poll:
    (Note: Social polls, food orders, equipment banter, or non-tennis topics should be isMatchScheduling: false).
 2. What day is it scheduled for? (e.g. "today", "tomorrow", "saturday", "sunday", or null if not mentioned).
 3. What time is it scheduled for? (e.g. "9am", "6:30pm", "10am", or null if not mentioned).
-4. Provide a clean human-readable when string (e.g. "Tomorrow 9am", "Saturday 6pm", "Today 8:30am", or null).
+4. Provide a clean human-readable when string (e.g. "Sunday 7:30am", "Saturday 6pm", "Today 8:30am"). If a day of the week (e.g. Sunday) was mentioned or implied, ALWAYS use the named day (e.g. "Sunday 7:30am"), do NOT replace named days with "Tomorrow". Only use "Tomorrow" if the user explicitly wrote "tomorrow".
 5. Poll type: "opt_in" for Yes/No polls, or "manual" for fixed/numbered slots.
 6. Poll size: number of player spots (or null if opt-in).
 
@@ -524,11 +524,18 @@ Respond ONLY with a JSON object in this exact format, with no other text or mark
     const cleanedJson = rawContent.replace(/^\`\`\`json\s*/i, '').replace(/\s*\`\`\`$/i, '').trim();
     const parsed = JSON.parse(cleanedJson);
 
+    let resolvedWhenStr = parsed.when || pollName;
+    // If an explicit day name was parsed (e.g. Sunday, Saturday), ensure when retains the day name instead of relative "Tomorrow"
+    if (parsed.dayWord && !/^(?:today|tomorrow|tonight)$/i.test(parsed.dayWord) && /^(?:tomorrow|today)/i.test(resolvedWhenStr)) {
+      const capDay = parsed.dayWord.charAt(0).toUpperCase() + parsed.dayWord.slice(1).toLowerCase();
+      resolvedWhenStr = parsed.timeWord ? `${capDay} ${parsed.timeWord}` : capDay;
+    }
+
     return {
       isMatchScheduling: Boolean(parsed.isMatchScheduling),
       dayWord: parsed.dayWord || null,
       timeWord: parsed.timeWord || null,
-      when: parsed.when || pollName,
+      when: resolvedWhenStr,
       type: parsed.type === 'opt_in' ? 'opt_in' : 'manual',
       size: typeof parsed.size === 'number' ? parsed.size : (parsed.type === 'opt_in' ? null : (options.length > 0 ? options.length : null))
     };
@@ -3141,7 +3148,8 @@ async function processPollVoteEvent(sock, pollMessageKey, rawPollUpdates) {
 
     await ratings.ensureRated(players);
     const schedule = generateMatchups(players);
-    const header = pollState.when ? `📅 ${pollState.when}\n\n` : '';
+    const whenHeader = formatMatchHeaderTime(pollState);
+    const header = whenHeader ? `📅 ${whenHeader}\n\n` : '';
     await sock.sendMessage(pollState.remoteJid, { text: header + formatMatchups(schedule) });
     pairHistory.recordDraw(pollId, schedule);
 
@@ -3159,6 +3167,55 @@ async function processPollVoteEvent(sock, pollMessageKey, rawPollUpdates) {
  *   includes the creator of the poll as one of the players.
  * - For fixed-size polls / rematches: regenerates matchups from the recorded player list.
  */
+/**
+ * Formats a clean, dynamic, timezone-accurate match header time string for matchup announcements
+ * preventing stale relative words like "Tomorrow" when drawn on match day.
+ */
+function formatMatchHeaderTime(pollState) {
+  if (!pollState) return '';
+  if (!pollState.playAt) return pollState.when || '';
+
+  const playAt = new Date(pollState.playAt);
+  if (Number.isNaN(playAt.getTime())) return pollState.when || '';
+
+  const playParts = getSanJoseParts(playAt);
+  const nowParts = getSanJoseParts(getSanJoseNow());
+
+  const timeFormatted = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/Los_Angeles',
+    hour: 'numeric',
+    minute: '2-digit',
+    hour12: true
+  }).format(playAt).replace(/\s+/g, '').toLowerCase();
+
+  const weekdayName = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/Los_Angeles',
+    weekday: 'long'
+  }).format(playAt);
+
+  // If match day is today in San Jose:
+  if (playParts.year === nowParts.year && playParts.month === nowParts.month && playParts.day === nowParts.day) {
+    if (pollState.when && !/^(?:tomorrow|tonight)\b/i.test(pollState.when.trim())) {
+      return pollState.when;
+    }
+    return `${weekdayName} ${timeFormatted}`;
+  }
+
+  // If match day is tomorrow in San Jose:
+  const tomorrowTemp = new Date(Date.UTC(nowParts.year, nowParts.month, nowParts.day + 1));
+  if (playParts.year === tomorrowTemp.getUTCFullYear() && playParts.month === tomorrowTemp.getUTCMonth() && playParts.day === tomorrowTemp.getUTCDate()) {
+    if (pollState.when && !/^(?:today|tonight)\b/i.test(pollState.when.trim())) {
+      return pollState.when;
+    }
+    return `Tomorrow ${timeFormatted} (${weekdayName})`;
+  }
+
+  if (pollState.when && !/^(?:today|tomorrow|tonight)\b/i.test(pollState.when.trim())) {
+    return pollState.when;
+  }
+  return `${weekdayName} ${timeFormatted}`;
+}
+
 async function generateMatchupsFromPoll(sock, chatId, specificPollId = null, specificPollName = null) {
   let targetPollId = null;
   let targetPollState = null;
@@ -3271,7 +3328,8 @@ async function generateMatchupsFromPoll(sock, chatId, specificPollId = null, spe
 
   await ratings.ensureRated(players);
   const schedule = generateMatchups(players);
-  const header = targetPollState.when ? `📅 ${targetPollState.when}\n\n` : '';
+  const whenHeader = formatMatchHeaderTime(targetPollState);
+  const header = whenHeader ? `📅 ${whenHeader}\n\n` : '';
   await sock.sendMessage(targetPollState.remoteJid, { text: header + formatMatchups(schedule) });
   pairHistory.recordDraw(targetPollId, schedule);
   targetPollState.lastSchedule = summarizeSchedule(schedule);
