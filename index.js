@@ -2273,6 +2273,15 @@ async function getResponse(sock, text, chatId, sender, msg) {
       : 'Nothing to clean up yet -- no polls have passed their play time + grace period.';
   }
 
+  if (lower === '!allpolls' || lower === '!allpollstatus' || lower === '!pollstatus all' || lower === '!pollstatusall' || lower === '!pollstatus -a') {
+    const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
+    const isAdmin = await isUserAdmin(sock, chatId, senderJid);
+    if (!isAdmin) {
+      return '⚠️ Only group admins can view status of all polls.';
+    }
+    return pollStatusText(null);
+  }
+
   if (lower === '!pollstatus') {
     return pollStatusText(chatId);
   }
@@ -2343,7 +2352,8 @@ function helpText() {
     '!poll [for <N>] [when] (or !createpoll) – direct command to create a match poll',
     '!matchups (or !draw, !rematch) – generate matchups from active tennis match poll',
     '!cancelpoll (or !deletepoll) – stop and delete the active poll (creator or admin only)',
-    '!pollstatus – debug: show raw vote count and voters for active match poll(s)',
+    '!pollstatus – debug: show raw vote count and voters for active match poll(s) in this chat',
+    '!allpolls (or !pollstatus all) – (Admin only) debug: show detailed status of all tracked polls',
     '!cleanuppolls – (Admin only) debug: force a sweep that deletes expired/completed polls now',
     '!reset – (Admin only) clear the bot\'s conversation memory',
     TRIGGER_PREFIX ? `${TRIGGER_PREFIX} <question> – ask the bot anything (including setting rating, questions)` : '(bot also responds to any message)'
@@ -3305,16 +3315,30 @@ function nameFor(jid) {
  * active poll(s), straight from the raw vote buffer (not the aggregated tally),
  * so you can tell whether votes are being received at all.
  */
-function pollStatusText(chatId) {
-  const chatPolls = [...activePolls.entries()].filter(([, state]) => state.remoteJid === chatId);
+function pollStatusText(chatId = null) {
+  const isAll = !chatId;
+  const chatPolls = isAll
+    ? [...activePolls.entries()]
+    : [...activePolls.entries()].filter(([, state]) => state.remoteJid === chatId);
+
   if (chatPolls.length === 0) {
-    return 'No poll on record for this chat -- create one with "' + TRIGGER_PREFIX + ' create a poll".';
+    return isAll
+      ? 'No polls on record in bot storage.'
+      : 'No poll on record for this chat -- create one with "' + TRIGGER_PREFIX + ' create a poll".';
   }
 
   const mePn = jidNormalizedUser(botSock?.user?.id || botSock?.authState?.creds?.me?.id || '');
 
   const sections = chatPolls.map(([pollId, pollState]) => {
     const playAtLocal = pollState.playAt ? new Date(pollState.playAt).toLocaleString() : 'unknown';
+
+    const groupName = isAll
+      ? (groupMetadataCache.get(pollState.remoteJid)?.subject || pollState.remoteJid)
+      : null;
+    const groupHeader = isAll ? `Chat/Group: ${groupName}\n` : '';
+    const remindersStr = Array.isArray(pollState.sentReminders) && pollState.sentReminders.length > 0
+      ? pollState.sentReminders.map((h) => h < 1 ? `${Math.round(h * 60)}m` : `${h}h`).join(', ')
+      : '(none yet)';
 
     if (pollState.isManual) {
       const { aggregated, interestedPlayers } = getPollVoters(pollId, pollState, mePn);
@@ -3328,10 +3352,11 @@ function pollStatusText(chatId) {
       const additionStr = additionNotes.length > 0 ? ` (includes ${additionNotes.join(' and ')})` : '';
 
       const lines = [
-        `Poll ${pollId}: User-Created Manual Match Poll "${pollState.name || 'Match Poll'}".`,
+        `${groupHeader}Poll ${pollId}: User-Created Manual Match Poll "${pollState.name || 'Match Poll'}".`,
         `Creator: ${creatorName}`,
         `Status: ${pollState.status} (Passively tracked)`,
-        `Play time: ${playAtLocal} (kept for 2 weeks after scheduled play time)`,
+        `Play time: ${playAtLocal} (when: "${pollState.when || 'unspecified'}")`,
+        `Sent reminders: [${remindersStr}]`,
         `Total votes buffered: ${pollState.voteBuffer.size}`,
         `Options & Votes:\n  ${optionSummaries.length ? optionSummaries.join('\n  ') : '(none)'}`,
         `Voted so far (${interestedPlayers.length}): ${interestedPlayers.length ? interestedPlayers.join(', ') : '(none yet)'}`,
@@ -3360,9 +3385,10 @@ function pollStatusText(chatId) {
       } catch (e) {}
 
       const lines = [
-        `Poll ${pollId}${pollState.when ? ` (${pollState.when})` : ''}: Opt-in (Yes/No).`,
+        `${groupHeader}Poll ${pollId}${pollState.when ? ` (${pollState.when})` : ''}: Opt-in (Yes/No).`,
         `Status: ${pollState.status}`,
         `Play time: ${playAtLocal} (kept for 2 weeks after scheduled play time)`,
+        `Sent reminders: [${remindersStr}]`,
         `Yes votes (${yesVoters.length}): ${yesVoters.length ? yesVoters.join(', ') : '(none yet)'}`,
         `No votes (${noVoters.length}): ${noVoters.length ? noVoters.join(', ') : '(none yet)'}`,
         'Matchups: Waiting for user prompt (!matchups or "@tenbot generate matchups")'
@@ -3373,10 +3399,11 @@ function pollStatusText(chatId) {
     const voters = [...pollState.voteBuffer.keys()].map(nameFor);
     const neededVotes = pollState.creator ? pollState.size - 1 : pollState.size;
     const lines = [
-      `Poll ${pollId}${pollState.when ? ` (${pollState.when})` : ''}: ${pollState.size} spots (${pollState.size === 2 ? 'Singles' : 'Doubles'}).`,
+      `${groupHeader}Poll ${pollId}${pollState.when ? ` (${pollState.when})` : ''}: ${pollState.size} spots (${pollState.size === 2 ? 'Singles' : 'Doubles'}).`,
       pollState.creator ? `Creator (Player 1): ${pollState.creator.name || 'Player 1'}` : 'Creator: None (all spots open)',
       `Status: ${pollState.status}`,
       `Play time: ${playAtLocal} (kept for 2 weeks after scheduled play time)`,
+      `Sent reminders: [${remindersStr}]`,
       `Raw votes recorded: ${pollState.voteBuffer.size}/${neededVotes} needed`,
       `Voters seen so far: ${voters.length ? voters.join(', ') : '(none yet)'}`
     ];
