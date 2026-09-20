@@ -111,7 +111,7 @@ const tennisRecord = require('./lib/tennisRecord');
 const pollStore = require('./lib/pollStore');
 const namesStore = require('./lib/names');
 const messageHistory = require('./lib/messageHistory');
-const { resolvePlayDateTime, getSanJoseNow } = require('./lib/pollTime');
+const { resolvePlayDateTime, getSanJoseNow, getSanJoseParts } = require('./lib/pollTime');
 
 // ---- CONFIG ----
 // Set this to the exact group name (subject) you want the bot to listen to.
@@ -1335,8 +1335,8 @@ function buildPollReminderText(H, pollState, openSpots, totalSpots, playerList, 
 async function checkAndSendPollReminders(sock) {
   if (!sock) return;
   try {
-    const sjNow = getSanJoseNow();
-    const currentHour = sjNow.getHours();
+    const sjParts = getSanJoseParts();
+    const currentHour = sjParts.hour;
 
     // Always silence reminders between 10pm and 8am (Pacific Time)
     if (currentHour >= 22 || currentHour < 8) return;
@@ -1372,44 +1372,65 @@ async function checkAndSendPollReminders(sock) {
       let openSpots = 0;
       let yesCount = 0;
 
-      const { interestedPlayers } = getPollVoters(pollId, pollState, mePn);
-      let players = [...interestedPlayers];
-      if (pollState.creator?.name && !players.includes(pollState.creator.name)) {
-        players.unshift(pollState.creator.name);
-      }
-      const playerList = players.length > 0 ? players.join(', ') : 'None yet';
+      const { interestedPlayers, aggregated } = getPollVoters(pollId, pollState, mePn);
+      let players = [];
 
-      if (isOptIn) {
-        yesCount = interestedPlayers.length;
-      } else {
-        if (pollState.size) {
-          totalSpots = pollState.size;
-          neededVotes = pollState.creator ? pollState.size - 1 : pollState.size;
-          const filledVotes = pollState.voteBuffer ? pollState.voteBuffer.size : 0;
-          openSpots = Math.max(0, neededVotes - filledVotes);
-        } else if (pollState.options && pollState.options.length > 0) {
-          totalSpots = pollState.options.length;
-          neededVotes = pollState.options.length;
-          const filledVotes = pollState.voteBuffer ? pollState.voteBuffer.size : 0;
-          openSpots = Math.max(0, neededVotes - filledVotes);
+      if (pollState.isManual) {
+        const options = pollState.options || [];
+        const firstSlotNum = getFirstSlotNumber(options);
+        const leadingCreatorSpots = (firstSlotNum && firstSlotNum > 1) ? (firstSlotNum - 1) : 0;
+        neededVotes = options.length > 0 ? options.length : (pollState.size || 4);
+        totalSpots = leadingCreatorSpots + neededVotes;
+
+        const filledVotes = aggregated && aggregated.length > 0
+          ? aggregated.filter((o) => o.voters.length > 0).length
+          : (interestedPlayers ? interestedPlayers.length : (pollState.voteBuffer ? pollState.voteBuffer.size : 0));
+        openSpots = Math.max(0, neededVotes - filledVotes);
+
+        if (isOptIn) {
+          yesCount = interestedPlayers.length;
+        } else {
+          if (openSpots <= 0) continue; // all manual slots filled
         }
+
+        const { players: resolvedPlayers } = resolveManualPollPlayers(pollState, interestedPlayers);
+        players = resolvedPlayers;
+      } else if (isOptIn) {
+        yesCount = interestedPlayers.length;
+        players = [...interestedPlayers];
+        if (pollState.creator?.name && !players.includes(pollState.creator.name)) {
+          players.unshift(pollState.creator.name);
+        }
+      } else {
+        totalSpots = pollState.size || (pollState.options ? pollState.options.length : 4);
+        neededVotes = pollState.creator ? totalSpots - 1 : totalSpots;
+        const filledVotes = aggregated && aggregated.length > 0
+          ? aggregated.filter((o) => o.voters.length > 0).length
+          : (interestedPlayers ? interestedPlayers.length : (pollState.voteBuffer ? pollState.voteBuffer.size : 0));
+        openSpots = Math.max(0, neededVotes - filledVotes);
 
         if (openSpots <= 0) continue; // fixed spot poll is already full
-      }
 
-      // Mark this bucket and all LARGER buckets as sent so we never back-send stale hours
-      for (const h of POWERS_OF_2_REMINDER_HOURS) {
-        if (h >= targetH && !pollState.sentReminders.includes(h)) {
-          pollState.sentReminders.push(h);
+        players = [...interestedPlayers];
+        if (pollState.creator?.name && !players.includes(pollState.creator.name)) {
+          players.unshift(pollState.creator.name);
         }
       }
-      persistPolls();
+
+      const playerList = players.length > 0 ? players.join(', ') : 'None yet';
 
       const reminderText = buildPollReminderText(targetH, pollState, openSpots, totalSpots, playerList, isOptIn, yesCount);
       console.log(`[poll] Sending ${targetH < 1 ? "10m" : targetH + "h"} reminder for poll ${pollId} ("${pollState.name || pollState.when}") in ${pollState.remoteJid}`);
 
       try {
         await sock.sendMessage(pollState.remoteJid, { text: reminderText });
+        // Mark this bucket and all LARGER buckets as sent ONLY AFTER successfully sending message
+        for (const h of POWERS_OF_2_REMINDER_HOURS) {
+          if (h >= targetH && !pollState.sentReminders.includes(h)) {
+            pollState.sentReminders.push(h);
+          }
+        }
+        persistPolls();
       } catch (sendErr) {
         console.error(`[poll] Failed to send reminder for poll ${pollId}:`, sendErr.message);
       }
@@ -2744,7 +2765,9 @@ async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWor
   }
 
   // If time rolled over to tomorrow and when doesn't mention tomorrow or day name, adjust when
-  const isTomorrow = playAt.getDate() !== sjNow.getDate() || playAt.getMonth() !== sjNow.getMonth();
+  const playParts = getSanJoseParts(playAt);
+  const nowParts = getSanJoseParts(sjNow);
+  const isTomorrow = playParts.day !== nowParts.day || playParts.month !== nowParts.month;
   let resolvedWhen = when;
   if (isTomorrow && !effectiveDayWord) {
     if (resolvedWhen) {
