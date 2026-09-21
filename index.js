@@ -117,8 +117,8 @@ const { resolvePlayDateTime, getSanJoseNow, getSanJoseParts } = require('./lib/p
 // Set this to the exact group name (subject) you want the bot to listen to.
 // Leave as null to have the bot log every group name/ID it sees, so you can
 // find the right one.
-//const TARGET_GROUP_NAME = 'SCVCC Early Morning Tennis Group (that usually plays in the evenings!)';
-const TARGET_GROUP_NAME = 'Bot-testing';
+const TARGET_GROUP_NAME = 'SCVCC Early Morning Tennis Group (that usually plays in the evenings!)';
+//const TARGET_GROUP_NAME = 'Bot-testing';
 
 // Only call the LLM when the bot is directly addressed (recommended for
 // groups, otherwise it'll try to reply to every single message). Structured
