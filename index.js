@@ -1322,11 +1322,22 @@ async function handleResumePoll(sock, chatId, sender, senderJid, specificPollId 
 
   // Determine if it should be 'filled' or 'active'
   let newStatus = 'active';
-  if (targetPollState.isManual) {
-    const totalOptionsCount = targetPollState.options ? targetPollState.options.length : 0;
-    const filledCount = targetPollState.voteBuffer ? targetPollState.voteBuffer.size : 0;
-    if (targetPollState.type !== 'opt_in' && totalOptionsCount > 0 && filledCount >= totalOptionsCount) {
-      newStatus = 'filled';
+  const isOptIn = targetPollState.type === 'opt_in' || targetPollState.options?.some((o) => /^yes$/i.test(o));
+
+  if (!isOptIn) {
+    if (targetPollState.isManual) {
+      const totalOptionsCount = targetPollState.options ? targetPollState.options.length : 0;
+      const filledCount = targetPollState.voteBuffer ? targetPollState.voteBuffer.size : 0;
+      if (totalOptionsCount > 0 && filledCount >= totalOptionsCount) {
+        newStatus = 'filled';
+      }
+    } else {
+      const totalSpots = targetPollState.size || (targetPollState.options ? targetPollState.options.length : 4);
+      const neededVotes = targetPollState.creator ? totalSpots - 1 : totalSpots;
+      const filledVotes = targetPollState.voteBuffer ? targetPollState.voteBuffer.size : 0;
+      if (neededVotes > 0 && filledVotes >= neededVotes) {
+        newStatus = 'filled';
+      }
     }
   }
 
@@ -1335,8 +1346,9 @@ async function handleResumePoll(sock, chatId, sender, senderJid, specificPollId 
   persistPolls();
 
   const pollName = targetPollState.name || targetPollState.when || 'Match Poll';
+  const reminderNote = newStatus === 'filled' ? 'all spots are currently filled (waiting for matchup request)' : 'reminders are active';
   console.log(`[poll] Poll ${targetPollId} ("${pollName}") in ${chatId} status resumed to ${newStatus} by ${sender}`);
-  return `▶️ Voting has been resumed for "${pollName}". Status is now ${newStatus} and reminders are active.`;
+  return `▶️ Voting has been resumed for "${pollName}". Status is now ${newStatus} and ${reminderNote}.`;
 }
 
 async function cancelOrDeletePoll(sock, remoteJid, pollId) {
@@ -3160,25 +3172,35 @@ async function processPollVoteEvent(sock, pollMessageKey, rawPollUpdates) {
 
     votePayload = normalizeVotePayload(votePayload);
     const canonicalVoter = voterLid || authenticatingVoter;
+    const hasSelectedOptions = Array.isArray(votePayload?.selectedOptions) && votePayload.selectedOptions.length > 0;
 
-    pollState.voteBuffer.set(canonicalVoter, {
-      ...u,
-      pollUpdateMessageKey: {
-        ...u.pollUpdateMessageKey,
-        fromMe: false,
-        participant: canonicalVoter
-      },
-      vote: votePayload
-    });
+    if (!hasSelectedOptions) {
+      // User unvoted / deselected all options in poll
+      pollState.voteBuffer.delete(canonicalVoter);
+      if (voterNormalized) pollState.voteBuffer.delete(voterNormalized);
+      if (voterPn) pollState.voteBuffer.delete(voterPn);
+      if (voterLid) pollState.voteBuffer.delete(voterLid);
+      console.log(`[poll] Voter ${nameFor(canonicalVoter)} (${canonicalVoter}) unvoted / removed selection from poll ${pollId}. Removed from voteBuffer.`);
+    } else {
+      pollState.voteBuffer.set(canonicalVoter, {
+        ...u,
+        pollUpdateMessageKey: {
+          ...u.pollUpdateMessageKey,
+          fromMe: false,
+          participant: canonicalVoter
+        },
+        vote: votePayload
+      });
 
-    // When recording a vote, if player rating is unavailable, fetch it from TennisRecord
-    const voterName = nameFor(canonicalVoter);
-    if (voterName && !ratings.isPlaceholder(voterName) && !GENERIC_NAMES.has(ratings.keyFor(voterName))) {
-      await ratings.ensureRated([{
-        name: voterName,
-        jid: canonicalVoter,
-        lid: authenticatingVoter && authenticatingVoter.endsWith('@lid') ? authenticatingVoter : null
-      }]);
+      // When recording a vote, if player rating is unavailable, fetch it from TennisRecord
+      const voterName = nameFor(canonicalVoter);
+      if (voterName && !ratings.isPlaceholder(voterName) && !GENERIC_NAMES.has(ratings.keyFor(voterName))) {
+        await ratings.ensureRated([{
+          name: voterName,
+          jid: canonicalVoter,
+          lid: authenticatingVoter && authenticatingVoter.endsWith('@lid') ? authenticatingVoter : null
+        }]);
+      }
     }
   }
   persistPolls(); // save vote progress immediately in case of a restart mid-poll
