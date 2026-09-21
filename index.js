@@ -1238,6 +1238,70 @@ function handlePollDeleted(remoteJid, pollId) {
  * Cancels a poll internally and deletes the poll message from WhatsApp.
  */
 /**
+ * Uses LLM to determine if a message is announcing that a tennis court
+ * reservation / session is being cancelled due to lack of votes / not enough players in a match poll.
+ * If so, returns { isCourtCancelledDueToLackOfVotes: true, pollId, reason }.
+ */
+async function checkCourtCancellationWithLLM(text, sender, chatId) {
+  if (!process.env.ANTHROPIC_API_KEY) return null;
+
+  const chatPolls = [...activePolls.entries()].filter(([, state]) =>
+    state.remoteJid === chatId && (state.status === 'active' || state.status === 'filled')
+  );
+  if (chatPolls.length === 0) return null;
+
+  const prompt = `You are an intelligent assistant for a tennis group chat in San Jose, CA.
+A group member sent this message in the chat:
+Sender: "${sender}"
+Message: "${text}"
+
+Active Match Polls in this chat:
+${chatPolls.map(([id, p]) => `- Poll ID: "${id}", Title: "${p.name || p.when}", Scheduled: "${p.when || p.playAt}", Status: "${p.status}", Spots: ${p.size || 'Opt-in'}`).join('\n')}
+
+Task:
+Analyze if the sender is announcing or stating that a tennis court (or court session/reservation) is being cancelled or released because there are not enough votes or a lack of players in a match poll (e.g. "Cancelling 2nd court due to lack of players", "Cancelled the 8:30am court since we only have 2", "I am cancelling the court because we don't have 4", "Releasing court because poll didn't fill", etc.).
+Note: If they are simply asking a question, talking about general court availability, cancelling their own individual participation (e.g. "I have to cancel today"), or chatting about unrelated topics, set isCourtCancelledDueToLackOfVotes to false.
+
+Respond ONLY with a JSON object in this exact format, with no extra text or markdown:
+{
+  "isCourtCancelledDueToLackOfVotes": boolean,
+  "pollId": string or null,
+  "reason": string
+}`;
+
+  try {
+    const response = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': process.env.ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01'
+      },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        max_tokens: 250,
+        messages: [{ role: 'user', content: prompt }]
+      })
+    });
+
+    if (!response.ok) {
+      console.warn(`[court-cancel-llm] Anthropic API returned ${response.status}`);
+      return null;
+    }
+
+    const data = await response.json();
+    const rawContent = data.content?.filter((b) => b.type === 'text').map((b) => b.text).join('').trim();
+    const cleanedJson = rawContent.replace(/^\`\`\`json\s*/i, '').replace(/\s*\`\`\`$/i, '').trim();
+    const parsed = JSON.parse(cleanedJson);
+
+    return parsed;
+  } catch (err) {
+    console.error('[court-cancel-llm] Failed to check court cancellation with LLM:', err.message);
+    return null;
+  }
+}
+
+/**
  * Stops voting on a poll: closes voting, halts reminders, and sets status to 'stopped'
  * without deleting the poll message from WhatsApp.
  */
@@ -2467,6 +2531,34 @@ async function getResponse(sock, text, chatId, sender, msg) {
 
   if (lower === '!pollstatus') {
     return pollStatusText(chatId);
+  }
+
+  // --- Check if message announces court cancellation due to lack of votes in poll ---
+  const hasCancelWord = /\bcancel(?:l?ed|l?ing|s)?\b/i.test(text);
+  const hasCourtWord = /\bcourts?\b/i.test(text);
+  if (hasCancelWord && hasCourtWord) {
+    const cancelAnalysis = await checkCourtCancellationWithLLM(text, sender, chatId);
+    if (cancelAnalysis && cancelAnalysis.isCourtCancelledDueToLackOfVotes) {
+      let targetPollId = cancelAnalysis.pollId;
+      if (!targetPollId || !activePolls.has(targetPollId)) {
+        for (const [pollId, pollState] of [...activePolls.entries()].reverse()) {
+          if (pollState.remoteJid === chatId && (pollState.status === 'active' || pollState.status === 'filled')) {
+            targetPollId = pollId;
+            break;
+          }
+        }
+      }
+      if (!targetPollId) targetPollId = latestPollIdByChat.get(chatId);
+
+      if (targetPollId && activePolls.has(targetPollId)) {
+        const targetPollState = activePolls.get(targetPollId);
+        targetPollState.status = 'stopped';
+        persistPolls();
+        const pollName = targetPollState.name || targetPollState.when || 'Match Poll';
+        console.log(`[poll] LLM detected court cancellation due to insufficient votes ("${cancelAnalysis.reason}"). Poll ${targetPollId} ("${pollName}") status set to stopped.`);
+        return `🛑 Detected court cancellation due to insufficient votes (${cancelAnalysis.reason || 'not enough players'}). Voting and reminders for "${pollName}" have been stopped. Matchups can still be generated anytime with "!matchups".`;
+      }
+    }
   }
 
   // --- Trigger check for bot-addressed messages (case-insensitive, requiring @, or native WhatsApp mentions) ---
