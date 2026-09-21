@@ -117,8 +117,8 @@ const { resolvePlayDateTime, getSanJoseNow, getSanJoseParts } = require('./lib/p
 // Set this to the exact group name (subject) you want the bot to listen to.
 // Leave as null to have the bot log every group name/ID it sees, so you can
 // find the right one.
-const TARGET_GROUP_NAME = 'SCVCC Early Morning Tennis Group (that usually plays in the evenings!)';
-//const TARGET_GROUP_NAME = 'Bot-testing';
+//const TARGET_GROUP_NAME = 'SCVCC Early Morning Tennis Group (that usually plays in the evenings!)';
+const TARGET_GROUP_NAME = 'Bot-testing';
 
 // Only call the LLM when the bot is directly addressed (recommended for
 // groups, otherwise it'll try to reply to every single message). Structured
@@ -359,6 +359,32 @@ const CLAUDE_TOOLS = [
         pollName: {
           type: 'string',
           description: 'Optional poll name or time keyword (e.g. "8am", "10am", "Tennis 8am") to match the specific poll.'
+        }
+      }
+    }
+  },
+  {
+    name: 'stop_poll',
+    description: 'Stops voting on an active or filled match poll, silences reminders, and sets status to stopped without deleting the poll message from WhatsApp. Matchups can still be generated later.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        pollId: {
+          type: 'string',
+          description: 'Optional specific poll ID to stop. If omitted, stops the most recent active or filled match poll in this chat.'
+        }
+      }
+    }
+  },
+  {
+    name: 'resume_poll',
+    description: 'Resumes voting and reminders for a stopped match poll.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        pollId: {
+          type: 'string',
+          description: 'Optional specific poll ID to resume. If omitted, resumes the most recent stopped match poll in this chat.'
         }
       }
     }
@@ -1211,6 +1237,108 @@ function handlePollDeleted(remoteJid, pollId) {
 /**
  * Cancels a poll internally and deletes the poll message from WhatsApp.
  */
+/**
+ * Stops voting on a poll: closes voting, halts reminders, and sets status to 'stopped'
+ * without deleting the poll message from WhatsApp.
+ */
+async function handleStopPoll(sock, chatId, sender, senderJid, specificPollId = null) {
+  let targetPollId = specificPollId || null;
+  if (!targetPollId) {
+    for (const [pollId, pollState] of [...activePolls.entries()].reverse()) {
+      if (pollState.remoteJid === chatId && (pollState.status === 'active' || pollState.status === 'filled')) {
+        targetPollId = pollId;
+        break;
+      }
+    }
+  }
+  if (!targetPollId) {
+    targetPollId = latestPollIdByChat.get(chatId);
+  }
+  if (!targetPollId || !activePolls.has(targetPollId)) {
+    return 'No active poll to stop.';
+  }
+
+  const targetPollState = activePolls.get(targetPollId);
+  if (targetPollState.status === 'stopped') {
+    return `Poll "${targetPollState.name || targetPollState.when || targetPollId}" is already stopped.`;
+  }
+  if (targetPollState.status === 'cancelled') {
+    return 'This poll was cancelled.';
+  }
+
+  const isCreator = targetPollState.creator ? isSameUser(targetPollState.creator.jid, senderJid, targetPollState.creator.name, sender) : false;
+  const isAdmin = await isUserAdmin(sock, chatId, senderJid);
+
+  if (!isCreator && !isAdmin) {
+    return '⚠️ Only the poll creator or group admins can stop voting on this poll.';
+  }
+
+  targetPollState.status = 'stopped';
+  persistPolls();
+
+  const pollName = targetPollState.name || targetPollState.when || 'Match Poll';
+  console.log(`[poll] Poll ${targetPollId} ("${pollName}") in ${chatId} status set to stopped by ${sender}`);
+  return `🛑 Voting has been stopped for "${pollName}". Reminders are closed and status is set to stopped. You can generate matchups anytime with "!matchups".`;
+}
+
+/**
+ * Resumes voting on a stopped poll: restores status to 'active' (or 'filled' if all slots are occupied),
+ * resumes vote tracking, and re-enables upcoming reminders.
+ */
+async function handleResumePoll(sock, chatId, sender, senderJid, specificPollId = null) {
+  let targetPollId = specificPollId || null;
+  if (!targetPollId) {
+    for (const [pollId, pollState] of [...activePolls.entries()].reverse()) {
+      if (pollState.remoteJid === chatId && pollState.status === 'stopped') {
+        targetPollId = pollId;
+        break;
+      }
+    }
+  }
+  if (!targetPollId) {
+    targetPollId = latestPollIdByChat.get(chatId);
+  }
+  if (!targetPollId || !activePolls.has(targetPollId)) {
+    return 'No stopped poll to resume.';
+  }
+
+  const targetPollState = activePolls.get(targetPollId);
+  if (targetPollState.status === 'active' || targetPollState.status === 'filled') {
+    return `Poll "${targetPollState.name || targetPollState.when || targetPollId}" is already active.`;
+  }
+  if (targetPollState.status === 'resolved') {
+    return `Poll "${targetPollState.name || targetPollState.when || targetPollId}" has already been resolved/drawn.`;
+  }
+  if (targetPollState.status === 'cancelled') {
+    return 'This poll was cancelled and cannot be resumed.';
+  }
+
+  const isCreator = targetPollState.creator ? isSameUser(targetPollState.creator.jid, senderJid, targetPollState.creator.name, sender) : false;
+  const isAdmin = await isUserAdmin(sock, chatId, senderJid);
+
+  if (!isCreator && !isAdmin) {
+    return '⚠️ Only the poll creator or group admins can resume voting on this poll.';
+  }
+
+  // Determine if it should be 'filled' or 'active'
+  let newStatus = 'active';
+  if (targetPollState.isManual) {
+    const totalOptionsCount = targetPollState.options ? targetPollState.options.length : 0;
+    const filledCount = targetPollState.voteBuffer ? targetPollState.voteBuffer.size : 0;
+    if (targetPollState.type !== 'opt_in' && totalOptionsCount > 0 && filledCount >= totalOptionsCount) {
+      newStatus = 'filled';
+    }
+  }
+
+  targetPollState.status = newStatus;
+  latestPollIdByChat.set(chatId, targetPollId);
+  persistPolls();
+
+  const pollName = targetPollState.name || targetPollState.when || 'Match Poll';
+  console.log(`[poll] Poll ${targetPollId} ("${pollName}") in ${chatId} status resumed to ${newStatus} by ${sender}`);
+  return `▶️ Voting has been resumed for "${pollName}". Status is now ${newStatus} and reminders are active.`;
+}
+
 async function cancelOrDeletePoll(sock, remoteJid, pollId) {
   if (!pollId) return;
   handlePollDeleted(remoteJid, pollId);
@@ -1980,6 +2108,14 @@ async function executeTool(sock, chatId, sender, toolUse, msg) {
       return `Failed to get weather for ${location}: ${err.message}`;
     }
   }
+  if (name === 'stop_poll') {
+    const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
+    return await handleStopPoll(sock, chatId, sender, senderJid, input.pollId || null);
+  }
+  if (name === 'resume_poll') {
+    const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
+    return await handleResumePoll(sock, chatId, sender, senderJid, input.pollId || null);
+  }
   if (name === 'cancel_poll') {
     let targetPollId = input.pollId || null;
     if (!targetPollId) {
@@ -2248,6 +2384,20 @@ async function getResponse(sock, text, chatId, sender, msg) {
   }
 
   // --- Poll management ---
+  if (lower.startsWith('!stoppoll') || lower.startsWith('!closepoll') || lower === '!stop' || lower === '!close') {
+    const parts = text.split(/\s+/);
+    const specificPollId = parts.length > 1 ? parts[1].trim() : null;
+    const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
+    return await handleStopPoll(sock, chatId, sender, senderJid, specificPollId);
+  }
+
+  if (lower.startsWith('!resumepoll') || lower.startsWith('!reopenpoll') || lower === '!resume' || lower === '!reopen') {
+    const parts = text.split(/\s+/);
+    const specificPollId = parts.length > 1 ? parts[1].trim() : null;
+    const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
+    return await handleResumePoll(sock, chatId, sender, senderJid, specificPollId);
+  }
+
   if (lower === '!cancelpoll' || lower === '!deletepoll') {
     let targetPollId = null;
     for (const [pollId, pollState] of [...activePolls.entries()].reverse()) {
@@ -2372,7 +2522,9 @@ function helpText() {
     `${TRIGGER_PREFIX} create a poll [for <N>] [when] – post a match poll (N spots for singles/doubles, or Yes/No opt-in if N is omitted)`,
     '!poll [for <N>] [when] (or !createpoll) – direct command to create a match poll',
     '!matchups (or !draw, !rematch) – generate matchups from active tennis match poll',
-    '!cancelpoll (or !deletepoll) – stop and delete the active poll (creator or admin only)',
+    '!stoppoll (or !closepoll) – stop voting and reminders, setting poll status to stopped (creator or admin only)',
+    '!resumepoll (or !reopenpoll) – resume voting and reminders for a stopped poll (creator or admin only)',
+    '!cancelpoll (or !deletepoll) – cancel and delete the active poll from WhatsApp (creator or admin only)',
     '!pollstatus – debug: show raw vote count and voters for active match poll(s) in this chat',
     '!allpolls (or !pollstatus all) – (Admin only) debug: show detailed status of all tracked polls',
     '!upcomingpolls (or !upcoming, !pollstatus upcoming) – list all match polls whose play time has not passed yet',
@@ -2934,7 +3086,7 @@ async function processPollVoteEvent(sock, pollMessageKey, rawPollUpdates) {
     `messageSecret present: ${!!pollEncKey}, is binary: ${Buffer.isBuffer(pollEncKey)}, length: ${pollEncKey?.length ?? 'n/a'}`
   );
 
-  if (pollState.status === 'cancelled') return; // don't process votes on a cancelled poll
+  if (pollState.status === 'cancelled' || pollState.status === 'stopped') return; // don't process votes on cancelled or stopped polls
 
   if (pollState.remoteJid && pollState.remoteJid.endsWith('@g.us')) {
     await getGroupMetadata(sock, pollState.remoteJid);
@@ -3058,7 +3210,7 @@ async function processPollVoteEvent(sock, pollMessageKey, rawPollUpdates) {
     } catch (e) {}
 
     // When all voting slots are filled and not already resolved, transition status to 'filled'
-    if (pollState.status !== 'resolved' && pollState.status !== 'cancelled') {
+    if (pollState.status !== 'resolved' && pollState.status !== 'cancelled' && pollState.status !== 'stopped') {
       const isFilled = (pollState.type !== 'opt_in' && totalOptionsCount > 0 && filledCount >= totalOptionsCount);
       const newStatus = isFilled ? 'filled' : 'active';
       if (pollState.status !== newStatus) {
@@ -3596,7 +3748,7 @@ function buildContextBlurb(chatId) {
         if (pollState.status === 'cancelled') {
           return `[Poll ${id}] a user-created manual match poll "${pollState.name || 'Match Poll'}" was cancelled`;
         } else {
-          const statusNote = pollState.status === 'resolved' ? 'status: resolved/drawn (can generate matchups again / rematch)' : (pollState.status === 'filled' ? 'status: filled (all voting slots filled, waiting for matchup request)' : 'status: active');
+          const statusNote = pollState.status === 'resolved' ? 'status: resolved/drawn (can generate matchups again / rematch)' : (pollState.status === 'filled' ? 'status: filled (all voting slots filled, waiting for matchup request)' : (pollState.status === 'stopped' ? 'status: stopped (voting stopped, call generate_matchups when ready)' : 'status: active'));
           return `[Poll ${id}] a user-created manual match poll "${pollState.name || 'Match Poll'}" (created by ${creatorName}) is tracked with ${interestedPlayers.length} vote(s): [${optionDetails.join('; ') || 'no votes yet'}]. Players currently in/playing (${playingPlayers.length}): ${playingPlayers.join(', ')}${additionSuffix}. (${statusNote} -- when asked to generate matchups or draw, call generate_matchups)`;
         }
       }
@@ -3624,7 +3776,7 @@ function buildContextBlurb(chatId) {
         if (pollState.status === 'cancelled') {
           return `[Poll ${id}] a Yes/No opt-in poll${whenSuffix} was cancelled`;
         } else {
-          const statusNote = pollState.status === 'resolved' ? 'status: resolved/drawn (can rematch)' : 'status: active';
+          const statusNote = pollState.status === 'resolved' ? 'status: resolved/drawn (can rematch)' : (pollState.status === 'stopped' ? 'status: stopped (voting stopped)' : 'status: active');
           return `[Poll ${id}] a Yes/No opt-in poll${whenSuffix} is tracked with ${yesCount} "Yes" vote(s) (${yesNames.join(', ') || 'none yet'}) and ${noCount} "No" vote(s). (${statusNote})`;
         }
       }
