@@ -388,6 +388,32 @@ const CLAUDE_TOOLS = [
         }
       }
     }
+  },
+  {
+    name: 'pause_reminders',
+    description: 'Pauses upcoming reminder notifications for a specific match poll or all active match polls in this chat. Any group member can issue this.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        pollId: {
+          type: 'string',
+          description: 'Optional specific poll ID to pause reminders for. If omitted, pauses reminders for all active match polls in this chat.'
+        }
+      }
+    }
+  },
+  {
+    name: 'resume_reminders',
+    description: 'Resumes upcoming reminder notifications for a specific match poll or all active match polls in this chat. Any group member can issue this.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        pollId: {
+          type: 'string',
+          description: 'Optional specific poll ID to resume reminders for. If omitted, resumes reminders for all active match polls in this chat.'
+        }
+      }
+    }
   }
 ];
 
@@ -1415,6 +1441,78 @@ async function handleResumePoll(sock, chatId, sender, senderJid, specificPollId 
   return `▶️ Voting has been resumed for "${pollName}". Status is now ${newStatus} and ${reminderNote}.`;
 }
 
+/**
+ * Pauses reminders for a specific poll or for all active polls in the chat.
+ * Any group member can run this command.
+ */
+async function handlePauseReminders(sock, chatId, sender, specificPollId = null) {
+  const targetPolls = [];
+  if (specificPollId) {
+    if (activePolls.has(specificPollId)) {
+      const p = activePolls.get(specificPollId);
+      if (p.remoteJid === chatId && p.status === 'active') {
+        targetPolls.push([specificPollId, p]);
+      }
+    }
+  } else {
+    for (const [id, state] of activePolls.entries()) {
+      if (state.remoteJid === chatId && state.status === 'active') {
+        targetPolls.push([id, state]);
+      }
+    }
+  }
+
+  if (targetPolls.length === 0) {
+    return 'No active match polls found in this chat to pause reminders for.';
+  }
+
+  const names = [];
+  for (const [id, state] of targetPolls) {
+    state.remindersPaused = true;
+    names.push(`"${state.name || state.when || id}"`);
+  }
+  persistPolls();
+
+  console.log(`[reminders] Reminders paused for ${targetPolls.length} poll(s) in ${chatId} by ${sender}`);
+  return `⏸️ Reminders have been paused for ${names.join(', ')}. Use "!resumereminders" to resume them anytime.`;
+}
+
+/**
+ * Resumes reminders for a specific poll or for all active polls in the chat.
+ * Any group member can run this command.
+ */
+async function handleResumeReminders(sock, chatId, sender, specificPollId = null) {
+  const targetPolls = [];
+  if (specificPollId) {
+    if (activePolls.has(specificPollId)) {
+      const p = activePolls.get(specificPollId);
+      if (p.remoteJid === chatId && p.status === 'active') {
+        targetPolls.push([specificPollId, p]);
+      }
+    }
+  } else {
+    for (const [id, state] of activePolls.entries()) {
+      if (state.remoteJid === chatId && state.status === 'active') {
+        targetPolls.push([id, state]);
+      }
+    }
+  }
+
+  if (targetPolls.length === 0) {
+    return 'No active match polls found in this chat to resume reminders for.';
+  }
+
+  const names = [];
+  for (const [id, state] of targetPolls) {
+    state.remindersPaused = false;
+    names.push(`"${state.name || state.when || id}"`);
+  }
+  persistPolls();
+
+  console.log(`[reminders] Reminders resumed for ${targetPolls.length} poll(s) in ${chatId} by ${sender}`);
+  return `▶️ Reminders have been resumed for ${names.join(', ')}.`;
+}
+
 async function cancelOrDeletePoll(sock, remoteJid, pollId) {
   if (!pollId) return;
   handlePollDeleted(remoteJid, pollId);
@@ -1567,6 +1665,7 @@ async function checkAndSendPollReminders(sock) {
 
     for (const [pollId, pollState] of activePolls.entries()) {
       if (pollState.status !== 'active') continue;
+      if (pollState.remindersPaused) continue; // reminders paused by group member
       if (!pollState.playAt) continue;
 
       const playAtMs = new Date(pollState.playAt).getTime();
@@ -2192,6 +2291,12 @@ async function executeTool(sock, chatId, sender, toolUse, msg) {
     const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
     return await handleResumePoll(sock, chatId, sender, senderJid, input.pollId || null);
   }
+  if (name === 'pause_reminders') {
+    return await handlePauseReminders(sock, chatId, sender, input.pollId || null);
+  }
+  if (name === 'resume_reminders') {
+    return await handleResumeReminders(sock, chatId, sender, input.pollId || null);
+  }
   if (name === 'cancel_poll') {
     let targetPollId = input.pollId || null;
     if (!targetPollId) {
@@ -2488,6 +2593,18 @@ async function getResponse(sock, text, chatId, sender, msg) {
     return await handleResumePoll(sock, chatId, sender, senderJid, specificPollId);
   }
 
+  if (lower.startsWith('!pausereminder') || lower.startsWith('!pausereminders') || lower === '!silencereminders') {
+    const parts = text.split(/\s+/);
+    const specificPollId = parts.length > 1 ? parts[1].trim() : null;
+    return await handlePauseReminders(sock, chatId, sender, specificPollId);
+  }
+
+  if (lower.startsWith('!resumereminder') || lower.startsWith('!resumereminders') || lower.startsWith('!unpausereminder') || lower.startsWith('!unpausereminders')) {
+    const parts = text.split(/\s+/);
+    const specificPollId = parts.length > 1 ? parts[1].trim() : null;
+    return await handleResumeReminders(sock, chatId, sender, specificPollId);
+  }
+
   if (lower === '!cancelpoll' || lower === '!deletepoll') {
     let targetPollId = null;
     for (const [pollId, pollState] of [...activePolls.entries()].reverse()) {
@@ -2642,6 +2759,8 @@ function helpText() {
     '!matchups (or !draw, !rematch) – generate matchups from active tennis match poll',
     '!stoppoll (or !closepoll) – stop voting and reminders, setting poll status to stopped (creator or admin only)',
     '!resumepoll (or !reopenpoll) – resume voting and reminders for a stopped poll (creator or admin only)',
+    '!pausereminders [pollId] (or !pausereminder) – pause upcoming match reminders for active poll(s)',
+    '!resumereminders [pollId] (or !resumereminder) – resume upcoming match reminders for active poll(s)',
     '!cancelpoll (or !deletepoll) – cancel and delete the active poll from WhatsApp (creator or admin only)',
     '!pollstatus – debug: show raw vote count and voters for active match poll(s) in this chat',
     '!allpolls (or !pollstatus all) – (Admin only) debug: show detailed status of all tracked polls',
@@ -3740,6 +3859,9 @@ function pollStatusText(chatId = null, opts = {}) {
     const remindersStr = Array.isArray(pollState.sentReminders) && pollState.sentReminders.length > 0
       ? pollState.sentReminders.map((h) => h < 1 ? `${Math.round(h * 60)}m` : `${h}h`).join(', ')
       : '(none yet)';
+    const remindersLine = pollState.remindersPaused
+      ? `Reminders: PAUSED (sent so far: [${remindersStr}])`
+      : `Sent reminders: [${remindersStr}]`;
 
     if (pollState.isManual) {
       const { aggregated, interestedPlayers } = getPollVoters(pollId, pollState, mePn);
@@ -3757,7 +3879,7 @@ function pollStatusText(chatId = null, opts = {}) {
         `Creator: ${creatorName}`,
         `Status: ${pollState.status} (Passively tracked)`,
         `Play time: ${playAtLocal} (when: "${pollState.when || 'unspecified'}")`,
-        `Sent reminders: [${remindersStr}]`,
+        remindersLine,
         `Total votes buffered: ${pollState.voteBuffer.size}`,
         `Options & Votes:\n  ${optionSummaries.length ? optionSummaries.join('\n  ') : '(none)'}`,
         `Voted so far (${interestedPlayers.length}): ${interestedPlayers.length ? interestedPlayers.join(', ') : '(none yet)'}`,
@@ -3789,7 +3911,7 @@ function pollStatusText(chatId = null, opts = {}) {
         `${groupHeader}Poll ${pollId}${pollState.when ? ` (${pollState.when})` : ''}: Opt-in (Yes/No).`,
         `Status: ${pollState.status}`,
         `Play time: ${playAtLocal} (kept for 2 weeks after scheduled play time)`,
-        `Sent reminders: [${remindersStr}]`,
+        remindersLine,
         `Yes votes (${yesVoters.length}): ${yesVoters.length ? yesVoters.join(', ') : '(none yet)'}`,
         `No votes (${noVoters.length}): ${noVoters.length ? noVoters.join(', ') : '(none yet)'}`,
         'Matchups: Waiting for user prompt (!matchups or "@tenbot generate matchups")'
@@ -3804,7 +3926,7 @@ function pollStatusText(chatId = null, opts = {}) {
       pollState.creator ? `Creator (Player 1): ${pollState.creator.name || 'Player 1'}` : 'Creator: None (all spots open)',
       `Status: ${pollState.status}`,
       `Play time: ${playAtLocal} (kept for 2 weeks after scheduled play time)`,
-      `Sent reminders: [${remindersStr}]`,
+      remindersLine,
       `Raw votes recorded: ${pollState.voteBuffer.size}/${neededVotes} needed`,
       `Voters seen so far: ${voters.length ? voters.join(', ') : '(none yet)'}`
     ];
