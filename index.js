@@ -1533,8 +1533,22 @@ async function sendPollReminder(sock, pollId, pollState, isManualTrigger = false
   const targetH = POWERS_OF_2_REMINDER_HOURS.find((h) => hoursRemaining <= h) || (hoursRemaining || 1);
   const reminderText = buildPollReminderText(targetH, pollState, openSpots, totalSpots, playerList, isOptIn, yesCount, hoursRemaining);
 
-  console.log(`[poll] Sending reminder for poll ${pollId} ("${pollState.name || pollState.when}") in ${pollState.remoteJid}`);
-  await sock.sendMessage(pollState.remoteJid, { text: reminderText });
+  const storedMessage = messageStore.get(storeKey(pollState.remoteJid, pollId));
+  const fromMe = !pollState.isManual;
+  const participant = pollState.creator?.jid;
+
+  const quotedMsg = {
+    key: {
+      remoteJid: pollState.remoteJid,
+      id: pollId,
+      fromMe: Boolean(fromMe),
+      ...(participant ? { participant } : {})
+    },
+    ...(storedMessage ? { message: storedMessage } : {})
+  };
+
+  console.log(`[poll] Sending reminder for poll ${pollId} ("${pollState.name || pollState.when}") in ${pollState.remoteJid} (replying to poll message)`);
+  await sock.sendMessage(pollState.remoteJid, { text: reminderText }, { quoted: quotedMsg });
 
   pollState.reminderCount = (pollState.reminderCount || 0) + 1;
   persistPolls();
