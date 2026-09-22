@@ -1565,84 +1565,124 @@ setInterval(cleanupExpiredPolls, POLL_CLEANUP_INTERVAL_MINUTES * 60 * 1000);
  * Builds engaging, creative, and escalating reminder text as match time gets closer.
  * Supports both fixed-spot and Yes/No opt-in match polls.
  */
-function buildPollReminderText(H, pollState, openSpots, totalSpots, playerList, isOptIn = false, yesCount = 0) {
+function buildPollReminderText(H, pollState, openSpots, totalSpots, playerList, isOptIn = false, yesCount = 0, hoursRemaining = null) {
   const whenStr = pollState.when ? pollState.when : (pollState.name || 'today');
   const spotWord = openSpots === 1 ? 'spot' : 'spots';
   const playerWord = openSpots === 1 ? 'player' : 'players';
 
+  const effHours = typeof hoursRemaining === 'number' && hoursRemaining > 0 ? hoursRemaining : H;
+  const currentH = Math.max(1, Math.round(effHours));
+  const currentMins = Math.max(1, Math.round(effHours * 60));
+
   if (isOptIn) {
-    if (H >= 24) {
-      return `⏰ *${H} Hours (1 Day) to Playtime!* We have *${yesCount} player(s) in* so far for *${whenStr}*.\n` +
-        `Players in: ${playerList}\n` +
+    if (effHours >= 24) {
+      const days = Math.round(effHours / 24);
+      const dayStr = days === 1 ? '1 Day' : `${days} Days`;
+      return `⏰ *${currentH} Hours (${dayStr}) to Playtime!* We have *${yesCount} player(s) in* so far for *${whenStr}*.
+` +
+        `Players in: ${playerList}
+` +
         `Don't miss out — cast your vote above to join the match!`;
     }
-    if (H >= 16) {
-      return `⏰ *${H} Hours to Playtime!* We have *${yesCount} player(s) in* so far for *${whenStr}*.\n` +
-        `Players in: ${playerList}\n` +
+    if (effHours >= 16) {
+      return `⏰ *${currentH} Hours to Playtime!* We have *${yesCount} player(s) in* so far for *${whenStr}*.
+` +
+        `Players in: ${playerList}
+` +
         `Don't miss out — cast your vote above to join the match!`;
     }
-    if (H >= 8) {
-      return `🎾 *8 Hours to Match Time!* We currently have *${yesCount} player(s) in* for *${whenStr}*.\n` +
-        `Current lineup: ${playerList}\n` +
+    if (effHours >= 8) {
+      return `🎾 *${currentH} Hours to Match Time!* We currently have *${yesCount} player(s) in* for *${whenStr}*.
+` +
+        `Current lineup: ${playerList}
+` +
         `Who else is ready to play? Vote Yes in the poll above! 🎾⚡`;
     }
-    if (H >= 4) {
-      return `🔥 *4 Hours Until Court Time!* *${yesCount} player(s)* lined up for *${whenStr}*!\n` +
-        `Roster: ${playerList}\n` +
+    if (effHours >= 4) {
+      return `🔥 *${currentH} Hours Until Court Time!* *${yesCount} player(s)* lined up for *${whenStr}*!
+` +
+        `Roster: ${playerList}
+` +
         `Cast your vote above if you want in on today's session!`;
     }
-    if (H >= 2) {
-      return `⚡ *2 HOURS TO GO!* *${yesCount} player(s)* confirmed for *${whenStr}*!\n` +
-        `Ready on court: ${playerList}\n` +
+    if (effHours >= 2) {
+      return `⚡ *${currentH} HOURS TO GO!* *${yesCount} player(s)* confirmed for *${whenStr}*!
+` +
+        `Ready on court: ${playerList}
+` +
         `Vote Yes now before teams and matchups are drawn! 🎾🏃‍♂️💨`;
     }
-    if (H >= 1) {
-      return `🚨 *FINAL CALL: 1 HOUR LEFT!* *${yesCount} player(s) in* for *${whenStr}*!\n` +
-        `Current roster: ${playerList}\n` +
+    if (effHours >= 1) {
+      const hourWord = currentH === 1 ? '1 HOUR LEFT' : `${currentH} HOURS LEFT`;
+      return `🚨 *FINAL CALL: ${hourWord}!* *${yesCount} player(s) in* for *${whenStr}*!
+` +
+        `Current roster: ${playerList}
+` +
         `Last chance to vote Yes before match time! 🏆🎾🔥`;
     }
-    return `⚡ *10 MINUTES REMAINING!* *${yesCount} player(s) in* for *${whenStr}*!\n` +
-      `Current roster: ${playerList}\n` +
+    return `⚡ *${currentMins} MINUTES REMAINING!* *${yesCount} player(s) in* for *${whenStr}*!
+` +
+      `Current roster: ${playerList}
+` +
       `Final countdown to vote Yes before matchups are locked in! 🏆🎾⚡`;
   }
 
-  if (H >= 32) {
-    return `🎾 *Match Alert:* The match poll for *${whenStr}* still has *${openSpots} open ${spotWord}* (${openSpots}/${totalSpots} needed).\n` +
-      `Current players: ${playerList}\n` +
+  if (effHours >= 32) {
+    return `🎾 *Match Alert:* The match poll for *${whenStr}* still has *${openSpots} open ${spotWord}* (${openSpots}/${totalSpots} needed).
+` +
+      `Current players: ${playerList}
+` +
       `Vote in the poll above to lock in your spot!`;
   }
-  if (H >= 24) {
-    return `⏰ *24 Hours (1 Day) to Playtime!* We have *${openSpots} ${spotWord} remaining* for *${whenStr}* (${openSpots}/${totalSpots} needed).\n` +
-      `Roster so far: ${playerList}\n` +
+  if (effHours >= 24) {
+    const days = Math.round(effHours / 24);
+    const dayStr = days === 1 ? '1 Day' : `${days} Days`;
+    return `⏰ *${currentH} Hours (${dayStr}) to Playtime!* We have *${openSpots} ${spotWord} remaining* for *${whenStr}* (${openSpots}/${totalSpots} needed).
+` +
+      `Roster so far: ${playerList}
+` +
       `Don't miss out — cast your vote above to join the court!`;
   }
-  if (H >= 16) {
-    return `⏰ *${H} Hours to Playtime!* We have *${openSpots} ${spotWord} remaining* for *${whenStr}* (${openSpots}/${totalSpots} needed).\n` +
-      `Roster so far: ${playerList}\n` +
+  if (effHours >= 16) {
+    return `⏰ *${currentH} Hours to Playtime!* We have *${openSpots} ${spotWord} remaining* for *${whenStr}* (${openSpots}/${totalSpots} needed).
+` +
+      `Roster so far: ${playerList}
+` +
       `Don't miss out — cast your vote above to join the court!`;
   }
-  if (H >= 8) {
-    return `🎾 *8 Hours to Match Time!* We still need *${openSpots} more ${playerWord}* to complete the court for *${whenStr}* (${totalSpots} total spots).\n` +
-      `Current lineup: ${playerList}\n` +
+  if (effHours >= 8) {
+    return `🎾 *${currentH} Hours to Match Time!* We still need *${openSpots} more ${playerWord}* to complete the court for *${whenStr}* (${totalSpots} total spots).
+` +
+      `Current lineup: ${playerList}
+` +
       `Who's ready to hit some winners today? Claim your spot!`;
   }
-  if (H >= 4) {
-    return `🔥 *4 Hours Until Court Time!* Only *${openSpots} ${spotWord} left* for *${whenStr}*!\n` +
-      `Lined up to play: ${playerList}\n` +
+  if (effHours >= 4) {
+    return `🔥 *${currentH} Hours Until Court Time!* Only *${openSpots} ${spotWord} left* for *${whenStr}*!
+` +
+      `Lined up to play: ${playerList}
+` +
       `Racquets ready? Grab the open ${spotWord} before it fills up! 🎾⚡`;
   }
-  if (H >= 2) {
-    return `⚡ *2 HOURS TO GO!* We only need *${openSpots} more ${playerWord}* to make the match happen at *${whenStr}*!\n` +
-      `Ready on court: ${playerList}\n` +
+  if (effHours >= 2) {
+    return `⚡ *${currentH} HOURS TO GO!* We only need *${openSpots} more ${playerWord}* to make the match happen at *${whenStr}*!
+` +
+      `Ready on court: ${playerList}
+` +
       `Don't leave the squad hanging — step up and claim the final ${spotWord}! 🎾🏃‍♂️💨`;
   }
-  if (H >= 1) {
-    return `🚨 *FINAL CALL: 1 HOUR LEFT!* Just *${openSpots} ${spotWord} open* for *${whenStr}*!\n` +
-      `Current roster: ${playerList}\n` +
+  if (effHours >= 1) {
+    const hourWord = currentH === 1 ? '1 HOUR LEFT' : `${currentH} HOURS LEFT`;
+    return `🚨 *FINAL CALL: ${hourWord}!* Just *${openSpots} ${spotWord} open* for *${whenStr}*!
+` +
+      `Current roster: ${playerList}
+` +
       `Who's coming through in the clutch? Vote now and let's play! 🏆🎾🔥`;
   }
-  return `⚡ *10 MINUTES TO GO!* Still need *${openSpots} more ${playerWord}* for *${whenStr}*!\n` +
-    `Current lineup: ${playerList}\n` +
+  return `⚡ *${currentMins} MINUTES TO GO!* Still need *${openSpots} more ${playerWord}* for *${whenStr}*!
+` +
+    `Current lineup: ${playerList}
+` +
     `Last chance to grab the remaining ${spotWord} before match time! 🏆🎾⚡`;
 }
 
@@ -1676,6 +1716,14 @@ async function checkAndSendPollReminders(sock) {
       const hoursRemaining = diffMs / (60 * 60 * 1000);
       const isOptIn = pollState.type === 'opt_in' || pollState.options?.some((o) => /^yes$/i.test(o));
 
+      // Do not send a reminder within one hour of creation of poll
+      if (pollState.createdAt) {
+        const pollAgeHours = (now - new Date(pollState.createdAt).getTime()) / (60 * 60 * 1000);
+        if (pollAgeHours < 1.0) {
+          continue;
+        }
+      }
+
       // Find the most immediate matching power-of-2 reminder bucket (smallest H where hoursRemaining <= H)
       const targetH = POWERS_OF_2_REMINDER_HOURS.find((h) => hoursRemaining <= h);
       if (!targetH) continue; // more than 64 hours away
@@ -1685,6 +1733,23 @@ async function checkAndSendPollReminders(sock) {
       }
 
       if (pollState.sentReminders.includes(targetH)) continue;
+
+      // If coming out of quiet hours (8:00 AM - 8:59 AM) and another reminder is scheduled within 1 hour, do not send missed reminder
+      if (currentHour === 8) {
+        const hasScheduledWithin1Hour = POWERS_OF_2_REMINDER_HOURS.some((h) =>
+          h < targetH && (hoursRemaining - 1.0) <= h && h <= hoursRemaining
+        );
+        if (hasScheduledWithin1Hour) {
+          console.log(`[poll] Bypassing missed reminder (${targetH}h) for poll ${pollId} after quiet hours because another reminder is scheduled within 1 hour.`);
+          for (const h of POWERS_OF_2_REMINDER_HOURS) {
+            if (h >= targetH && !pollState.sentReminders.includes(h)) {
+              pollState.sentReminders.push(h);
+            }
+          }
+          persistPolls();
+          continue;
+        }
+      }
 
       // Determine spots and voters
       let totalSpots = 0;
@@ -1739,7 +1804,7 @@ async function checkAndSendPollReminders(sock) {
 
       const playerList = players.length > 0 ? players.join(', ') : 'None yet';
 
-      const reminderText = buildPollReminderText(targetH, pollState, openSpots, totalSpots, playerList, isOptIn, yesCount);
+      const reminderText = buildPollReminderText(targetH, pollState, openSpots, totalSpots, playerList, isOptIn, yesCount, hoursRemaining);
       console.log(`[poll] Sending ${targetH < 1 ? "10m" : targetH + "h"} reminder for poll ${pollId} ("${pollState.name || pollState.when}") in ${pollState.remoteJid}`);
 
       try {
@@ -2018,6 +2083,7 @@ async function startBot() {
             type: pollType,
             when: resolvedWhen,
             playAt: playAt.toISOString(),
+            createdAt: new Date().toISOString(),
             status: 'active',
             isManual: true, // user-created manual match poll, passively tracked
             creator: { name: creatorName, jid: creatorJid },
@@ -3274,6 +3340,7 @@ async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWor
     type: isOptIn ? 'opt_in' : 'fixed',
     when: resolvedWhen || null,
     playAt: playAt.toISOString(),
+    createdAt: new Date().toISOString(),
     status: 'active', // 'active' | 'resolved' | 'cancelled'
     isManual: false,
     creator: shouldIncludeCreator ? { name: creatorName || 'Player 1', jid: creatorJid || null } : null,
