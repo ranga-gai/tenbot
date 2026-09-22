@@ -414,6 +414,19 @@ const CLAUDE_TOOLS = [
         }
       }
     }
+  },
+  {
+    name: 'trigger_reminder',
+    description: 'Manually sends a match reminder notification for a specific active poll or all active match polls in this chat. Any group member can issue this.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        pollId: {
+          type: 'string',
+          description: 'Optional specific poll ID to send reminder for. If omitted, sends reminders for all active match polls in this chat.'
+        }
+      }
+    }
   }
 ];
 
@@ -1445,6 +1458,127 @@ async function handleResumePoll(sock, chatId, sender, senderJid, specificPollId 
  * Pauses reminders for a specific poll or for all active polls in the chat.
  * Any group member can run this command.
  */
+/**
+ * Helper to build and send a reminder message for an active poll.
+ */
+async function sendPollReminder(sock, pollId, pollState, isManualTrigger = false) {
+  if (!sock || !pollState || pollState.status !== 'active') return false;
+
+  const now = Date.now();
+  const mePn = jidNormalizedUser(sock.user?.id || sock.authState?.creds?.me?.id || '');
+
+  let hoursRemaining = 0;
+  if (pollState.playAt) {
+    const playAtMs = new Date(pollState.playAt).getTime();
+    if (!Number.isNaN(playAtMs)) {
+      hoursRemaining = Math.max(0, (playAtMs - now) / (60 * 60 * 1000));
+    }
+  }
+
+  const isOptIn = pollState.type === 'opt_in' || pollState.options?.some((o) => /^yes$/i.test(o));
+
+  // Determine spots and voters
+  let totalSpots = 0;
+  let neededVotes = 0;
+  let openSpots = 0;
+  let yesCount = 0;
+
+  const { interestedPlayers, aggregated } = getPollVoters(pollId, pollState, mePn);
+  let players = [];
+
+  if (pollState.isManual) {
+    const options = pollState.options || [];
+    const firstSlotNum = getFirstSlotNumber(options);
+    const leadingCreatorSpots = (firstSlotNum && firstSlotNum > 1) ? (firstSlotNum - 1) : 0;
+    neededVotes = options.length > 0 ? options.length : (pollState.size || 4);
+    totalSpots = leadingCreatorSpots + neededVotes;
+
+    const filledVotes = aggregated && aggregated.length > 0
+      ? aggregated.filter((o) => o.voters.length > 0).length
+      : (interestedPlayers ? interestedPlayers.length : (pollState.voteBuffer ? pollState.voteBuffer.size : 0));
+    openSpots = Math.max(0, neededVotes - filledVotes);
+
+    if (isOptIn) {
+      yesCount = interestedPlayers.length;
+    } else {
+      if (openSpots <= 0 && !isManualTrigger) return false;
+    }
+
+    const { players: resolvedPlayers } = resolveManualPollPlayers(pollState, interestedPlayers);
+    players = resolvedPlayers;
+  } else if (isOptIn) {
+    yesCount = interestedPlayers.length;
+    players = [...interestedPlayers];
+    if (pollState.creator?.name && !players.includes(pollState.creator.name)) {
+      players.unshift(pollState.creator.name);
+    }
+  } else {
+    totalSpots = pollState.size || (pollState.options ? pollState.options.length : 4);
+    neededVotes = pollState.creator ? totalSpots - 1 : totalSpots;
+    const filledVotes = aggregated && aggregated.length > 0
+      ? aggregated.filter((o) => o.voters.length > 0).length
+      : (interestedPlayers ? interestedPlayers.length : (pollState.voteBuffer ? pollState.voteBuffer.size : 0));
+    openSpots = Math.max(0, neededVotes - filledVotes);
+
+    if (openSpots <= 0 && !isManualTrigger) return false;
+
+    players = [...interestedPlayers];
+    if (pollState.creator?.name && !players.includes(pollState.creator.name)) {
+      players.unshift(pollState.creator.name);
+    }
+  }
+
+  const playerList = players.length > 0 ? players.join(', ') : 'None yet';
+
+  const targetH = POWERS_OF_2_REMINDER_HOURS.find((h) => hoursRemaining <= h) || (hoursRemaining || 1);
+  const reminderText = buildPollReminderText(targetH, pollState, openSpots, totalSpots, playerList, isOptIn, yesCount, hoursRemaining);
+
+  console.log(`[poll] Sending reminder for poll ${pollId} ("${pollState.name || pollState.when}") in ${pollState.remoteJid}`);
+  await sock.sendMessage(pollState.remoteJid, { text: reminderText });
+
+  pollState.reminderCount = (pollState.reminderCount || 0) + 1;
+  persistPolls();
+  return true;
+}
+
+/**
+ * Manually sends a reminder for a specific poll or all active polls in the chat.
+ */
+async function handleTriggerReminder(sock, chatId, sender, specificPollId = null) {
+  const targetPolls = [];
+  if (specificPollId) {
+    if (activePolls.has(specificPollId)) {
+      const p = activePolls.get(specificPollId);
+      if (p.remoteJid === chatId && p.status === 'active') {
+        targetPolls.push([specificPollId, p]);
+      }
+    }
+  } else {
+    for (const [id, state] of activePolls.entries()) {
+      if (state.remoteJid === chatId && state.status === 'active') {
+        targetPolls.push([id, state]);
+      }
+    }
+  }
+
+  if (targetPolls.length === 0) {
+    return 'No active match polls found in this chat to send reminders for.';
+  }
+
+  let sentCount = 0;
+  for (const [id, state] of targetPolls) {
+    try {
+      const sent = await sendPollReminder(sock, id, state, true);
+      if (sent) sentCount++;
+    } catch (err) {
+      console.error(`[poll] Failed to send manual reminder for poll ${id}:`, err.message);
+    }
+  }
+
+  console.log(`[reminders] Manual reminder triggered for ${sentCount}/${targetPolls.length} poll(s) in ${chatId} by ${sender}`);
+  return null;
+}
+
 async function handlePauseReminders(sock, chatId, sender, specificPollId = null) {
   const targetPolls = [];
   if (specificPollId) {
@@ -1706,6 +1840,7 @@ async function checkAndSendPollReminders(sock) {
     for (const [pollId, pollState] of activePolls.entries()) {
       if (pollState.status !== 'active') continue;
       if (pollState.remindersPaused) continue; // reminders paused by group member
+      if ((pollState.reminderCount || 0) >= 3) continue; // limit maximum number of reminders to 3
       if (!pollState.playAt) continue;
 
       const playAtMs = new Date(pollState.playAt).getTime();
@@ -1751,71 +1886,17 @@ async function checkAndSendPollReminders(sock) {
         }
       }
 
-      // Determine spots and voters
-      let totalSpots = 0;
-      let neededVotes = 0;
-      let openSpots = 0;
-      let yesCount = 0;
-
-      const { interestedPlayers, aggregated } = getPollVoters(pollId, pollState, mePn);
-      let players = [];
-
-      if (pollState.isManual) {
-        const options = pollState.options || [];
-        const firstSlotNum = getFirstSlotNumber(options);
-        const leadingCreatorSpots = (firstSlotNum && firstSlotNum > 1) ? (firstSlotNum - 1) : 0;
-        neededVotes = options.length > 0 ? options.length : (pollState.size || 4);
-        totalSpots = leadingCreatorSpots + neededVotes;
-
-        const filledVotes = aggregated && aggregated.length > 0
-          ? aggregated.filter((o) => o.voters.length > 0).length
-          : (interestedPlayers ? interestedPlayers.length : (pollState.voteBuffer ? pollState.voteBuffer.size : 0));
-        openSpots = Math.max(0, neededVotes - filledVotes);
-
-        if (isOptIn) {
-          yesCount = interestedPlayers.length;
-        } else {
-          if (openSpots <= 0) continue; // all manual slots filled
-        }
-
-        const { players: resolvedPlayers } = resolveManualPollPlayers(pollState, interestedPlayers);
-        players = resolvedPlayers;
-      } else if (isOptIn) {
-        yesCount = interestedPlayers.length;
-        players = [...interestedPlayers];
-        if (pollState.creator?.name && !players.includes(pollState.creator.name)) {
-          players.unshift(pollState.creator.name);
-        }
-      } else {
-        totalSpots = pollState.size || (pollState.options ? pollState.options.length : 4);
-        neededVotes = pollState.creator ? totalSpots - 1 : totalSpots;
-        const filledVotes = aggregated && aggregated.length > 0
-          ? aggregated.filter((o) => o.voters.length > 0).length
-          : (interestedPlayers ? interestedPlayers.length : (pollState.voteBuffer ? pollState.voteBuffer.size : 0));
-        openSpots = Math.max(0, neededVotes - filledVotes);
-
-        if (openSpots <= 0) continue; // fixed spot poll is already full
-
-        players = [...interestedPlayers];
-        if (pollState.creator?.name && !players.includes(pollState.creator.name)) {
-          players.unshift(pollState.creator.name);
-        }
-      }
-
-      const playerList = players.length > 0 ? players.join(', ') : 'None yet';
-
-      const reminderText = buildPollReminderText(targetH, pollState, openSpots, totalSpots, playerList, isOptIn, yesCount, hoursRemaining);
-      console.log(`[poll] Sending ${targetH < 1 ? "10m" : targetH + "h"} reminder for poll ${pollId} ("${pollState.name || pollState.when}") in ${pollState.remoteJid}`);
-
       try {
-        await sock.sendMessage(pollState.remoteJid, { text: reminderText });
-        // Mark this bucket and all LARGER buckets as sent ONLY AFTER successfully sending message
-        for (const h of POWERS_OF_2_REMINDER_HOURS) {
-          if (h >= targetH && !pollState.sentReminders.includes(h)) {
-            pollState.sentReminders.push(h);
+        const sent = await sendPollReminder(sock, pollId, pollState, false);
+        if (sent) {
+          // Mark this bucket and all LARGER buckets as sent ONLY AFTER successfully sending message
+          for (const h of POWERS_OF_2_REMINDER_HOURS) {
+            if (h >= targetH && !pollState.sentReminders.includes(h)) {
+              pollState.sentReminders.push(h);
+            }
           }
+          persistPolls();
         }
-        persistPolls();
       } catch (sendErr) {
         console.error(`[poll] Failed to send reminder for poll ${pollId}:`, sendErr.message);
       }
@@ -2363,6 +2444,10 @@ async function executeTool(sock, chatId, sender, toolUse, msg) {
   if (name === 'resume_reminders') {
     return await handleResumeReminders(sock, chatId, sender, input.pollId || null);
   }
+  if (name === 'trigger_reminder' || name === 'send_reminder') {
+    const res = await handleTriggerReminder(sock, chatId, sender, input.pollId || null);
+    return res || 'Reminder triggered and sent to group.';
+  }
   if (name === 'cancel_poll') {
     let targetPollId = input.pollId || null;
     if (!targetPollId) {
@@ -2671,6 +2756,12 @@ async function getResponse(sock, text, chatId, sender, msg) {
     return await handleResumeReminders(sock, chatId, sender, specificPollId);
   }
 
+  if (lower.startsWith('!sendreminder') || lower.startsWith('!remindpoll') || lower === '!remind' || lower === '!sendreminders' || lower === '!triggerreminder') {
+    const parts = text.split(/\s+/);
+    const specificPollId = parts.length > 1 ? parts[1].trim() : null;
+    return await handleTriggerReminder(sock, chatId, sender, specificPollId);
+  }
+
   if (lower === '!cancelpoll' || lower === '!deletepoll') {
     let targetPollId = null;
     for (const [pollId, pollState] of [...activePolls.entries()].reverse()) {
@@ -2827,6 +2918,7 @@ function helpText() {
     '!resumepoll (or !reopenpoll) – resume voting and reminders for a stopped poll (creator or admin only)',
     '!pausereminders [pollId] (or !pausereminder) – pause upcoming match reminders for active poll(s)',
     '!resumereminders [pollId] (or !resumereminder) – resume upcoming match reminders for active poll(s)',
+    '!remind [pollId] (or !sendreminder, !remindpoll) – manually trigger a reminder for active match poll(s)',
     '!cancelpoll (or !deletepoll) – cancel and delete the active poll from WhatsApp (creator or admin only)',
     '!pollstatus – debug: show raw vote count and voters for active match poll(s) in this chat',
     '!allpolls (or !pollstatus all) – (Admin only) debug: show detailed status of all tracked polls',
@@ -3926,9 +4018,10 @@ function pollStatusText(chatId = null, opts = {}) {
     const remindersStr = Array.isArray(pollState.sentReminders) && pollState.sentReminders.length > 0
       ? pollState.sentReminders.map((h) => h < 1 ? `${Math.round(h * 60)}m` : `${h}h`).join(', ')
       : '(none yet)';
+    const countStr = `(${pollState.reminderCount || 0}/3 sent)`;
     const remindersLine = pollState.remindersPaused
-      ? `Reminders: PAUSED (sent so far: [${remindersStr}])`
-      : `Sent reminders: [${remindersStr}]`;
+      ? `Reminders: PAUSED (sent so far: [${remindersStr}] ${countStr})`
+      : `Sent reminders: [${remindersStr}] ${countStr}`;
 
     if (pollState.isManual) {
       const { aggregated, interestedPlayers } = getPollVoters(pollId, pollState, mePn);
