@@ -860,8 +860,9 @@ function parsePollCreationText(text) {
 /**
  * Handles direct poll creation from parsed message parameters without calling the LLM.
  */
-async function handleDirectPollCreation(sock, chatId, sender, msg, parsed) {
+async function handleDirectPollCreation(sock, chatId, sender, msg, parsed, opts = {}) {
   const { size, when, dayWord, timeWord, includeCreator, cancelExisting } = parsed;
+  const isCommand = opts.isCommand === true;
   const creatorName = sender !== 'Someone' ? sender : (msg?.key?.participant ? nameFor(msg.key.participant) : 'Player 1');
   const creatorJid = msg?.key?.participant || msg?.key?.remoteJid || null;
   const targetChatId = chatId.endsWith('@g.us') ? chatId : (await getTargetGroupJid(sock) || chatId);
@@ -877,7 +878,8 @@ async function handleDirectPollCreation(sock, chatId, sender, msg, parsed) {
     creatorJid,
     includeCreator,
     null,
-    cancelExisting
+    cancelExisting,
+    isCommand
   );
 
   if (res?.err) {
@@ -2376,7 +2378,7 @@ async function executeTool(sock, chatId, sender, toolUse, msg) {
     const creatorJid = msg?.key?.participant || msg?.key?.remoteJid || null;
     const targetChatId = chatId.endsWith('@g.us') ? chatId : (await getTargetGroupJid(sock) || chatId);
 
-    const res = await createMatchPoll(sock, targetChatId, size, when, dayWord, timeWord, creatorName, creatorJid, includeCreator, replacePollId, cancelExisting);
+    const res = await createMatchPoll(sock, targetChatId, size, when, dayWord, timeWord, creatorName, creatorJid, includeCreator, replacePollId, cancelExisting, false);
     if (res?.err) {
       return `Could not create poll: ${res.err}`;
     }
@@ -2750,7 +2752,7 @@ async function getResponse(sock, text, chatId, sender, msg) {
   if (/^!(?:createpoll|poll|makepoll|newpoll)\b/i.test(text)) {
     const parsed = parsePollCreationText(text);
     if (parsed) {
-      return await handleDirectPollCreation(sock, chatId, sender, msg, parsed);
+      return await handleDirectPollCreation(sock, chatId, sender, msg, parsed, { isCommand: true });
     }
   }
 
@@ -2896,7 +2898,7 @@ async function getResponse(sock, text, chatId, sender, msg) {
   // --- Direct Poll Creation Request (handled directly without LLM) ---
   const directPollParsed = parsePollCreationText(promptText);
   if (directPollParsed) {
-    return await handleDirectPollCreation(sock, chatId, sender, msg, directPollParsed);
+    return await handleDirectPollCreation(sock, chatId, sender, msg, directPollParsed, { isCommand: false });
   }
 
   // --- Free-form score reports ---
@@ -3320,7 +3322,7 @@ function formatRatings() {
  *   "Yes" and "No". The bot then waits for a user prompt to generate matchups from Yes voters.
  * - If replacePollId or cancelExisting is specified, deletes the older poll from WhatsApp.
  */
-async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWord = null, timeWord = null, creatorName = null, creatorJid = null, includeCreator = true, replacePollId = null, cancelExisting = false) {
+async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWord = null, timeWord = null, creatorName = null, creatorJid = null, includeCreator = true, replacePollId = null, cancelExisting = false, isCommand = false) {
   const isOptIn = !size;
 
   if (size !== null && size !== undefined) {
@@ -3474,8 +3476,9 @@ async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWor
     when: resolvedWhen || null,
     playAt: playAt.toISOString(),
     createdAt: new Date().toISOString(),
-    status: 'active', // 'active' | 'resolved' | 'cancelled'
+    status: 'active', // 'active' | 'filled' | 'resolved' | 'cancelled' | 'stopped' | 'expired'
     isManual: false,
+    isCommand: Boolean(isCommand),
     creator: (shouldIncludeCreator || leadingVirtualCount > 0) ? { name: creatorName || 'Player 1', jid: creatorJid || null } : null,
     lastConflictSignature: null,
     voteBuffer: new Map(), // voterJid -> raw pollUpdate entry
@@ -3748,7 +3751,7 @@ async function processPollVoteEvent(sock, pollMessageKey, rawPollUpdates) {
     return; // don't generate matchups while there's a conflict
   }
 
-  if (pollState.status !== 'active') return;
+  if (pollState.status !== 'active' && pollState.status !== 'filled') return;
 
   if (filled.length === neededVotes) {
     // Build the player list in slot order.
@@ -3767,11 +3770,24 @@ async function processPollVoteEvent(sock, pollMessageKey, rawPollUpdates) {
       players.push(voterJid ? nameFor(voterJid) : opt);
     }
 
+    // If created by direct command (!createpoll / !poll), do NOT auto-create matchups.
+    // Set status to 'filled' and wait for explicit matchup request (!matchups / @tenbot matchups).
+    if (pollState.isCommand) {
+      if (pollState.status !== 'filled') {
+        pollState.status = 'filled';
+        pollState.lastPlayers = players;
+        persistPolls();
+        console.log(`[poll] Command-created poll ${pollId} filled (${players.length} players: ${players.join(', ')}). Status set to filled; waiting for matchup request.`);
+      }
+      return;
+    }
+
+    // For polls created with @tenbot prompt, auto-create matchups immediately
     pollState.status = 'resolved';
     pollState.lastPlayers = players;
     persistPolls();
 
-    console.log(`[poll] Poll ${pollId} filled -- posting matchups for: ${players.join(', ')}`);
+    console.log(`[poll] Prompt-created poll ${pollId} filled -- auto-posting matchups for: ${players.join(', ')}`);
 
     await ratings.ensureRated(players);
     const schedule = generateMatchups(players);
@@ -3782,6 +3798,9 @@ async function processPollVoteEvent(sock, pollMessageKey, rawPollUpdates) {
 
     // Kept so "we won" reports can work out who the opponents were.
     pollState.lastSchedule = summarizeSchedule(schedule);
+    persistPolls();
+  } else if (pollState.status === 'filled') {
+    pollState.status = 'active';
     persistPolls();
   }
 }
