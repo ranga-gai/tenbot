@@ -1677,14 +1677,23 @@ function cleanupExpiredPolls() {
   const now = Date.now();
   const graceMs = POLL_EXPIRY_GRACE_DAYS * 24 * 60 * 60 * 1000; // Keep polls for 2 weeks (14 days)
   const removed = [];
+  let statusChanged = false;
 
   for (const [pollId, pollState] of activePolls.entries()) {
     if (!pollState.playAt) continue; // no play time recorded -- never auto-expire it
     const playAtMs = new Date(pollState.playAt).getTime();
     if (Number.isNaN(playAtMs)) continue;
 
+    // 1. If play time has passed and poll is still 'active' or 'filled', mark status as 'expired'
+    if (now >= playAtMs && (pollState.status === 'active' || pollState.status === 'filled')) {
+      pollState.status = 'expired';
+      statusChanged = true;
+      console.log(`[poll] Match play time passed for poll ${pollId} ("${pollState.name || pollState.when}"): status automatically set to expired.`);
+    }
+
+    // 2. If exceeded 2-week retention period after play time, delete from storage
     if (now > playAtMs + graceMs) {
-      console.log(`[poll] Expiring poll ${pollId} ("${pollState.name || pollState.when}"): playAt=${pollState.playAt}, now=${new Date(now).toISOString()} (exceeded 2-week retention)`);
+      console.log(`[poll] Deleting old poll ${pollId} ("${pollState.name || pollState.when}"): playAt=${pollState.playAt}, now=${new Date(now).toISOString()} (exceeded 2-week retention)`);
       activePolls.delete(pollId);
       for (const key of messageStore.keys()) {
         if (key.endsWith(`:${pollId}`)) {
@@ -1698,9 +1707,11 @@ function cleanupExpiredPolls() {
     }
   }
 
-  if (removed.length > 0) {
+  if (removed.length > 0 || statusChanged) {
     persistPolls();
-    console.log(`[poll] Cleaned up ${removed.length} expired/completed poll(s) older than 2 weeks: ${removed.join(', ')}`);
+    if (removed.length > 0) {
+      console.log(`[poll] Cleaned up ${removed.length} expired/completed poll(s) older than 2 weeks: ${removed.join(', ')}`);
+    }
   }
   return removed;
 }
@@ -1860,7 +1871,14 @@ async function checkAndSendPollReminders(sock) {
       const playAtMs = new Date(pollState.playAt).getTime();
       if (Number.isNaN(playAtMs)) continue;
       const diffMs = playAtMs - now;
-      if (diffMs <= 0) continue; // match time has passed
+      if (diffMs <= 0) {
+        if (pollState.status === 'active' || pollState.status === 'filled') {
+          pollState.status = 'expired';
+          persistPolls();
+          console.log(`[poll] Match play time passed for poll ${pollId}: status automatically set to expired.`);
+        }
+        continue; // match time has passed
+      }
 
       const hoursRemaining = diffMs / (60 * 60 * 1000);
       const isOptIn = pollState.type === 'opt_in' || pollState.options?.some((o) => /^yes$/i.test(o));
@@ -2818,7 +2836,11 @@ async function getResponse(sock, text, chatId, sender, msg) {
       : 'Nothing to clean up yet -- no polls have passed their play time + grace period.';
   }
 
-  if (lower === '!upcomingpolls' || lower === '!upcomingpollstatus' || lower === '!upcoming' || lower === '!activepolls' || lower === '!pollstatus upcoming' || lower === '!pollstatus -u') {
+  if (lower === '!activepolls' || lower === '!activepollstatus' || lower === '!active' || lower === '!pollstatus active' || lower === '!pollstatus -act') {
+    return pollStatusText(null, { activeOnly: true });
+  }
+
+  if (lower === '!upcomingpolls' || lower === '!upcomingpollstatus' || lower === '!upcoming' || lower === '!pollstatus upcoming' || lower === '!pollstatus -u') {
     return pollStatusText(null, { upcomingOnly: true });
   }
 
@@ -2936,6 +2958,7 @@ function helpText() {
     '!cancelpoll (or !deletepoll) – cancel and delete the active poll from WhatsApp (creator or admin only)',
     '!pollstatus – debug: show raw vote count and voters for active match poll(s) in this chat',
     '!allpolls (or !pollstatus all) – (Admin only) debug: show detailed status of all tracked polls',
+    '!activepolls (or !active, !pollstatus active) – list match polls with status active or filled',
     '!upcomingpolls (or !upcoming, !pollstatus upcoming) – list all match polls whose play time has not passed yet',
     '!cleanuppolls – (Admin only) debug: force a sweep that deletes expired/completed polls now',
     '!reset – (Admin only) clear the bot\'s conversation memory',
@@ -3963,6 +3986,7 @@ function nameFor(jid) {
 function pollStatusText(chatId = null, opts = {}) {
   const isAll = !chatId;
   const upcomingOnly = opts.upcomingOnly === true;
+  const activeOnly = opts.activeOnly === true;
   const now = Date.now();
 
   let chatPolls = [...activePolls.entries()];
@@ -3971,7 +3995,9 @@ function pollStatusText(chatId = null, opts = {}) {
     chatPolls = chatPolls.filter(([, state]) => state.remoteJid === chatId);
   }
 
-  if (upcomingOnly) {
+  if (activeOnly) {
+    chatPolls = chatPolls.filter(([, state]) => state.status === 'active' || state.status === 'filled');
+  } else if (upcomingOnly) {
     chatPolls = chatPolls.filter(([, state]) => {
       if (state.status === 'cancelled') return false;
       if (!state.playAt) return true;
@@ -3981,6 +4007,9 @@ function pollStatusText(chatId = null, opts = {}) {
   }
 
   if (chatPolls.length === 0) {
+    if (activeOnly) {
+      return '🎾 No active or filled match polls on record.';
+    }
     if (upcomingOnly) {
       return '📅 No upcoming match polls on record whose play time has not passed yet.';
     }
@@ -4172,7 +4201,7 @@ function buildContextBlurb(chatId) {
         if (pollState.status === 'cancelled') {
           return `[Poll ${id}] a user-created manual match poll "${pollState.name || 'Match Poll'}" was cancelled`;
         } else {
-          const statusNote = pollState.status === 'resolved' ? 'status: resolved/drawn (can generate matchups again / rematch)' : (pollState.status === 'filled' ? 'status: filled (all voting slots filled, waiting for matchup request)' : (pollState.status === 'stopped' ? 'status: stopped (voting stopped, call generate_matchups when ready)' : 'status: active'));
+          const statusNote = pollState.status === 'resolved' ? 'status: resolved/drawn (can generate matchups again / rematch)' : (pollState.status === 'filled' ? 'status: filled (all voting slots filled, waiting for matchup request)' : (pollState.status === 'stopped' ? 'status: stopped (voting stopped, call generate_matchups when ready)' : (pollState.status === 'expired' ? 'status: expired (play time passed, can still generate matchups if requested)' : 'status: active')));
           return `[Poll ${id}] a user-created manual match poll "${pollState.name || 'Match Poll'}" (created by ${creatorName}) is tracked with ${interestedPlayers.length} vote(s): [${optionDetails.join('; ') || 'no votes yet'}]. Players currently in/playing (${playingPlayers.length}): ${playingPlayers.join(', ')}${additionSuffix}. (${statusNote} -- when asked to generate matchups or draw, call generate_matchups)`;
         }
       }
@@ -4200,7 +4229,7 @@ function buildContextBlurb(chatId) {
         if (pollState.status === 'cancelled') {
           return `[Poll ${id}] a Yes/No opt-in poll${whenSuffix} was cancelled`;
         } else {
-          const statusNote = pollState.status === 'resolved' ? 'status: resolved/drawn (can rematch)' : (pollState.status === 'stopped' ? 'status: stopped (voting stopped)' : 'status: active');
+          const statusNote = pollState.status === 'resolved' ? 'status: resolved/drawn (can rematch)' : (pollState.status === 'stopped' ? 'status: stopped (voting stopped)' : (pollState.status === 'expired' ? 'status: expired (play time passed, can still generate matchups if requested)' : 'status: active'));
           return `[Poll ${id}] a Yes/No opt-in poll${whenSuffix} is tracked with ${yesCount} "Yes" vote(s) (${yesNames.join(', ') || 'none yet'}) and ${noCount} "No" vote(s). (${statusNote})`;
         }
       }
@@ -4211,7 +4240,7 @@ function buildContextBlurb(chatId) {
       if (pollState.status === 'cancelled') {
         return `[Poll ${id}] a ${pollState.size}-spot poll${whenSuffix} was cancelled`;
       } else {
-        const statusNote = pollState.status === 'resolved' ? 'status: resolved/drawn (can rematch)' : 'status: active';
+        const statusNote = pollState.status === 'resolved' ? 'status: resolved/drawn (can rematch)' : (pollState.status === 'stopped' ? 'status: stopped (voting stopped)' : (pollState.status === 'expired' ? 'status: expired (play time passed, can still generate matchups if requested)' : 'status: active'));
         return `[Poll ${id}] a ${pollState.size}-spot poll${whenSuffix}${creatorSuffix} is tracked with ${filledCount}/${neededVotes} votes. (${statusNote})`;
       }
     });
