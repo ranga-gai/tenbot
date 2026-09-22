@@ -2232,7 +2232,7 @@ async function executeTool(sock, chatId, sender, toolUse, msg) {
  * Records a manually published lineup in the chat into the active poll state
  * and pair history so score reports and partner memory work seamlessly.
  */
-async function handleManualLineup(sock, chatId, sender, lineup) {
+async function handleManualLineup(sock, chatId, sender, lineup, msg) {
   let targetPollId = null;
   let targetPollState = null;
 
@@ -2257,13 +2257,27 @@ async function handleManualLineup(sock, chatId, sender, lineup) {
     await ratings.ensureRated(lineup.players);
     persistPolls();
     console.log(`[lineup] Recorded manual lineup for poll ${targetPollId} in ${chatId} (${lineup.players.length} players: ${lineup.players.join(', ')})`);
-    return `📋 Got it! Recorded lineup for ${lineup.players.length} players (${lineup.players.join(', ')}). Results can be reported anytime!`;
   } else {
     pairHistory.recordDraw(`manual_${Date.now()}`, lineup);
     await ratings.ensureRated(lineup.players);
     console.log(`[lineup] Recorded standalone manual lineup in ${chatId} (${lineup.players.length} players: ${lineup.players.join(', ')})`);
-    return `📋 Got it! Recorded lineup for ${lineup.players.length} players (${lineup.players.join(', ')}). Results can be reported anytime!`;
   }
+
+  if (msg?.key && sock) {
+    try {
+      await sock.sendMessage(chatId, {
+        react: {
+          text: '🤖',
+          key: msg.key
+        }
+      });
+      console.log(`[lineup] Added 🤖 reaction to lineup message in ${chatId}`);
+    } catch (err) {
+      console.error(`[lineup] Failed to add 🤖 reaction:`, err.message);
+    }
+  }
+
+  return null;
 }
 
 async function getResponse(sock, text, chatId, sender, msg) {
@@ -2448,7 +2462,7 @@ async function getResponse(sock, text, chatId, sender, msg) {
   // --- Check for manually published lineup ---
   const manualLineup = parseLineup(text, knownPlayers(chatId));
   if (manualLineup) {
-    return await handleManualLineup(sock, chatId, sender, manualLineup);
+    return await handleManualLineup(sock, chatId, sender, manualLineup, msg);
   }
 
   // --- Direct Command Poll creation (!createpoll / !poll / !makepoll / !newpoll) ---
