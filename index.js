@@ -1279,7 +1279,7 @@ async function checkCourtCancellationWithLLM(text, sender, chatId) {
   if (!process.env.ANTHROPIC_API_KEY) return null;
 
   const chatPolls = [...activePolls.entries()].filter(([, state]) =>
-    state.remoteJid === chatId && (state.status === 'active' || state.status === 'filled')
+    state.remoteJid === chatId && state.status === 'active'
   );
   if (chatPolls.length === 0) return null;
 
@@ -1292,12 +1292,12 @@ Active Match Polls in this chat:
 ${chatPolls.map(([id, p]) => `- Poll ID: "${id}", Title: "${p.name || p.when}", Scheduled: "${p.when || p.playAt}", Status: "${p.status}", Spots: ${p.size || 'Opt-in'}`).join('\n')}
 
 Task:
-Analyze if the sender is announcing or stating that a tennis court (or court session/reservation) is being cancelled or released because there are not enough votes or a lack of players in a match poll (e.g. "Cancelling 2nd court due to lack of players", "Cancelled the 8:30am court since we only have 2", "I am cancelling the court because we don't have 4", "Releasing court because poll didn't fill", etc.).
+Analyze if the sender is announcing or stating that a tennis court (or court session/reservation) is being cancelled or released (e.g. "Cancelled the court", "Cancelling 2nd court due to lack of players", "Cancelled the 8:30am court since we only have 2", "I am cancelling the court because we don't have 4", "Releasing court because poll didn't fill", etc.).
 Note: If they are simply asking a question, talking about general court availability, cancelling their own individual participation (e.g. "I have to cancel today"), or chatting about unrelated topics, set isCourtCancelledDueToLackOfVotes to false.
 
 Respond ONLY with a JSON object in this exact format, with no extra text or markdown:
 {
-  "isCourtCancelledDueToLackOfVotes": boolean,
+  "isCourtCancelled": boolean,
   "pollId": string or null,
   "reason": string
 }`;
@@ -1408,6 +1408,9 @@ async function handleResumePoll(sock, chatId, sender, senderJid, specificPollId 
   }
   if (targetPollState.status === 'cancelled') {
     return 'This poll was cancelled and cannot be resumed.';
+  }
+  if (targetPollState.status === 'expired') {
+    return `Poll "${targetPollState.name || targetPollState.when || targetPollId}" has expired (scheduled match play time has passed).`;
   }
 
   const isCreator = targetPollState.creator ? isSameUser(targetPollState.creator.jid, senderJid, targetPollState.creator.name, sender) : false;
@@ -1685,8 +1688,8 @@ function cleanupExpiredPolls() {
     const playAtMs = new Date(pollState.playAt).getTime();
     if (Number.isNaN(playAtMs)) continue;
 
-    // 1. If play time has passed and poll is still 'active' or 'filled', mark status as 'expired'
-    if (now >= playAtMs && (pollState.status === 'active' || pollState.status === 'filled')) {
+    // 1. If play time has passed and poll is still 'active', 'filled', or 'stopped', mark status as 'expired'
+    if (now >= playAtMs && (pollState.status === 'active' || pollState.status === 'filled' || pollState.status === 'stopped')) {
       pollState.status = 'expired';
       statusChanged = true;
       console.log(`[poll] Match play time passed for poll ${pollId} ("${pollState.name || pollState.when}"): status automatically set to expired.`);
@@ -1873,7 +1876,7 @@ async function checkAndSendPollReminders(sock) {
       if (Number.isNaN(playAtMs)) continue;
       const diffMs = playAtMs - now;
       if (diffMs <= 0) {
-        if (pollState.status === 'active' || pollState.status === 'filled') {
+        if (pollState.status === 'active' || pollState.status === 'filled' || pollState.status === 'stopped') {
           pollState.status = 'expired';
           persistPolls();
           console.log(`[poll] Match play time passed for poll ${pollId}: status automatically set to expired.`);
@@ -2857,7 +2860,7 @@ async function getResponse(sock, text, chatId, sender, msg) {
   const hasCourtWord = /\bcourts?\b/i.test(text);
   if (hasCancelWord && hasCourtWord) {
     const cancelAnalysis = await checkCourtCancellationWithLLM(text, sender, chatId);
-    if (cancelAnalysis && cancelAnalysis.isCourtCancelledDueToLackOfVotes) {
+    if (cancelAnalysis && cancelAnalysis.isCourtCancelled) {
       let targetPollId = cancelAnalysis.pollId;
       if (!targetPollId || !activePolls.has(targetPollId)) {
         for (const [pollId, pollState] of [...activePolls.entries()].reverse()) {
@@ -2874,8 +2877,22 @@ async function getResponse(sock, text, chatId, sender, msg) {
         targetPollState.status = 'stopped';
         persistPolls();
         const pollName = targetPollState.name || targetPollState.when || 'Match Poll';
-        console.log(`[poll] LLM detected court cancellation due to insufficient votes ("${cancelAnalysis.reason}"). Poll ${targetPollId} ("${pollName}") status set to stopped.`);
-        return `🛑 Detected court cancellation due to insufficient votes (${cancelAnalysis.reason || 'not enough players'}). Voting and reminders for "${pollName}" have been stopped. Matchups can still be generated anytime with "!matchups".`;
+        console.log(`[poll] LLM detected court cancellation due to: "${cancelAnalysis.reason}". Poll ${targetPollId} ("${pollName}") status set to stopped.`);
+
+        if (msg?.key && sock) {
+          try {
+            await sock.sendMessage(chatId, {
+              react: {
+                text: '🤖',
+                key: msg.key
+              }
+            });
+            console.log(`[poll] Added 🤖 reaction to court cancellation message in ${chatId}`);
+          } catch (err) {
+            console.error('[poll] Failed to add 🤖 reaction:', err.message);
+          }
+        }
+        return null;
       }
     }
   }
@@ -2953,7 +2970,7 @@ function helpText() {
     '!cancelpoll (or !deletepoll) – cancel and delete the active poll from WhatsApp (creator or admin only)',
     '!pollstatus – debug: show raw vote count and voters for active match poll(s) in this chat',
     '!allpolls (or !pollstatus all) – (Admin only) debug: show detailed status of all tracked polls',
-    '!activepolls (or !active, !pollstatus active) – list match polls with status active or filled',
+    '!activepolls (or !active, !pollstatus active) – list match polls with status active, filled, or stopped',
     '!upcomingpolls (or !upcoming, !pollstatus upcoming) – list all match polls whose play time has not passed yet',
     '!cleanuppolls – (Admin only) debug: force a sweep that deletes expired/completed polls now',
     '!reset – (Admin only) clear the bot\'s conversation memory',
@@ -4045,7 +4062,7 @@ function pollStatusText(chatId = null, opts = {}) {
   }
 
   if (activeOnly) {
-    chatPolls = chatPolls.filter(([, state]) => state.status === 'active' || state.status === 'filled');
+    chatPolls = chatPolls.filter(([, state]) => state.status === 'active' || state.status === 'filled' || state.status === 'stopped');
   } else if (upcomingOnly) {
     chatPolls = chatPolls.filter(([, state]) => {
       if (state.status === 'cancelled') return false;
@@ -4057,7 +4074,7 @@ function pollStatusText(chatId = null, opts = {}) {
 
   if (chatPolls.length === 0) {
     if (activeOnly) {
-      return '🎾 No active or filled match polls on record.';
+      return '🎾 No active, filled, or stopped match polls on record.';
     }
     if (upcomingOnly) {
       return '📅 No upcoming match polls on record whose play time has not passed yet.';
