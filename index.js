@@ -114,11 +114,6 @@ const messageHistory = require('./lib/messageHistory');
 const { resolvePlayDateTime, getSanJoseNow, getSanJoseParts } = require('./lib/pollTime');
 
 // ---- CONFIG ----
-// Set this to the exact group name (subject) you want the bot to listen to.
-// Leave as null to have the bot log every group name/ID it sees, so you can
-// find the right one.
-const TARGET_GROUP_NAME = 'SCVCC Early Morning Tennis Group (that usually plays in the evenings!)';
-//const TARGET_GROUP_NAME = 'Bot-testing';
 
 // Only call the LLM when the bot is directly addressed (recommended for
 // groups, otherwise it'll try to reply to every single message). Structured
@@ -449,6 +444,19 @@ if (!process.env.ANTHROPIC_API_KEY) {
   );
 }
 
+if (!process.env.TARGET_GROUP_NAME) {
+  console.error(
+    '❌  No TARGET_GROUP_NAME found in environment. Copy .env.example to .env');
+  throw new Error('No TARGET_GROUP_NAME found in environment.');
+}
+
+
+// Set this to the exact group name (subject) you want the bot to listen to.
+// Leave as null to have the bot log every group name/ID it sees, so you can
+// find the right one.
+const TARGET_GROUP_NAME = process.env.TARGET_GROUP_NAME;
+
+
 // In-memory conversation history per chat: chatId -> [{role, content}, ...]
 const chatHistories = new Map();
 
@@ -657,7 +665,7 @@ function getFirstSlotNumber(options) {
   if (!options || options.length === 0) return null;
   const firstLabel = String(options[0]).trim();
   const match = firstLabel.match(/^(?:player|spot|slot|court|#|no\.?|num\.?)\s*(\d+)\b/i) ||
-                firstLabel.match(/\b(\d+)\b/);
+    firstLabel.match(/\b(\d+)\b/);
   if (match) {
     const num = parseInt(match[1], 10);
     if (Number.isFinite(num) && num >= 1) return num;
@@ -842,11 +850,11 @@ function parsePollCreationText(text) {
   // Determine size
   let size = null;
   const sizeMatch = textWithoutTime.match(/\b(?:for|size|spots?|players?)\s*[:=]?\s*(\d+)\b/i) ||
-                    textWithoutTime.match(/\b(\d+)\s*(?:spots?|players?|people|courts?)\b/i) ||
-                    textWithoutTime.match(/\bpoll\s+for\s+(\d+)\b/i) ||
-                    textWithoutTime.match(/^!(?:createpoll|poll|makepoll|newpoll)\s+(\d+)\b/i) ||
-                    textWithoutTime.match(/\bcreate\s+(?:a\s+)?(?:match\s+)?poll\s+(\d+)\b/i) ||
-                    textWithoutTime.match(/\b([248]|12|16)\s*(?:players?|spots?)?\b/i);
+    textWithoutTime.match(/\b(\d+)\s*(?:spots?|players?|people|courts?)\b/i) ||
+    textWithoutTime.match(/\bpoll\s+for\s+(\d+)\b/i) ||
+    textWithoutTime.match(/^!(?:createpoll|poll|makepoll|newpoll)\s+(\d+)\b/i) ||
+    textWithoutTime.match(/\bcreate\s+(?:a\s+)?(?:match\s+)?poll\s+(\d+)\b/i) ||
+    textWithoutTime.match(/\b([248]|12|16)\s*(?:players?|spots?)?\b/i);
   if (sizeMatch) {
     size = parseInt(sizeMatch[1], 10);
   } else if (/\bsingles\b/i.test(textWithoutTime)) {
@@ -990,7 +998,7 @@ async function getTargetGroupJid(sock) {
     const groups = await sock.groupFetchAllParticipating();
     for (const [gId, gMeta] of Object.entries(groups)) {
       groupMetadataCache.set(gId, gMeta);
-      if (gMeta.subject === TARGET_GROUP_NAME) {
+      if (gMeta.subject === process.env.TARGET_GROUP_NAME) {
         targetGroupJid = gId;
         return gId;
       }
@@ -2472,32 +2480,32 @@ async function startBot() {
   sock.ev.on('messages.update', async (updates) => {
     try {
       for (const { key, update } of updates) {
-      const remoteJid = key?.remoteJid || update.key?.remoteJid;
-      if (!remoteJid || !remoteJid.endsWith('@g.us')) continue;
-      if (TARGET_GROUP_NAME) {
-        const metadata = await getGroupMetadata(sock, remoteJid);
-        const groupName = metadata?.subject || remoteJid;
-        if (groupName !== TARGET_GROUP_NAME) continue;
-      }
+        const remoteJid = key?.remoteJid || update.key?.remoteJid;
+        if (!remoteJid || !remoteJid.endsWith('@g.us')) continue;
+        if (TARGET_GROUP_NAME) {
+          const metadata = await getGroupMetadata(sock, remoteJid);
+          const groupName = metadata?.subject || remoteJid;
+          if (groupName !== TARGET_GROUP_NAME) continue;
+        }
 
-      // Check if a tracked poll message was revoked/deleted (message set to null)
-      if (update && update.message === null) {
-        const deletedId = key?.id || update.key?.id;
-        if (deletedId && activePolls.has(deletedId)) {
-          handlePollDeleted(remoteJid, deletedId);
+        // Check if a tracked poll message was revoked/deleted (message set to null)
+        if (update && update.message === null) {
+          const deletedId = key?.id || update.key?.id;
+          if (deletedId && activePolls.has(deletedId)) {
+            handlePollDeleted(remoteJid, deletedId);
+          }
+        }
+
+        if (!update.pollUpdates) continue;
+        if (!activePolls.has(key.id)) continue;
+        console.log(`[poll] Vote received via messages.update for poll ${key.id} (${update.pollUpdates.length} entry/entries)`);
+        try {
+          await processPollVoteEvent(sock, key, update.pollUpdates);
+        } catch (err) {
+          console.error('Error handling poll update:', err && err.message ? err.message : err);
+          console.error(err && err.stack ? err.stack : '(no stack trace available)');
         }
       }
-
-      if (!update.pollUpdates) continue;
-      if (!activePolls.has(key.id)) continue;
-      console.log(`[poll] Vote received via messages.update for poll ${key.id} (${update.pollUpdates.length} entry/entries)`);
-      try {
-        await processPollVoteEvent(sock, key, update.pollUpdates);
-      } catch (err) {
-        console.error('Error handling poll update:', err && err.message ? err.message : err);
-        console.error(err && err.stack ? err.stack : '(no stack trace available)');
-      }
-    }
     } catch (err) {
       console.error(`⚠️ [${new Date().toISOString()}] Error in messages.update outer loop:`, err);
     }
@@ -2507,25 +2515,25 @@ async function startBot() {
   sock.ev.on('messages.delete', async (item) => {
     try {
       const jid = item.jid || (Array.isArray(item.keys) && item.keys[0]?.remoteJid);
-    if (jid && jid.endsWith('@g.us') && TARGET_GROUP_NAME) {
-      const metadata = await getGroupMetadata(sock, jid);
-      const groupName = metadata?.subject || jid;
-      if (groupName !== TARGET_GROUP_NAME) return;
-    }
+      if (jid && jid.endsWith('@g.us') && TARGET_GROUP_NAME) {
+        const metadata = await getGroupMetadata(sock, jid);
+        const groupName = metadata?.subject || jid;
+        if (groupName !== TARGET_GROUP_NAME) return;
+      }
 
-    if (item.all && item.jid) {
-      for (const [pollId, pollState] of [...activePolls.entries()]) {
-        if (pollState.remoteJid === item.jid) {
-          handlePollDeleted(item.jid, pollId);
+      if (item.all && item.jid) {
+        for (const [pollId, pollState] of [...activePolls.entries()]) {
+          if (pollState.remoteJid === item.jid) {
+            handlePollDeleted(item.jid, pollId);
+          }
+        }
+      } else if (Array.isArray(item.keys)) {
+        for (const key of item.keys) {
+          if (key?.id && activePolls.has(key.id)) {
+            handlePollDeleted(key.remoteJid, key.id);
+          }
         }
       }
-    } else if (Array.isArray(item.keys)) {
-      for (const key of item.keys) {
-        if (key?.id && activePolls.has(key.id)) {
-          handlePollDeleted(key.remoteJid, key.id);
-        }
-      }
-    }
     } catch (err) {
       console.error(`⚠️ [${new Date().toISOString()}] Error in messages.delete:`, err);
     }
@@ -2567,10 +2575,10 @@ async function handleMessage(sock, msg, groupName) {
 function extractText(message) {
   if (!message) return null;
   const msg = message.ephemeralMessage?.message ||
-              message.viewOnceMessage?.message ||
-              message.viewOnceMessageV2?.message ||
-              message.documentWithCaptionMessage?.message ||
-              message;
+    message.viewOnceMessage?.message ||
+    message.viewOnceMessageV2?.message ||
+    message.documentWithCaptionMessage?.message ||
+    message;
   return (
     msg.conversation ||
     msg.extendedTextMessage?.text ||
@@ -3935,7 +3943,7 @@ async function processPollVoteEvent(sock, pollMessageKey, rawPollUpdates) {
       const votingOptions = aggregated.filter((o) => !/^(no|out|can't play|cannot play)$/i.test(o.name.trim()));
       filledCount = votingOptions.filter((o) => o.voters.length > 0).length;
       if (totalOptionsCount === 0) totalOptionsCount = votingOptions.length;
-    } catch (e) {}
+    } catch (e) { }
 
     // When all voting slots are filled and not already resolved, transition status to 'filled'
     if (pollState.status !== 'resolved' && pollState.status !== 'cancelled' && pollState.status !== 'stopped') {
@@ -4423,7 +4431,7 @@ function pollStatusText(chatId = null, opts = {}) {
           yesVoters = yesOpt ? yesOpt.voters.map((v) => nameFor(v)) : [];
           noVoters = noOpt ? noOpt.voters.map((v) => nameFor(v)) : [];
         }
-      } catch (e) {}
+      } catch (e) { }
 
       const lines = [
         `${groupHeader}Poll ${pollId}${pollState.when ? ` (${pollState.when})` : ''}: Opt-in (Yes/No).`,
@@ -4546,7 +4554,7 @@ function buildContextBlurb(chatId) {
             noCount = noOpt ? noOpt.voters.length : 0;
             yesNames = yesOpt ? yesOpt.voters.map((v) => nameFor(v)) : [];
           }
-        } catch (e) {}
+        } catch (e) { }
 
         if (pollState.status === 'cancelled') {
           return `[Poll ${id}] a Yes/No opt-in poll${whenSuffix} was cancelled`;
@@ -4683,7 +4691,7 @@ async function launchBot() {
       try {
         botSock.ev.removeAllListeners();
         botSock.end(undefined);
-      } catch (e) {}
+      } catch (e) { }
       botSock = null;
     }
     await startBot();
