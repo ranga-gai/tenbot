@@ -511,11 +511,22 @@ async function interpretManualPollWithLLM(pollName, options, creatorName) {
     const dayMatch = pollName.match(/\b(today|tonight|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tue|wed|thu|fri|sat|sun)\b/i);
     const timeMatch = pollName.match(/\b(\d{1,2}(?:[:.]\d{2})?\s*(?:am|pm))\b/i) || pollName.match(/\b(\d{1,2}[:.]\d{2})\b/i);
     const hasYesNo = options.some((opt) => /^yes$/i.test(opt.trim())) && options.some((opt) => /^no$/i.test(opt.trim()));
+    const timeWord = timeMatch ? timeMatch[1] : null;
+    const dayWord = dayMatch ? dayMatch[1] : null;
+    let whenStr = pollName;
+    if (timeWord && !dayWord) {
+      const playAt = resolvePlayDateTime(null, timeWord);
+      const playParts = getSanJoseParts(playAt);
+      const nowParts = getSanJoseParts(getSanJoseNow());
+      if (playParts.day !== nowParts.day || playParts.month !== nowParts.month) {
+        whenStr = `Tomorrow ${timeWord}`;
+      }
+    }
     return {
       isMatchScheduling,
-      dayWord: dayMatch ? dayMatch[1] : null,
-      timeWord: timeMatch ? timeMatch[1] : null,
-      when: pollName,
+      dayWord,
+      timeWord,
+      when: whenStr,
       type: hasYesNo ? 'opt_in' : 'manual',
       size: hasYesNo ? null : (options.length > 0 ? options.length : null)
     };
@@ -548,9 +559,9 @@ Poll Details:
 Please analyze this poll:
 1. Is this poll for scheduling/organizing a tennis match, practice session, hitting, drill, or court play? (isMatchScheduling: true/false).
    (Note: Social polls, food orders, equipment banter, or non-tennis topics should be isMatchScheduling: false).
-2. What day is it scheduled for? (e.g. "today", "tomorrow", "saturday", "sunday", or null if not mentioned).
+2. What day is it scheduled for? (e.g. "today", "tomorrow", "saturday", "sunday", or null if not mentioned). If only a start time was mentioned (e.g. "Tennis 7pm", "6am") without an explicit day word and the start time is already in the past today in San Jose, leave dayWord as null.
 3. What time is it scheduled for? (e.g. "9am", "6:30pm", "10am", or null if not mentioned).
-4. Provide a clean human-readable when string (e.g. "Sunday 7:30am", "Saturday 6pm", "Today 8:30am"). If a day of the week (e.g. Sunday) was mentioned or implied, ALWAYS use the named day (e.g. "Sunday 7:30am"), do NOT replace named days with "Tomorrow". Only use "Tomorrow" if the user explicitly wrote "tomorrow".
+4. Provide a clean human-readable when string (e.g. "Sunday 7:30am", "Saturday 6pm", "Tomorrow 7pm", "Today 8:30am"). If only a start time was mentioned without an explicit day and the start time is already in the past today in San Jose (e.g. it is 8pm now and poll title is "Tennis 7pm"), use "Tomorrow <time>" (e.g. "Tomorrow 7pm"). If a day of the week (e.g. Sunday) was mentioned or implied, ALWAYS use the named day (e.g. "Sunday 7:30am"). Only use "Tomorrow" if the user explicitly wrote "tomorrow" or if only a time was given that has already passed today.
 5. Poll type: "opt_in" for Yes/No polls, or "manual" for fixed/numbered slots.
 6. Poll size: number of player spots (or null if opt-in).
 
@@ -2310,10 +2321,29 @@ async function startBot() {
 
           messageStore.set(storeKey(remoteJid, pollId), msg.message);
 
-          const playAt = resolvePlayDateTime(interpretation.dayWord, interpretation.timeWord);
+          // If no explicit day word was in the poll title, ensure dayWord is null so resolvePlayDateTime rolls past times over to tomorrow
+          const hasExplicitDayInPollTitle = /\b(today|tonight|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tue|wed|thu|fri|sat|sun)\b/i.test(pollName);
+          const effectiveDayWord = hasExplicitDayInPollTitle ? interpretation.dayWord : null;
+
+          const playAt = resolvePlayDateTime(effectiveDayWord, interpretation.timeWord);
+          const sjNow = getSanJoseNow();
+          const playParts = getSanJoseParts(playAt);
+          const nowParts = getSanJoseParts(sjNow);
+          const isTomorrow = playParts.day !== nowParts.day || playParts.month !== nowParts.month;
+
+          let resolvedWhen = interpretation.when || pollName;
+          if (isTomorrow && !hasExplicitDayInPollTitle) {
+            if (resolvedWhen && !/\b(today|tomorrow|tonight|monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tue|wed|thu|fri|sat|sun)\b/i.test(resolvedWhen)) {
+              resolvedWhen = `Tomorrow ${resolvedWhen}`;
+            } else if (interpretation.timeWord && !/\b(today|tomorrow|tonight|monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tue|wed|thu|fri|sat|sun)\b/i.test(resolvedWhen)) {
+              resolvedWhen = `Tomorrow ${interpretation.timeWord}`;
+            } else if (!resolvedWhen) {
+              resolvedWhen = 'Tomorrow';
+            }
+          }
+
           const pollType = interpretation.type || (options.some((opt) => /^yes$/i.test(opt.trim())) ? 'opt_in' : 'manual');
           const pollSize = interpretation.size !== undefined && interpretation.size !== null ? interpretation.size : (pollType === 'opt_in' ? null : (options.length > 0 ? options.length : null));
-          const resolvedWhen = interpretation.when || pollName;
 
           const initialManualHours = (playAt.getTime() - Date.now()) / (60 * 60 * 1000);
           const manualSentReminders = POWERS_OF_2_REMINDER_HOURS.filter((h) => h > initialManualHours && h > 1);
