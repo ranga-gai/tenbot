@@ -1338,6 +1338,132 @@ Respond ONLY with a JSON object in this exact format, with no extra text or mark
  * Stops voting on a poll: closes voting, halts reminders, and sets status to 'stopped'
  * without deleting the poll message from WhatsApp.
  */
+
+/**
+ * Uses LLM to decode free-form or mentioned lineup messages
+ * (e.g. "@132388105547860 @278081952608440 @169384953794573 @78636841447513 - Court 6 7.00 pm").
+ */
+async function parseLineupWithLLM(text, chatId) {
+  if (!process.env.ANTHROPIC_API_KEY) return null;
+  console.log(`[lineup-llm] Invoking Claude to parse manual lineup in ${chatId}: "${text}"`);
+
+  const playerEntries = namesStore.getAllEntries();
+  const playerListDesc = playerEntries.map((e) => {
+    const rawId = e.id ? e.id.split('@')[0] : '';
+    const rawPn = e.pn ? e.pn.split('@')[0] : '';
+    const aliasesStr = e.aliases && e.aliases.length > 0 ? `, aliases: [${e.aliases.join(', ')}]` : '';
+    const ids = [rawId, rawPn].filter(Boolean).join(', ');
+    return `- "${e.name}"${e.fullName ? ` (${e.fullName})` : ''} [IDs/Mentions: ${ids || 'none'}${aliasesStr}]`;
+  }).join('\n');
+
+  const activePollsDesc = [...activePolls.entries()]
+    .filter(([, p]) => p.remoteJid === chatId && (p.status === 'active' || p.status === 'filled' || p.status === 'stopped'))
+    .map(([id, p]) => `- Poll "${p.name || p.when || id}" (size: ${p.size || 'opt-in'}, when: "${p.when || ''}", status: ${p.status})`)
+    .join('\n');
+
+  const prompt = `You are an expert tennis assistant parsing a WhatsApp group chat message in San Jose, CA.
+A group member just posted this message:
+"""
+${text}
+"""
+
+Active tennis match polls in this chat:
+${activePollsDesc || '(none)'}
+
+Known registered players in this tennis group (with their WhatsApp mention IDs and aliases):
+${playerListDesc}
+
+Task:
+Determine if this message is announcing or publishing match lineups, player court assignments, teams, or rotations (e.g. "@132388105547860 @278081952608440 @169384953794573 @78636841447513 - Court 6 7.00 pm", "Court 1: Alice & Bob vs Charlie & David", "Set 1: Court 2 Mike / Sara vs John / Alex", "Alice Bob vs Charlie Dave Court 3", etc.).
+
+Rules:
+1. Map any @<digits> or @<name> mentions to the correct player display name using the known registered players list. If a mention ID is not in the list, use the short name or phone number as the player name.
+2. If 4 players are listed on a court without explicit "vs" (e.g. "@P1 @P2 @P3 @P4 - Court 6 7pm"), treat them as a doubles session on that court:
+   - teamA: [Player 1, Player 2]
+   - teamB: [Player 3, Player 4]
+3. If 2 players are listed on a court without "vs", treat them as singles: teamA: [Player 1], teamB: [Player 2].
+4. If this is just casual conversation, banter, a question, or a score report (e.g. "we won", "beat", "defeated", score like "6-4 6-2"), set "isLineup": false.
+
+Respond ONLY with a JSON object in this exact format:
+{
+  "isLineup": boolean,
+  "type": "singles" | "doubles",
+  "players": ["Player 1", "Player 2", ...],
+  "sets": [
+    {
+      "set": 1,
+      "courts": [
+        {
+          "court": 6,
+          "teamA": ["Player 1", "Player 2"],
+          "teamB": ["Player 3", "Player 4"]
+        }
+      ]
+    }
+  ]
+}
+If isLineup is false, return:
+{
+  "isLineup": false
+}`;
+
+  try {
+    const response = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': process.env.ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01'
+      },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        max_tokens: 500,
+        messages: [{ role: 'user', content: prompt }]
+      })
+    });
+
+    if (!response.ok) {
+      console.warn(`[lineup-llm] Anthropic API returned ${response.status}`);
+      return null;
+    }
+
+    const data = await response.json();
+    const rawContent = data.content?.filter((b) => b.type === 'text').map((b) => b.text).join('').trim();
+    const cleanedJson = rawContent.replace(/^\`\`\`json\s*/i, '').replace(/\s*\`\`\`$/i, '').trim();
+    const parsed = JSON.parse(cleanedJson);
+
+    if (!parsed || !parsed.isLineup || !Array.isArray(parsed.players) || parsed.players.length < 2 || !Array.isArray(parsed.sets) || parsed.sets.length === 0) {
+      return null;
+    }
+
+    const resolvePlayer = (p) => {
+      const clean = String(p).replace(/^@/, '').trim();
+      const resolved = nameFor(clean);
+      return resolved || clean;
+    };
+
+    const resolvedPlayers = parsed.players.map(resolvePlayer);
+    const resolvedSets = parsed.sets.map((s) => ({
+      ...s,
+      courts: (s.courts || []).map((c) => ({
+        ...c,
+        teamA: (c.teamA || []).map(resolvePlayer),
+        teamB: (c.teamB || []).map(resolvePlayer)
+      }))
+    }));
+
+    console.log(`[lineup-llm] Decoded lineup (${parsed.type || 'doubles'}): ${resolvedPlayers.length} player(s) [${resolvedPlayers.join(', ')}]`);
+    return {
+      type: parsed.type || (resolvedPlayers.length === 2 ? 'singles' : 'doubles'),
+      players: resolvedPlayers,
+      sets: resolvedSets
+    };
+  } catch (err) {
+    console.error('[lineup-llm] Failed to parse lineup with LLM:', err.message);
+    return null;
+  }
+}
+
 async function handleStopPoll(sock, chatId, sender, senderJid, specificPollId = null) {
   let targetPollId = specificPollId || null;
   if (!targetPollId) {
@@ -2523,7 +2649,7 @@ async function handleManualLineup(sock, chatId, sender, lineup, msg) {
   let targetPollState = null;
 
   for (const [pollId, pollState] of [...activePolls.entries()].reverse()) {
-    if (pollState.remoteJid === chatId && pollState.status === 'active') {
+    if (pollState.remoteJid === chatId && (pollState.status === 'active' || pollState.status === 'filled' || pollState.status === 'stopped')) {
       targetPollId = pollId;
       targetPollState = pollState;
       break;
@@ -2745,10 +2871,29 @@ async function getResponse(sock, text, chatId, sender, msg) {
     }
   }
 
-  // --- Check for manually published lineup ---
-  const manualLineup = parseLineup(text, knownPlayers(chatId));
-  if (manualLineup) {
-    return await handleManualLineup(sock, chatId, sender, manualLineup, msg);
+  // --- Check for manually published lineup (only if at least one poll is active, filled, or stopped) ---
+  const hasActivePollForLineup = [...activePolls.values()].some(
+    (p) => p.remoteJid === chatId && (p.status === 'active' || p.status === 'filled' || p.status === 'stopped')
+  );
+  if (hasActivePollForLineup) {
+    let manualLineup = parseLineup(text, knownPlayers(chatId));
+
+    if (!manualLineup) {
+      // Check in order with short-circuit evaluation (court -> set -> vs -> @)
+      const hasLineupHint = /\bcourts?\b|\bct\b|\bc\d+\b/i.test(text) ||
+                            /\bsets?\b/i.test(text) ||
+                            /\b(?:vs\.?|v\.?|versus)\b/i.test(text) ||
+                            /@\w+/i.test(text);
+
+      if (hasLineupHint) {
+        console.log(`[lineup] Matchup hint detected in "${text}" (sender: ${sender}). Calling parseLineupWithLLM...`);
+        manualLineup = await parseLineupWithLLM(text, chatId);
+      }
+    }
+
+    if (manualLineup) {
+      return await handleManualLineup(sock, chatId, sender, manualLineup, msg);
+    }
   }
 
   // --- Direct Command Poll creation (!createpoll / !poll / !makepoll / !newpoll) ---
