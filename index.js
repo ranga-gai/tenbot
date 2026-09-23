@@ -142,6 +142,7 @@ const POLL_CLEANUP_INTERVAL_MINUTES = 15;
 const POLL_REMINDER_HOURS = [0.1667, 1, 2, 4, 8, 16, 24, 32, 64];
 const POWERS_OF_2_REMINDER_HOURS = POLL_REMINDER_HOURS;
 const POLL_REMINDER_CHECK_INTERVAL_MS = 60 * 1000;
+const MAX_POLL_REMINDERS = 2;
 
 // System prompt controlling the bot's personality/behavior
 const SYSTEM_PROMPT =
@@ -2069,7 +2070,7 @@ async function checkAndSendPollReminders(sock) {
     for (const [pollId, pollState] of activePolls.entries()) {
       if (pollState.status !== 'active') continue;
       if (pollState.remindersPaused) continue; // reminders paused by group member
-      if ((pollState.reminderCount || 0) >= 3) continue; // limit maximum number of reminders to 3
+      if ((pollState.reminderCount || 0) >= MAX_POLL_REMINDERS) continue; // limit maximum number of reminders to 2
       if (!pollState.playAt) continue;
 
       const playAtMs = new Date(pollState.playAt).getTime();
@@ -4375,7 +4376,7 @@ function pollStatusText(chatId = null, opts = {}) {
     const remindersStr = Array.isArray(pollState.sentReminders) && pollState.sentReminders.length > 0
       ? pollState.sentReminders.map((h) => h < 1 ? `${Math.round(h * 60)}m` : `${h}h`).join(', ')
       : '(none yet)';
-    const countStr = `(${pollState.reminderCount || 0}/3 sent)`;
+    const countStr = `(${pollState.reminderCount || 0}/${MAX_POLL_REMINDERS} sent)`;
     const remindersLine = pollState.remindersPaused
       ? `Reminders: PAUSED (sent so far: [${remindersStr}] ${countStr})`
       : `Sent reminders: [${remindersStr}] ${countStr}`;
