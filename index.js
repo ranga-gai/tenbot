@@ -334,6 +334,14 @@ const CLAUDE_TOOLS = [
     }
   },
   {
+    name: 'clear_all_polls',
+    description: 'Removes all polls from bot memory and state without deleting them from WhatsApp. Admin only.',
+    input_schema: {
+      type: 'object',
+      properties: {}
+    }
+  },
+  {
     name: 'cancel_poll',
     description: 'Cancels the active match poll and deletes the poll message from WhatsApp.',
     input_schema: {
@@ -1809,6 +1817,61 @@ async function cancelOrDeletePoll(sock, remoteJid, pollId) {
 }
 
 /**
+ * Admin command to cancel and delete all tracked polls from WhatsApp and storage.
+ */
+async function handleDeleteAllPolls(sock, chatId, senderJid) {
+  const isAdmin = await isUserAdmin(sock, chatId, senderJid);
+  if (!isAdmin) {
+    return '⚠️ Only group admins can delete all polls.';
+  }
+
+  const allPollEntries = [...activePolls.entries()];
+  if (allPollEntries.length === 0) {
+    return 'No polls on record to delete.';
+  }
+
+  let deletedCount = 0;
+  for (const [pollId, pollState] of allPollEntries) {
+    const targetChat = pollState.remoteJid || chatId;
+    try {
+      await cancelOrDeletePoll(sock, targetChat, pollId);
+      deletedCount++;
+    } catch (err) {
+      console.error(`[poll] Failed to cancel/delete poll ${pollId}:`, err.message);
+    }
+  }
+
+  activePolls.clear();
+  latestPollIdByChat.clear();
+  persistPolls();
+
+  console.log(`[poll] Admin deleted all ${deletedCount} poll(s) from storage and WhatsApp.`);
+  return `🗑️ Deleted ${deletedCount} poll(s) from storage and WhatsApp.`;
+}
+
+/**
+ * Admin command to clear all polls from the bot's memory/state without deleting them from WhatsApp.
+ */
+async function handleClearAllPolls(sock, chatId, senderJid) {
+  const isAdmin = await isUserAdmin(sock, chatId, senderJid);
+  if (!isAdmin) {
+    return '⚠️ Only group admins can clear all polls.';
+  }
+
+  const count = activePolls.size;
+  if (count === 0) {
+    return 'No polls on record to clear.';
+  }
+
+  activePolls.clear();
+  latestPollIdByChat.clear();
+  persistPolls();
+
+  console.log(`[poll] Admin cleared all ${count} poll(s) from state (kept on WhatsApp).`);
+  return `🧹 Cleared ${count} poll(s) from bot state (polls remain on WhatsApp).`;
+}
+
+/**
  * Deletes any poll whose scheduled play time (plus grace period) has
  * passed, regardless of whether it ended up resolved, cancelled, or just
  * never filled up. Runs once at startup (to clear anything stale from
@@ -2634,6 +2697,10 @@ async function executeTool(sock, chatId, sender, toolUse, msg) {
     const res = await handleTriggerReminder(sock, chatId, sender, input.pollId || null);
     return res || 'Reminder triggered and sent to group.';
   }
+  if (name === 'clear_all_polls') {
+    const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
+    return await handleClearAllPolls(sock, chatId, senderJid);
+  }
   if (name === 'cancel_poll') {
     let targetPollId = input.pollId || null;
     if (!targetPollId) {
@@ -2967,6 +3034,11 @@ async function getResponse(sock, text, chatId, sender, msg) {
     return await handleTriggerReminder(sock, chatId, sender, specificPollId);
   }
 
+  if (lower === '!clearallpolls' || lower === '!clearpolls') {
+    const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
+    return await handleClearAllPolls(sock, chatId, senderJid);
+  }
+
   if (lower === '!cancelpoll' || lower === '!deletepoll') {
     let targetPollId = null;
     for (const [pollId, pollState] of [...activePolls.entries()].reverse()) {
@@ -3143,6 +3215,7 @@ function helpText() {
     '!resumereminders [pollId] (or !resumereminder) – resume upcoming match reminders for active poll(s)',
     '!remind [pollId] (or !sendreminder, !remindpoll) – manually trigger a reminder for active match poll(s)',
     '!cancelpoll (or !deletepoll) – cancel and delete the active poll from WhatsApp (creator or admin only)',
+    '!clearallpolls (or !clearpolls) – (Admin only) remove all polls from bot state without deleting them from WhatsApp',
     '!pollstatus – debug: show raw vote count and voters for active match poll(s) in this chat',
     '!allpolls (or !pollstatus all) – (Admin only) debug: show detailed status of all tracked polls',
     '!activepolls (or !active, !pollstatus active) – list match polls with status active, filled, or stopped',
