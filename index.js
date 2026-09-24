@@ -2462,6 +2462,16 @@ async function startBot() {
           });
           latestPollIdByChat.set(remoteJid, pollId);
           persistPolls();
+
+          // Fetch rating for creator if not seen before
+          if (creatorName && !ratings.isPlaceholder(creatorName) && !GENERIC_NAMES.has(ratings.keyFor(creatorName))) {
+            const creatorLid = creatorJid ? namesStore.resolveCanonicalId(creatorJid) : null;
+            ratings.ensureRated([{
+              name: creatorName,
+              jid: creatorJid,
+              lid: creatorLid && creatorLid.endsWith('@lid') ? creatorLid : null
+            }]).catch(() => {});
+          }
           console.log(`[poll] LLM verified & passively tracking manually-created match poll ${pollId} ("${pollName}", when: "${resolvedWhen}", type: ${pollType}, size: ${pollSize}) by ${creatorName} in ${remoteJid}`);
         } else {
           messageStore.set(storeKey(remoteJid, pollId), msg.message);
@@ -3882,6 +3892,16 @@ async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWor
   });
   latestPollIdByChat.set(remoteJid, pollId);
   persistPolls();
+
+  // Fetch rating for creator if not seen before
+  if (creatorName && !ratings.isPlaceholder(creatorName) && !GENERIC_NAMES.has(ratings.keyFor(creatorName))) {
+    const creatorLid = creatorJid ? namesStore.resolveCanonicalId(creatorJid) : null;
+    ratings.ensureRated([{
+      name: creatorName,
+      jid: creatorJid,
+      lid: creatorLid && creatorLid.endsWith('@lid') ? creatorLid : null
+    }]).catch(() => {});
+  }
   console.log(`[poll] Created poll ${pollId} (${isOptIn ? 'Yes/No opt-in' : `${validCount} spots (given: ${size})`}, creator/virtual: ${leadingVirtualCount > 0 ? (creatorName || 'Player 1') : 'none'}) in ${remoteJid}${resolvedWhen ? ` (${resolvedWhen})` : ''}, play time ${playAt.toISOString()}`);
 
   return {
