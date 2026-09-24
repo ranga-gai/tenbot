@@ -165,7 +165,7 @@ const SYSTEM_PROMPT =
   "you see the message, so don't claim you can't record scores. " +
   'Initial ratings for new players are looked up from TennisRecord.com (defaulting to 3.49 if not found). ' +
   'Users can also change their own rating by addressing you (e.g. "@tenbot my rating is 4.0" or "@tenbot set my rating to 3.5") -- ' +
-  'call the set_rating tool to update it. ' +
+  'call the set_rating tool to update it. Group admins can also update ratings for other players. ' +
   'When creating a poll: ' +
   '- ALWAYS call the create_poll tool directly when a user asks to create a poll. Never ask the user for confirmation before creating the poll, even if the creator already has other active polls in the group (the backend handles slot allocation and conflict separation automatically). ' +
   '- If only a start time was specified without a day (e.g. "create a poll for 6am" or "create a poll for 9am"): ' +
@@ -300,7 +300,7 @@ const CLAUDE_TOOLS = [
 
   {
     name: 'set_rating',
-    description: 'Sets or updates the rating for the user who sent the message (or for a named player if specified). Rating must be a number between 2.5 and 4.5.',
+    description: 'Sets or updates the rating for the user who sent the message (or for a named player if specified). Rating must be a number between 2.5 and 4.5. Non-admins can only change their own rating; only group admins can change ratings for other players.',
     input_schema: {
       type: 'object',
       properties: {
@@ -2670,14 +2670,8 @@ async function executeTool(sock, chatId, sender, toolUse, msg) {
 
   if (name === 'set_rating') {
     const newRating = input.rating;
-    const targetPlayer = input.player || (sender !== 'Someone' ? sender : (msg?.key?.participant ? nameFor(msg.key.participant) : null));
-    const targetJid = !input.player ? (msg?.key?.participant || msg?.key?.remoteJid || null) : null;
-    if (!targetPlayer) return 'Could not identify player to update rating for.';
-    if (typeof newRating !== 'number' || newRating < ratings.MIN_RATING || newRating > ratings.MAX_RATING) {
-      return `Rating must be a number between ${ratings.MIN_RATING} and ${ratings.MAX_RATING}.`;
-    }
-    const updated = ratings.setRating(targetPlayer, newRating, { jid: targetJid });
-    return `Updated rating for ${targetPlayer} to ${ratings.formatRating(updated)}.`;
+    const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
+    return await handleSetRating(sock, chatId, senderJid, sender, input.player || null, newRating);
   }
   if (name === 'get_weather') {
     const location = input.location || DEFAULT_LOCATION;
@@ -2914,15 +2908,12 @@ async function getResponse(sock, text, chatId, sender, msg) {
 
   // --- Ratings & manual rating updates ---
   if (lower.startsWith('!myrating') || lower.startsWith('!setrating')) {
-    const valStr = text.replace(/^!(?:myrating|setrating)\s*/i, '').trim();
-    const val = parseFloat(valStr);
-    if (Number.isNaN(val) || val < ratings.MIN_RATING || val > ratings.MAX_RATING) {
+    const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
+    const parsed = parseSetRatingCommand(text, sender);
+    if (!parsed) {
       return `Please provide a valid rating between ${ratings.MIN_RATING} and ${ratings.MAX_RATING}, e.g. "!setrating 3.5" or "${TRIGGER_PREFIX} set my rating to 4.0".`;
     }
-    const targetPlayer = sender !== 'Someone' ? sender : (msg?.key?.participant ? nameFor(msg.key.participant) : 'Player');
-    const targetJid = msg?.key?.participant || msg?.key?.remoteJid || null;
-    const updated = ratings.setRating(targetPlayer, val, { jid: targetJid });
-    return `Updated rating for ${targetPlayer} to ${ratings.formatRating(updated)}.`;
+    return await handleSetRating(sock, chatId, senderJid, sender, parsed.name, parsed.rating);
   }
 
   if (lower === '!ratings') {
@@ -3213,7 +3204,7 @@ function helpText() {
     '!aliases – list all registered players and their aliases',
     '!fullname <full name> (or !setfullname <name> = <full name>) – set your full name and lookup initial TennisRecord rating',
     '!refreshratings – (Admin only) refresh player ratings from TennisRecord.com now',
-    `!setrating <rating> (or ${TRIGGER_PREFIX} my rating is <rating>) – set or update your rating (${ratings.MIN_RATING}–${ratings.MAX_RATING})`,
+    `!setrating <rating> (or ${TRIGGER_PREFIX} my rating is <rating>) – set or update your rating (${ratings.MIN_RATING}–${ratings.MAX_RATING}) (admins can set ratings for other players)`,
     '!weather [location] – forecast for outdoor play (defaults to ' + DEFAULT_LOCATION + ')',
     `${TRIGGER_PREFIX} create a poll [for <N>] [when] – post a match poll (N spots for singles/doubles, or Yes/No opt-in if N is omitted)`,
     '!poll [for <N>] [when] (or !createpoll) – direct command to create a match poll',
@@ -3233,6 +3224,67 @@ function helpText() {
     '!reset – (Admin only) clear the bot\'s conversation memory',
     TRIGGER_PREFIX ? `${TRIGGER_PREFIX} <question> – ask the bot anything (including setting rating, questions)` : '(bot also responds to any message)'
   ].join('\n');
+}
+
+async function handleSetRating(sock, chatId, senderJid, senderName, playerName, ratingVal) {
+  if (typeof ratingVal !== 'number' || Number.isNaN(ratingVal) || ratingVal < ratings.MIN_RATING || ratingVal > ratings.MAX_RATING) {
+    return `Please provide a valid rating between ${ratings.MIN_RATING} and ${ratings.MAX_RATING}, e.g. "!setrating 3.5" or "${TRIGGER_PREFIX} set my rating to 4.0".`;
+  }
+
+  const targetPlayer = playerName || senderName || (senderJid ? nameFor(senderJid) : 'me');
+  const canManage = await canUserManagePlayerAlias(sock, chatId, senderJid, senderName, targetPlayer);
+  if (!canManage) {
+    return '⚠️ Only group admins can update ratings for other players. You can set your own rating.';
+  }
+
+  let targetJid = null;
+  const tKey = ratings.keyFor(targetPlayer);
+  const isSelf = ['me', 'myself', 'my', 'i'].includes(tKey) ||
+    (senderName && ratings.keyFor(senderName) === tKey) ||
+    (senderJid && ratings.keyFor(nameFor(senderJid)) === tKey);
+
+  let resolvedPlayerName = targetPlayer;
+  if (isSelf) {
+    targetJid = senderJid || null;
+    resolvedPlayerName = senderName !== 'Someone' ? senderName : (senderJid ? nameFor(senderJid) : 'Player');
+  } else {
+    const match = namesStore.findIdByNameOrAlias(targetPlayer);
+    if (match) {
+      targetJid = match.id || null;
+      resolvedPlayerName = match.entry?.name || targetPlayer;
+    }
+  }
+
+  const updated = ratings.setRating(resolvedPlayerName, ratingVal, { jid: targetJid });
+  return `Updated rating for ${resolvedPlayerName} to ${ratings.formatRating(updated)}.`;
+}
+
+function parseSetRatingCommand(text, defaultSenderName = null) {
+  const raw = text.replace(/^!(?:myrating|setrating)\s*/i, '').trim();
+  if (!raw) return null;
+
+  const forMatch = raw.match(/^for\s+(.+?)\s*(?:=|\bto\b|:)?\s*(\d+(?:\.\d+)?)$/i) ||
+                   raw.match(/^(.+?)\s+\bfor\b\s+(\d+(?:\.\d+)?)$/i);
+  if (forMatch) {
+    return { name: forMatch[1].trim(), rating: parseFloat(forMatch[2]) };
+  }
+
+  const delimMatch = raw.match(/^(.+?)\s*(?:=|:|->|\bto\b|\bas\b)\s*(\d+(?:\.\d+)?)$/i);
+  if (delimMatch) {
+    return { name: delimMatch[1].trim(), rating: parseFloat(delimMatch[2]) };
+  }
+
+  const spaceMatch = raw.match(/^(.+?)\s+(\d+(?:\.\d+)?)$/);
+  if (spaceMatch && Number.isNaN(parseFloat(spaceMatch[1]))) {
+    return { name: spaceMatch[1].trim(), rating: parseFloat(spaceMatch[2]) };
+  }
+
+  const num = parseFloat(raw);
+  if (!Number.isNaN(num)) {
+    return { name: defaultSenderName || 'me', rating: num };
+  }
+
+  return null;
 }
 
 /**
