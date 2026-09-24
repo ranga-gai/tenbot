@@ -989,7 +989,6 @@ function recordName(jid, name) {
   if (!trimmed) return false;
   const raw = jid;
   const norm = jidNormalizedUser(jid);
-
   const canonicalId = namesStore.resolveCanonicalId(norm || raw);
   const pn = norm?.endsWith('@s.whatsapp.net') ? norm : (raw?.endsWith('@s.whatsapp.net') ? raw : null);
   namesStore.setName(canonicalId, trimmed, [], pn);
@@ -2211,9 +2210,12 @@ async function startBot() {
   const meName = sock.user?.name || state.creds?.me?.name;
   const meId = sock.user?.id || state.creds?.me?.id;
   const meLid = sock.user?.lid || state.creds?.me?.lid;
-  if (meName) {
-    if (meId) recordName(meId, meName);
-    if (meLid) recordName(meLid, meName);
+  const mePnNorm = meId ? jidNormalizedUser(meId) : null;
+  const meLidNorm = meLid ? jidNormalizedUser(meLid) : null;
+  if (meLidNorm && mePnNorm && meLidNorm !== mePnNorm) {
+    namesStore.setMapping(meLidNorm, mePnNorm, meName);
+  } else if (meLidNorm && meName) {
+    recordName(meLidNorm, meName);
   }
 
   sock.ev.on('creds.update', saveCreds);
@@ -2291,9 +2293,12 @@ async function startBot() {
       const currMeName = sock.user?.name || sock.authState?.creds?.me?.name;
       const currMeId = sock.user?.id || sock.authState?.creds?.me?.id;
       const currMeLid = sock.user?.lid || sock.authState?.creds?.me?.lid;
-      if (currMeName) {
-        if (currMeId) recordName(currMeId, currMeName);
-        if (currMeLid) recordName(currMeLid, currMeName);
+      const currMePn = currMeId ? jidNormalizedUser(currMeId) : null;
+      const currMeLidNorm = currMeLid ? jidNormalizedUser(currMeLid) : null;
+      if (currMeLidNorm && currMePn && currMeLidNorm !== currMePn) {
+        namesStore.setMapping(currMeLidNorm, currMePn, currMeName);
+      } else if (currMeLidNorm && currMeName) {
+        recordName(currMeLidNorm, currMeName);
       }
 
       // Pre-warm group metadata cache so the very first message is recognized instantly
@@ -2380,9 +2385,10 @@ async function startBot() {
       }
 
       // Remember voter's display name if present
-      if (msg.pushName && (msg.key.participant || remoteJid)) {
-        const rawJid = msg.key.participant || remoteJid;
-        recordName(rawJid, msg.pushName);
+      if (msg.pushName && msg.key?.participant) {
+        recordName(msg.key.participant, msg.pushName);
+      } else if (msg.pushName && !msg.key?.fromMe && remoteJid && !remoteJid.endsWith('@g.us')) {
+        recordName(remoteJid, msg.pushName);
       }
 
       // Check for incoming poll creation message (bot-created or user-created in group)
