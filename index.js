@@ -165,7 +165,7 @@ const SYSTEM_PROMPT =
   "you see the message, so don't claim you can't record scores. " +
   'Initial ratings for new players are looked up from TennisRecord.com (defaulting to 3.49 if not found). ' +
   'Users can also change their own rating by addressing you (e.g. "@tenbot my rating is 4.0" or "@tenbot set my rating to 3.5") -- ' +
-  'call the set_rating tool to update it. Group admins can also update ratings for other players. ' +
+  'call the set_rating or reset_rating tool to update it. Group admins can also update or reset ratings for other players. ' +
   'When creating a poll: ' +
   '- ALWAYS call the create_poll tool directly when a user asks to create a poll. Never ask the user for confirmation before creating the poll, even if the creator already has other active polls in the group (the backend handles slot allocation and conflict separation automatically). ' +
   '- If only a start time was specified without a day (e.g. "create a poll for 6am" or "create a poll for 9am"): ' +
@@ -222,6 +222,19 @@ const CLAUDE_TOOLS = [
         replacePollId: {
           type: 'string',
           description: 'Optional poll ID of an older/existing poll to cancel and delete from WhatsApp when creating this new poll.'
+        }
+      }
+    }
+  },
+  {
+    name: 'reset_rating',
+    description: 'Resets a player\'s rating (or the sender\'s rating if player is omitted) back to their baseline TennisRecord rating (or default 3.49). Non-admins can only reset their own rating; only group admins can reset ratings for other players.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        player: {
+          type: 'string',
+          description: 'Optional player name or alias to reset rating for. If omitted, resets the sender\'s rating.'
         }
       }
     }
@@ -2673,6 +2686,10 @@ async function executeTool(sock, chatId, sender, toolUse, msg) {
     const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
     return await handleSetRating(sock, chatId, senderJid, sender, input.player || null, newRating);
   }
+  if (name === 'reset_rating') {
+    const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
+    return await handleResetRating(sock, chatId, senderJid, sender, input.player || null);
+  }
   if (name === 'get_weather') {
     const location = input.location || DEFAULT_LOCATION;
     try {
@@ -2914,6 +2931,12 @@ async function getResponse(sock, text, chatId, sender, msg) {
       return `Please provide a valid rating between ${ratings.MIN_RATING} and ${ratings.MAX_RATING}, e.g. "!setrating 3.5" or "${TRIGGER_PREFIX} set my rating to 4.0".`;
     }
     return await handleSetRating(sock, chatId, senderJid, sender, parsed.name, parsed.rating);
+  }
+
+  if (lower.startsWith('!resetrating') || lower.startsWith('!ratingreset')) {
+    const raw = text.replace(/^!(?:resetrating|ratingreset)\s*/i, '').trim();
+    const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
+    return await handleResetRating(sock, chatId, senderJid, sender, raw || null);
   }
 
   if (lower === '!ratings') {
@@ -3205,6 +3228,7 @@ function helpText() {
     '!fullname <full name> (or !setfullname <name> = <full name>) – set your full name and lookup initial TennisRecord rating',
     '!refreshratings – (Admin only) refresh player ratings from TennisRecord.com now',
     `!setrating <rating> (or ${TRIGGER_PREFIX} my rating is <rating>) – set or update your rating (${ratings.MIN_RATING}–${ratings.MAX_RATING}) (admins can set ratings for other players)`,
+    `!resetrating [player] (or ${TRIGGER_PREFIX} reset my rating) – reset rating back to baseline TennisRecord rating`,
     '!weather [location] – forecast for outdoor play (defaults to ' + DEFAULT_LOCATION + ')',
     `${TRIGGER_PREFIX} create a poll [for <N>] [when] – post a match poll (N spots for singles/doubles, or Yes/No opt-in if N is omitted)`,
     '!poll [for <N>] [when] (or !createpoll) – direct command to create a match poll',
@@ -3257,6 +3281,41 @@ async function handleSetRating(sock, chatId, senderJid, senderName, playerName, 
 
   const updated = ratings.setRating(resolvedPlayerName, ratingVal, { jid: targetJid });
   return `Updated rating for ${resolvedPlayerName} to ${ratings.formatRating(updated)}.`;
+}
+
+async function handleResetRating(sock, chatId, senderJid, senderName, playerName) {
+  const targetPlayer = playerName || senderName || (senderJid ? nameFor(senderJid) : 'me');
+  const canManage = await canUserManagePlayerAlias(sock, chatId, senderJid, senderName, targetPlayer);
+  if (!canManage) {
+    return '⚠️ Only group admins can reset ratings for other players. You can reset your own rating.';
+  }
+
+  let targetJid = null;
+  const tKey = ratings.keyFor(targetPlayer);
+  const isSelf = ['me', 'myself', 'my', 'i'].includes(tKey) ||
+    (senderName && ratings.keyFor(senderName) === tKey) ||
+    (senderJid && ratings.keyFor(nameFor(senderJid)) === tKey);
+
+  let resolvedPlayerName = targetPlayer;
+  if (isSelf) {
+    targetJid = senderJid || null;
+    resolvedPlayerName = senderName !== 'Someone' ? senderName : (senderJid ? nameFor(senderJid) : 'Player');
+  } else {
+    const match = namesStore.findIdByNameOrAlias(targetPlayer);
+    if (match) {
+      targetJid = match.id || null;
+      resolvedPlayerName = match.entry?.name || targetPlayer;
+    }
+  }
+
+  const res = await ratings.resetRating(resolvedPlayerName, { jid: targetJid });
+  if (!res) {
+    return `Could not reset rating for "${resolvedPlayerName}".`;
+  }
+
+  const locStr = res.tennisRecordLocation ? ` (${res.tennisRecordLocation})` : '';
+  const urlStr = res.tennisRecordUrl ? ` -> ${res.tennisRecordUrl}` : '';
+  return `🔄 Reset rating for "${res.name}" to baseline ${ratings.formatRating(res.rating)}${locStr}${urlStr}.`;
 }
 
 function parseSetRatingCommand(text, defaultSenderName = null) {
