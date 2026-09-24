@@ -990,6 +990,10 @@ function recordName(jid, name) {
   const raw = jid;
   const norm = jidNormalizedUser(jid);
   const canonicalId = namesStore.resolveCanonicalId(norm || raw);
+  const existingName = namesStore.getName(canonicalId || norm || raw);
+  if (existingName && existingName === trimmed) {
+    return false;
+  }
   const pn = norm?.endsWith('@s.whatsapp.net') ? norm : (raw?.endsWith('@s.whatsapp.net') ? raw : null);
   namesStore.setName(canonicalId, trimmed, [], pn);
   return true;
