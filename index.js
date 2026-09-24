@@ -983,7 +983,7 @@ function stripLeadingTrigger(text) {
 /**
  * Associates a JID / LID with a display name across all formats.
  */
-function recordName(jid, name) {
+function recordName(jid, name, explicitPn = null) {
   if (!jid || !name) return false;
   const trimmed = String(name).trim();
   if (!trimmed) return false;
@@ -991,10 +991,13 @@ function recordName(jid, name) {
   const norm = jidNormalizedUser(jid);
   const canonicalId = namesStore.resolveCanonicalId(norm || raw);
   const existingName = namesStore.getName(canonicalId || norm || raw);
-  if (existingName && existingName === trimmed) {
+  const existingPn = namesStore.getPnByLid(canonicalId || norm || raw);
+
+  const pn = explicitPn || (norm?.endsWith('@s.whatsapp.net') ? norm : (raw?.endsWith('@s.whatsapp.net') ? raw : null)) || existingPn;
+
+  if (existingName && existingName === trimmed && existingPn && existingPn === pn) {
     return false;
   }
-  const pn = norm?.endsWith('@s.whatsapp.net') ? norm : (raw?.endsWith('@s.whatsapp.net') ? raw : null);
   namesStore.setName(canonicalId, trimmed, [], pn);
   return true;
 }
@@ -2242,7 +2245,8 @@ async function startBot() {
       for (const c of contacts) {
         const name = c.name || c.notify || c.verifiedName;
         if (name && c.id && isTargetGroupContact(c.id)) {
-          recordName(c.id, name);
+          const cPn = c.id.endsWith('@s.whatsapp.net') ? jidNormalizedUser(c.id) : (c.pn ? jidNormalizedUser(c.pn) : null);
+          recordName(c.id, name, cPn);
         }
       }
     } catch (err) {
@@ -2256,7 +2260,8 @@ async function startBot() {
       for (const c of updates) {
         const name = c.name || c.notify || c.verifiedName;
         if (name && c.id && isTargetGroupContact(c.id)) {
-          recordName(c.id, name);
+          const cPn = c.id.endsWith('@s.whatsapp.net') ? jidNormalizedUser(c.id) : (c.pn ? jidNormalizedUser(c.pn) : null);
+          recordName(c.id, name, cPn);
         }
       }
     } catch (err) {
@@ -2389,10 +2394,11 @@ async function startBot() {
       }
 
       // Remember voter's display name if present
+      const senderPn = msg.key?.participantPn ? jidNormalizedUser(msg.key.participantPn) : (msg.participantPn ? jidNormalizedUser(msg.participantPn) : null);
       if (msg.pushName && msg.key?.participant) {
-        recordName(msg.key.participant, msg.pushName);
+        recordName(msg.key.participant, msg.pushName, senderPn);
       } else if (msg.pushName && !msg.key?.fromMe && remoteJid && !remoteJid.endsWith('@g.us')) {
-        recordName(remoteJid, msg.pushName);
+        recordName(remoteJid, msg.pushName, remoteJid.endsWith('@s.whatsapp.net') ? remoteJid : null);
       }
 
       // Check for incoming poll creation message (bot-created or user-created in group)
@@ -2583,8 +2589,9 @@ async function handleMessage(sock, msg, groupName) {
   const sender = msg.pushName || 'Someone';
 
   // Remember this voter's display name for when we see their poll votes later.
+  const senderPn = msg.key?.participantPn ? jidNormalizedUser(msg.key.participantPn) : (msg.participantPn ? jidNormalizedUser(msg.participantPn) : null);
   if (msg.key.participant) {
-    recordName(msg.key.participant, sender);
+    recordName(msg.key.participant, sender, senderPn);
   }
 
   // Record all target group messages in persistent 2-week history
