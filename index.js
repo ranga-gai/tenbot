@@ -548,51 +548,7 @@ const CLAUDE_TOOLS = [
       }
     }
   },
-  {
-    name: 'book_court',
-    description: 'Books a tennis court (Courts 1-6) or pickleball court at Silver Creek Valley Country Club (SCVCC) for the member.',
-    input_schema: {
-      type: 'object',
-      properties: {
-        when: {
-          type: 'string',
-          description: 'Date and time description (e.g. "tomorrow 6pm", "Saturday 9am", "today 7pm").'
-        },
-        date: {
-          type: 'string',
-          description: 'Optional explicit date (e.g. "9/26/2026", "tomorrow").'
-        },
-        time: {
-          type: 'string',
-          description: 'Start time of booking (e.g. "6:00 PM", "6pm", "9am").'
-        },
-        court: {
-          type: 'string',
-          description: 'Optional specific court preference (e.g. "Court 2", "Court 4", "Pickleball 1"). If omitted, books the first available court.'
-        },
-        duration: {
-          type: 'string',
-          description: 'Duration of the court reservation: "60 Minutes" (default), "90 Minutes", or "120 Minutes".'
-        },
-        partySize: {
-          type: 'string',
-          description: 'Party size: "Doubles" (default) or "Singles".'
-        },
-        sport: {
-          type: 'string',
-          description: 'Sport type: "tennis" (default) or "pickleball".'
-        }
-      }
-    }
-  },
-  {
-    name: 'get_my_court_bookings',
-    description: 'Retrieves active upcoming court reservations at Silver Creek Valley Country Club (SCVCC) for the member.',
-    input_schema: {
-      type: 'object',
-      properties: {}
-    }
-  },
+
 ];
 
 // How many past messages (per chat) to keep for conversational context
@@ -3020,7 +2976,7 @@ async function executeTool(sock, chatId, sender, toolUse, msg) {
     return res?.message || 'Checked court availability.';
   }
   if (name === 'book_court') {
-    const res = await scvcc.bookCourt(input);
+    const res = await scvcc.bookCourt({ ...input, requester: input.requester || sender });
     return res?.message || 'Court booked.';
   }
   if (name === 'get_my_court_bookings') {
@@ -3150,17 +3106,11 @@ async function getResponse(sock, text, chatId, sender, msg) {
   }
 
   if (lower.startsWith('!bookcourt') || lower.startsWith('!reservecourt')) {
-    const parsed = scvcc.parseBookCourtCommand(text);
-    if (!parsed) {
-      return 'Please specify a time to book, e.g. "!bookcourt 6pm tomorrow" or "!bookcourt 9am Saturday Court 2 singles".';
-    }
-    const res = await scvcc.bookCourt(parsed);
-    return res?.message || 'Could not complete court booking.';
+    return 'Court booking via bot is currently paused. Please check court availability using !courts.';
   }
 
   if (lower === '!mybookings' || lower === '!myreservations' || lower === '!mycourts') {
-    const res = await scvcc.getMyReservations();
-    return res?.message || 'Could not retrieve your court reservations.';
+    return 'Court reservations viewing is currently paused.';
   }
 
   // --- Availability ---
@@ -3654,8 +3604,6 @@ function helpText() {
     `!resetrating [player] (or ${TRIGGER_PREFIX} reset my rating) – reset rating back to baseline TennisRecord rating`,
     '!weather [location] – forecast for outdoor play (defaults to ' + DEFAULT_LOCATION + ')',
     '!courts [when] [time] [court] [pb] – check court availability at SCVCC, e.g. "!courts tomorrow", "!courts 6pm saturday", "!courts pb tomorrow"',
-    '!bookcourt <time> [when] [court] [duration] [singles|doubles] – book a court at SCVCC, e.g. "!bookcourt 6pm tomorrow Court 2", "!bookcourt 9am sat Court 1 singles"',
-    '!mybookings (or !myreservations) – list your active upcoming court reservations at SCVCC',
     `${TRIGGER_PREFIX} create a poll [for <N>] [when] – post a match poll (N spots for singles/doubles, or Yes/No opt-in if N is omitted)`,
     '!poll [for <N>] [when] [no-matchups] (or !createpoll, !optinpoll, !yesnopoll) – direct command to create a match poll (fixed spots or Yes/No opt-in)',
     '!matchups (or !draw, !rematch) – generate matchups from active tennis match poll',
