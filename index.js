@@ -147,7 +147,7 @@ const SYSTEM_PROMPT =
   'conversational (1-3 sentences) unless asked for more detail. You have ' +
   "access to tools to create match polls (fixed-spot polls for 2 singles or 4/8/12 doubles, " +
   "or Yes/No opt-in polls when no number of players is specified), generate matchups from poll votes, " +
-  "set/update player ratings, check weather, cancel/delete polls, schedule recurring daily polls (schedule_recurring_poll), list recurring schedules (list_recurring_polls), and access the group's availability list, win/loss leaderboard, " +
+  "set/update player ratings, check weather, cancel/delete polls, schedule recurring match polls on specific days of the week or every day (schedule_recurring_poll), list recurring schedules (list_recurring_polls), and access the group's availability list, win/loss leaderboard, " +
   'and active polls (given below). Multiple polls can be created for different times or by different users. ' +
   'The live local time in San Jose, CA is provided at the top of the context blurb below. ' +
   'Polls created manually by users for organizing tennis matches are passively tracked by the bot (marked as user-created / isManual). ' +
@@ -456,7 +456,7 @@ const CLAUDE_TOOLS = [
   },
   {
     name: 'schedule_recurring_poll',
-    description: 'Schedules a recurring daily tennis match poll to be created and posted automatically every day. Example: schedule a daily poll for 4 at 7pm, posted at 8am every morning.',
+    description: 'Schedules a recurring tennis match poll to be created and posted automatically on specified days of the week or every day. Example: schedule a poll for 4 at 7pm on weekdays, posted at 8am.',
     input_schema: {
       type: 'object',
       properties: {
@@ -467,6 +467,10 @@ const CLAUDE_TOOLS = [
         matchTime: {
           type: 'string',
           description: 'Time of day when the match takes place (e.g. "7pm", "9am", "6:30pm", "19:00").'
+        },
+        days: {
+          type: 'string',
+          description: 'Days of the week when the match takes place (e.g. "everyday", "weekdays", "weekends", "mon-thu", "mon,wed,fri", "tuesdays and thursdays", "saturday"). Defaults to "everyday".'
         },
         postTime: {
           type: 'string',
@@ -3560,8 +3564,8 @@ function helpText() {
     '!activepolls (or !active, !pollstatus active) – list match polls with status active, filled, or stopped',
     '!upcomingpolls (or !upcoming, !pollstatus upcoming) – list all match polls whose play time has not passed yet',
     '!cleanuppolls – (Admin only) debug: force a sweep that deletes expired/completed polls now',
-    '!recurringpoll [size] <matchTime> [at <postTime>] [no-matchups] – schedule a daily match poll, e.g. "!recurringpoll 4 7pm at 8am" or "!recurringpoll opt-in 7pm"',
-    '!recurringpolls – list all scheduled recurring daily polls',
+    '!recurringpoll [size] <matchTime> [at <postTime>] [days] [no-matchups] – schedule a recurring match poll, e.g. "!recurringpoll 4 7pm mon-thu", "!recurringpoll 4 7pm at 8am on weekdays", "!recurringpoll 4 9am on weekends", "!recurringpoll opt-in 7pm mon, wed, fri"',
+    '!recurringpolls – list all scheduled recurring match polls',
     '!cancelrecurringpoll <id> – cancel and delete a scheduled recurring daily poll (creator or admin only)',
     '!clearallrecurringpolls (or !clearrecurringpolls, !cancelallrecurringpolls) – (Admin only) clear and delete all scheduled recurring daily polls',
     '!pauserecurringpoll <id> (or !resumerecurringpoll <id>) – pause/resume a recurring daily poll',
@@ -5027,7 +5031,7 @@ function buildContextBlurb(chatId) {
   const chatRecurring = [...recurringPolls.values()].filter((s) => !chatId.endsWith('@g.us') || s.remoteJid === chatId);
   let recurringText = 'none';
   if (chatRecurring.length > 0) {
-    recurringText = chatRecurring.map((s) => `[ID: ${s.id}] ${s.size ? `${s.size} spots` : 'Opt-in'} for ${s.matchDisplay} (posts daily at ${s.postDisplay}, status: ${s.enabled ? 'active' : 'paused'})`).join('; ');
+    recurringText = chatRecurring.map((s) => `[ID: ${s.id}] ${s.size ? `${s.size} spots` : 'Opt-in'} for ${s.matchDisplay} (${s.daysDisplay || s.days || 'everyday'}) (posts at ${s.postDisplay}, status: ${s.enabled ? 'active' : 'paused'})`).join('; ');
   }
 
   const groupChatLog = messageHistory.formatRecentMessagesForContext(chatId);
