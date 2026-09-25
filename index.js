@@ -111,7 +111,8 @@ const tennisRecord = require('./lib/tennisRecord');
 const pollStore = require('./lib/pollStore');
 const namesStore = require('./lib/names');
 const messageHistory = require('./lib/messageHistory');
-const { resolvePlayDateTime, getSanJoseNow, getSanJoseParts } = require('./lib/pollTime');
+const recurringPollsModule = require('./lib/recurringPolls');
+const { resolvePlayDateTime, getSanJoseNow, getSanJoseParts, parseTimeString } = require('./lib/pollTime');
 
 // ---- CONFIG ----
 
@@ -146,7 +147,7 @@ const SYSTEM_PROMPT =
   'conversational (1-3 sentences) unless asked for more detail. You have ' +
   "access to tools to create match polls (fixed-spot polls for 2 singles or 4/8/12 doubles, " +
   "or Yes/No opt-in polls when no number of players is specified), generate matchups from poll votes, " +
-  "set/update player ratings, check weather, cancel/delete polls, and access the group's availability list, win/loss leaderboard, " +
+  "set/update player ratings, check weather, cancel/delete polls, schedule recurring daily polls (schedule_recurring_poll), list recurring schedules (list_recurring_polls), and access the group's availability list, win/loss leaderboard, " +
   'and active polls (given below). Multiple polls can be created for different times or by different users. ' +
   'The live local time in San Jose, CA is provided at the top of the context blurb below. ' +
   'Polls created manually by users for organizing tennis matches are passively tracked by the bot (marked as user-created / isManual). ' +
@@ -222,6 +223,14 @@ const CLAUDE_TOOLS = [
         replacePollId: {
           type: 'string',
           description: 'Optional poll ID of an older/existing poll to cancel and delete from WhatsApp when creating this new poll.'
+        },
+        autoMatchups: {
+          type: 'boolean',
+          description: 'Whether to automatically generate matchups when voting completes (default: true). Set to false if matchups should NOT be created automatically.'
+        },
+        noMatchups: {
+          type: 'boolean',
+          description: 'If true, do not automatically create matchups when voting completes.'
         }
       }
     }
@@ -444,6 +453,70 @@ const CLAUDE_TOOLS = [
         }
       }
     }
+  },
+  {
+    name: 'schedule_recurring_poll',
+    description: 'Schedules a recurring daily tennis match poll to be created and posted automatically every day. Example: schedule a daily poll for 4 at 7pm, posted at 8am every morning.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        size: {
+          type: 'integer',
+          description: 'Total number of players for the match (2 for singles, 4/8/12 for doubles). If omitted, creates a Yes/No opt-in poll.'
+        },
+        matchTime: {
+          type: 'string',
+          description: 'Time of day when the match takes place (e.g. "7pm", "9am", "6:30pm", "19:00").'
+        },
+        postTime: {
+          type: 'string',
+          description: 'Optional time of day when the poll should be posted to the group (e.g. "8am", "7:30am", "7pm"). If omitted, defaults to 8:00 AM (or 7:00 PM the evening before for early morning matches).'
+        },
+        includeCreator: {
+          type: 'boolean',
+          description: 'Whether the creator should be automatically added as Player 1 in the recurring poll (default false for automated daily polls).'
+        },
+        autoMatchups: {
+          type: 'boolean',
+          description: 'Whether to automatically generate matchups when the poll fills up. Set to false if matchups should NOT be created automatically when poll ends/fills (default: true).'
+        },
+        noMatchups: {
+          type: 'boolean',
+          description: 'If true, do not automatically create matchups when the poll ends/fills.'
+        }
+      },
+      required: ['matchTime']
+    }
+  },
+  {
+    name: 'list_recurring_polls',
+    description: 'Lists all scheduled recurring match polls in this chat.',
+    input_schema: {
+      type: 'object',
+      properties: {}
+    }
+  },
+  {
+    name: 'cancel_recurring_poll',
+    description: 'Cancels and deletes a scheduled recurring daily match poll by its schedule ID. Only the poll creator or group admins can cancel it.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        scheduleId: {
+          type: 'string',
+          description: 'The schedule ID of the recurring poll to cancel (e.g. "rec_1", "sched_abc").'
+        }
+      },
+      required: ['scheduleId']
+    }
+  },
+  {
+    name: 'clear_all_recurring_polls',
+    description: 'Clears and deletes all scheduled recurring daily match polls in this chat. Admin only.',
+    input_schema: {
+      type: 'object',
+      properties: {}
+    }
   }
 ];
 
@@ -497,7 +570,8 @@ let targetGroupJid = null;
 const {
   messageStore,   // `${remoteJid}:${id}` -> stored WAMessage content, needed for getMessage() and vote decoding
   activePolls,    // pollId -> { remoteJid, size, type, when, playAt, status, creator, lastConflictSignature, voteBuffer, lastPlayers, isManual }
-  latestPollIdByChat // chatId -> pollId, so "!cancelpoll"/"!rematch"/"!pollstatus" know which poll to act on
+  latestPollIdByChat, // chatId -> pollId, so "!cancelpoll"/"!rematch"/"!pollstatus" know which poll to act on
+  recurringPolls  // scheduleId -> recurring schedule object
 } = pollStore.load();
 
 const storeKey = (remoteJid, id) => `${remoteJid}:${id}`;
@@ -507,7 +581,7 @@ namesStore.defaultMissingFullNames();
 ratings.syncRatingsWithNames();
 
 function persistPolls() {
-  pollStore.save({ messageStore, activePolls, latestPollIdByChat });
+  pollStore.save({ messageStore, activePolls, latestPollIdByChat, recurringPolls });
 }
 
 function escapeRegex(str) {
@@ -821,10 +895,15 @@ function getPollVoters(pollId, pollState, mePn) {
 function parsePollCreationText(text) {
   if (!text) return null;
 
-  const isPollCreationCommand = /^!(?:createpoll|poll|makepoll|newpoll)\b/i.test(text);
-  const isPollCreationPhrase = /\b(?:create|make|post|start|set\s*up|setup|open)\s+(?:a\s+)?(?:match\s+)?(?:singles\s+|doubles\s+)?poll\b|\bnew\s+(?:match\s+)?poll\b|\bpoll\s+for\b/i.test(text);
+  const isPollCreationCommand = /^!(?:createpoll|poll|makepoll|newpoll|optinpoll|yesnopoll|createoptinpoll|createyesnopoll)\b/i.test(text);
+  const isPollCreationPhrase = /\b(?:create|make|post|start|set\s*up|setup|open)\s+(?:a\s+)?(?:match\s+)?(?:singles\s+|doubles\s+|yes\/no\s+|yesno\s+|opt-?in\s+)?poll\b|\bnew\s+(?:match\s+)?(?:singles\s+|doubles\s+|yes\/no\s+|yesno\s+|opt-?in\s+)?poll\b|\b(?:opt-?in|yes\s*\/\s*no|yesno)\s+poll\b|\bpoll\s+for\b/i.test(text);
 
   if (!isPollCreationCommand && !isPollCreationPhrase) {
+    return null;
+  }
+
+  // If this is a recurring/daily poll request, leave it for parseRecurringPollText
+  if (/\b(?:daily|recurring|repeating|every\s*day)\b/i.test(text)) {
     return null;
   }
 
@@ -861,19 +940,23 @@ function parsePollCreationText(text) {
   textWithoutTime = textWithoutTime.replace(/\b\d{1,2}(?:[:.]\d{2})?\s*(?:am|pm)\b/ig, ' ').replace(/\b\d{1,2}[:.]\d{2}\b/g, ' ');
 
   // Determine size
+  const isExplicitOptIn = /\b(?:opt-?in|yes\s*\/\s*no|yesno|open)\b/i.test(text) ||
+    /^!(?:optinpoll|yesnopoll|createoptinpoll|createyesnopoll)\b/i.test(text);
   let size = null;
-  const sizeMatch = textWithoutTime.match(/\b(?:for|size|spots?|players?)\s*[:=]?\s*(\d+)\b/i) ||
-    textWithoutTime.match(/\b(\d+)\s*(?:spots?|players?|people|courts?)\b/i) ||
-    textWithoutTime.match(/\bpoll\s+for\s+(\d+)\b/i) ||
-    textWithoutTime.match(/^!(?:createpoll|poll|makepoll|newpoll)\s+(\d+)\b/i) ||
-    textWithoutTime.match(/\bcreate\s+(?:a\s+)?(?:match\s+)?poll\s+(\d+)\b/i) ||
-    textWithoutTime.match(/\b([248]|12|16)\s*(?:players?|spots?)?\b/i);
-  if (sizeMatch) {
-    size = parseInt(sizeMatch[1], 10);
-  } else if (/\bsingles\b/i.test(textWithoutTime)) {
-    size = 2;
-  } else if (/\bdoubles\b/i.test(textWithoutTime)) {
-    size = 4;
+  if (!isExplicitOptIn) {
+    const sizeMatch = textWithoutTime.match(/\b(?:for|size|spots?|players?)\s*[:=]?\s*(\d+)\b/i) ||
+      textWithoutTime.match(/\b(\d+)\s*(?:spots?|players?|people|courts?)\b/i) ||
+      textWithoutTime.match(/\bpoll\s+for\s+(\d+)\b/i) ||
+      textWithoutTime.match(/^!(?:createpoll|poll|makepoll|newpoll)\s+(\d+)\b/i) ||
+      textWithoutTime.match(/\bcreate\s+(?:a\s+)?(?:match\s+)?poll\s+(\d+)\b/i) ||
+      textWithoutTime.match(/\b([248]|12|16)\s*(?:players?|spots?)?\b/i);
+    if (sizeMatch) {
+      size = parseInt(sizeMatch[1], 10);
+    } else if (/\bsingles\b/i.test(textWithoutTime)) {
+      size = 2;
+    } else if (/\bdoubles\b/i.test(textWithoutTime)) {
+      size = 4;
+    }
   }
 
   // Determine includeCreator
@@ -888,13 +971,17 @@ function parsePollCreationText(text) {
     cancelExisting = true;
   }
 
+  // Determine noMatchups
+  const noMatchups = /(?:^|\s)(?:--no-?matchups?|--no-?draw)\b|\b(?:no[-_\s]*matchups?|no[-_\s]*draw|without\s+(?:auto[-_\s]*|automatic\s+)?matchups?|without\s+(?:auto[-_\s]*|automatic\s+)?draw|(?:do\s*not|don\x27?t)\s+(?:create|make|generate|post|auto-?generate)\s+(?:matchups?|draw|the\s+draw|the\s+matchups?)|no[-_\s]*(?:auto\s+|automatic\s+)?matchups?)\b/i.test(text);
+
   return {
     size,
     when,
     dayWord,
     timeWord,
     includeCreator,
-    cancelExisting
+    cancelExisting,
+    noMatchups
   };
 }
 
@@ -920,7 +1007,8 @@ async function handleDirectPollCreation(sock, chatId, sender, msg, parsed, opts 
     includeCreator,
     null,
     cancelExisting,
-    isCommand
+    isCommand,
+    parsed.noMatchups || false
   );
 
   if (res?.err) {
@@ -1838,6 +1926,81 @@ async function handleResumeReminders(sock, chatId, sender, specificPollId = null
   return `▶️ Reminders have been resumed for ${names.join(', ')}.`;
 }
 
+async function handleScheduleRecurringPoll(sock, chatId, sender, senderJid, params) {
+  const targetChatId = chatId.endsWith('@g.us') ? chatId : (await getTargetGroupJid(sock) || chatId);
+  return await recurringPollsModule.scheduleRecurringPoll({
+    recurringPolls,
+    persistPolls,
+    targetChatId,
+    sender,
+    senderJid,
+    params
+  });
+}
+
+function handleListRecurringPolls(chatId) {
+  return recurringPollsModule.listRecurringPolls({ recurringPolls, chatId });
+}
+
+async function handleCancelRecurringPoll(sock, chatId, sender, senderJid, scheduleId) {
+  const cleanId = String(scheduleId || '').trim();
+  if (!cleanId) {
+    return 'Please provide the schedule ID to cancel, e.g. "!cancelrecurringpoll rec_1" (see "!recurringpolls" for IDs) or "!clearallrecurringpolls" to clear all.';
+  }
+
+  if (!recurringPolls.has(cleanId)) {
+    return `Schedule ID "\`${cleanId}\`" was not found. Use "!recurringpolls" to view all scheduled IDs.`;
+  }
+
+  const sched = recurringPolls.get(cleanId);
+  const isCreator = sched.creator ? isSameUser(sched.creator.jid, senderJid, sched.creator.name, sender) : false;
+  const isAdmin = await isUserAdmin(sock, chatId, senderJid);
+
+  if (!isCreator && !isAdmin) {
+    return '⚠️ Only the creator of this recurring poll or group admins can cancel it.';
+  }
+
+  return await recurringPollsModule.cancelRecurringPoll({ recurringPolls, persistPolls, sender, scheduleId: cleanId });
+}
+
+async function handleClearAllRecurringPolls(sock, chatId, sender, senderJid) {
+  const isAdmin = await isUserAdmin(sock, chatId, senderJid);
+  if (!isAdmin) {
+    return '⚠️ Only group admins can clear all recurring polls.';
+  }
+  return await recurringPollsModule.clearAllRecurringPolls({ recurringPolls, persistPolls, sender, chatId });
+}
+
+async function handlePauseRecurringPoll(sock, chatId, sender, senderJid, scheduleId) {
+  const cleanId = String(scheduleId || '').trim();
+  if (!cleanId || !recurringPolls.has(cleanId)) {
+    return `Schedule ID "\`${cleanId}\`" was not found. Use "!recurringpolls" to view active IDs.`;
+  }
+  const sched = recurringPolls.get(cleanId);
+  const isCreator = sched.creator ? isSameUser(sched.creator.jid, senderJid, sched.creator.name, sender) : false;
+  const isAdmin = await isUserAdmin(sock, chatId, senderJid);
+
+  if (!isCreator && !isAdmin) {
+    return '⚠️ Only the creator of this recurring poll or group admins can pause it.';
+  }
+  return await recurringPollsModule.pauseRecurringPoll({ recurringPolls, persistPolls, scheduleId: cleanId });
+}
+
+async function handleResumeRecurringPoll(sock, chatId, sender, senderJid, scheduleId) {
+  const cleanId = String(scheduleId || '').trim();
+  if (!cleanId || !recurringPolls.has(cleanId)) {
+    return `Schedule ID "\`${cleanId}\`" was not found. Use "!recurringpolls" to view active IDs.`;
+  }
+  const sched = recurringPolls.get(cleanId);
+  const isCreator = sched.creator ? isSameUser(sched.creator.jid, senderJid, sched.creator.name, sender) : false;
+  const isAdmin = await isUserAdmin(sock, chatId, senderJid);
+
+  if (!isCreator && !isAdmin) {
+    return '⚠️ Only the creator of this recurring poll or group admins can resume it.';
+  }
+  return await recurringPollsModule.resumeRecurringPoll({ recurringPolls, persistPolls, scheduleId: cleanId });
+}
+
 async function cancelOrDeletePoll(sock, remoteJid, pollId) {
   if (!pollId) return;
   handlePollDeleted(remoteJid, pollId);
@@ -2175,6 +2338,20 @@ setInterval(() => {
   if (botSock) checkAndSendPollReminders(botSock);
 }, POLL_REMINDER_CHECK_INTERVAL_MS);
 
+// Check and automatically trigger recurring daily polls every 30 seconds
+const RECURRING_POLL_CHECK_INTERVAL_MS = 30 * 1000;
+setInterval(() => {
+  if (botSock) {
+    recurringPollsModule.checkAndPostRecurringPolls({
+      sock: botSock,
+      recurringPolls,
+      persistPolls,
+      createMatchPoll,
+      getTargetGroupJid
+    });
+  }
+}, RECURRING_POLL_CHECK_INTERVAL_MS);
+
 // Bi-weekly player rating refresh from TennisRecord.com (every 2 weeks)
 const RATINGS_REFRESH_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000; // Check every 6 hours for players due (>= 14 days)
 
@@ -2344,6 +2521,13 @@ async function startBot() {
       console.log(`✅ Tennis group bot is ready and listening for group ${TARGET_GROUP_NAME}.`);
 
       checkAndSendPollReminders(sock);
+      recurringPollsModule.checkAndPostRecurringPolls({
+        sock,
+        recurringPolls,
+        persistPolls,
+        createMatchPoll,
+        getTargetGroupJid
+      });
     }
   });
 
@@ -2649,7 +2833,8 @@ async function executeTool(sock, chatId, sender, toolUse, msg) {
     const creatorJid = msg?.key?.participant || msg?.key?.remoteJid || null;
     const targetChatId = chatId.endsWith('@g.us') ? chatId : (await getTargetGroupJid(sock) || chatId);
 
-    const res = await createMatchPoll(sock, targetChatId, size, when, dayWord, timeWord, creatorName, creatorJid, includeCreator, replacePollId, cancelExisting, false);
+    const noMatchups = input.noMatchups === true || input.autoMatchups === false;
+    const res = await createMatchPoll(sock, targetChatId, size, when, dayWord, timeWord, creatorName, creatorJid, includeCreator, replacePollId, cancelExisting, false, noMatchups);
     if (res?.err) {
       return `Could not create poll: ${res.err}`;
     }
@@ -2743,6 +2928,21 @@ async function executeTool(sock, chatId, sender, toolUse, msg) {
   if (name === 'trigger_reminder' || name === 'send_reminder') {
     const res = await handleTriggerReminder(sock, chatId, sender, input.pollId || null);
     return res || 'Reminder triggered and sent to group.';
+  }
+  if (name === 'schedule_recurring_poll') {
+    const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
+    return await handleScheduleRecurringPoll(sock, chatId, sender, senderJid, input);
+  }
+  if (name === 'list_recurring_polls') {
+    return handleListRecurringPolls(chatId);
+  }
+  if (name === 'cancel_recurring_poll') {
+    const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
+    return await handleCancelRecurringPoll(sock, chatId, sender, senderJid, input.scheduleId);
+  }
+  if (name === 'clear_all_recurring_polls' || name === 'cancel_all_recurring_polls') {
+    const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
+    return await handleClearAllRecurringPolls(sock, chatId, sender, senderJid);
   }
   if (name === 'clear_all_polls') {
     const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
@@ -3044,11 +3244,72 @@ async function getResponse(sock, text, chatId, sender, msg) {
     }
   }
 
-  // --- Direct Command Poll creation (!createpoll / !poll / !makepoll / !newpoll) ---
-  if (/^!(?:createpoll|poll|makepoll|newpoll)\b/i.test(text)) {
+  // --- Direct Command Poll creation (!createpoll / !poll / !makepoll / !newpoll / !optinpoll / !yesnopoll) ---
+  if (/^!(?:createpoll|poll|makepoll|newpoll|optinpoll|yesnopoll|createoptinpoll|createyesnopoll)\b/i.test(text)) {
     const parsed = parsePollCreationText(text);
     if (parsed) {
       return await handleDirectPollCreation(sock, chatId, sender, msg, parsed, { isCommand: true });
+    }
+  }
+
+  // --- Recurring daily poll commands ---
+  if (lower === '!recurringpolls' || lower === '!scheduledpolls' || lower === '!dailypolls' || lower === '!recurringpoll list' || lower === '!schedulepoll list') {
+    return handleListRecurringPolls(chatId);
+  }
+
+  if (lower === '!clearallrecurringpolls' || lower === '!clearrecurringpolls' || lower === '!cancelallrecurringpolls' || lower === '!deleteallrecurringpolls' || lower === '!removeallrecurringpolls' || lower === '!clearallrecurring' || lower === '!cancelallrecurring') {
+    const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
+    return await handleClearAllRecurringPolls(sock, chatId, sender, senderJid);
+  }
+
+  if (lower.startsWith('!cancelrecurringpoll') || lower.startsWith('!deleterecurringpoll') || lower.startsWith('!removerecurringpoll') || lower.startsWith('!clearrecurringpoll')) {
+    const parts = text.split(/\s+/);
+    const specificId = parts.length > 1 ? parts[1].trim() : null;
+    const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
+    if (specificId && /^all$/i.test(specificId)) {
+      return await handleClearAllRecurringPolls(sock, chatId, sender, senderJid);
+    }
+    return await handleCancelRecurringPoll(sock, chatId, sender, senderJid, specificId);
+  }
+
+  if (lower.startsWith('!pauserecurringpoll') || lower.startsWith('!stoprecurringpoll')) {
+    const parts = text.split(/\s+/);
+    const specificId = parts.length > 1 ? parts[1].trim() : null;
+    const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
+    return await handlePauseRecurringPoll(sock, chatId, sender, senderJid, specificId);
+  }
+
+  if (lower.startsWith('!resumerecurringpoll') || lower.startsWith('!startrecurringpoll')) {
+    const parts = text.split(/\s+/);
+    const specificId = parts.length > 1 ? parts[1].trim() : null;
+    const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
+    return await handleResumeRecurringPoll(sock, chatId, sender, senderJid, specificId);
+  }
+
+  if (/^!(?:recurringpoll|dailypoll|schedulepoll|everydaypoll|repeatingpoll|recurringoptinpoll|dailyoptinpoll|recurringyesnopoll|dailyyesnopoll)\b/i.test(text)) {
+    const parsed = recurringPollsModule.parseRecurringPollText(text);
+    if (parsed) {
+      if (parsed.action === 'list') {
+        return handleListRecurringPolls(chatId);
+      }
+      if (parsed.action === 'clear_all') {
+        const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
+        return await handleClearAllRecurringPolls(sock, chatId, sender, senderJid);
+      }
+      if (parsed.action === 'cancel') {
+        const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
+        return await handleCancelRecurringPoll(sock, chatId, sender, senderJid, parsed.scheduleId);
+      }
+      if (parsed.action === 'pause') {
+        const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
+        return await handlePauseRecurringPoll(sock, chatId, sender, senderJid, parsed.scheduleId);
+      }
+      if (parsed.action === 'resume') {
+        const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
+        return await handleResumeRecurringPoll(sock, chatId, sender, senderJid, parsed.scheduleId);
+      }
+      const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
+      return await handleScheduleRecurringPoll(sock, chatId, sender, senderJid, parsed);
     }
   }
 
@@ -3210,6 +3471,32 @@ async function getResponse(sock, text, chatId, sender, msg) {
   }
   if (!promptText) return null;
 
+  // --- Direct Recurring Poll Request (handled directly without LLM) ---
+  const directRecurringParsed = recurringPollsModule.parseRecurringPollText(promptText);
+  if (directRecurringParsed) {
+    if (directRecurringParsed.action === 'list') {
+      return handleListRecurringPolls(chatId);
+    }
+    if (directRecurringParsed.action === 'clear_all') {
+      const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
+      return await handleClearAllRecurringPolls(sock, chatId, sender, senderJid);
+    }
+    if (directRecurringParsed.action === 'cancel') {
+      const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
+      return await handleCancelRecurringPoll(sock, chatId, sender, senderJid, directRecurringParsed.scheduleId);
+    }
+    if (directRecurringParsed.action === 'pause') {
+      const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
+      return await handlePauseRecurringPoll(sock, chatId, sender, senderJid, directRecurringParsed.scheduleId);
+    }
+    if (directRecurringParsed.action === 'resume') {
+      const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
+      return await handleResumeRecurringPoll(sock, chatId, sender, senderJid, directRecurringParsed.scheduleId);
+    }
+    const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
+    return await handleScheduleRecurringPoll(sock, chatId, sender, senderJid, directRecurringParsed);
+  }
+
   // --- Direct Poll Creation Request (handled directly without LLM) ---
   const directPollParsed = parsePollCreationText(promptText);
   if (directPollParsed) {
@@ -3259,7 +3546,7 @@ function helpText() {
     `!resetrating [player] (or ${TRIGGER_PREFIX} reset my rating) – reset rating back to baseline TennisRecord rating`,
     '!weather [location] – forecast for outdoor play (defaults to ' + DEFAULT_LOCATION + ')',
     `${TRIGGER_PREFIX} create a poll [for <N>] [when] – post a match poll (N spots for singles/doubles, or Yes/No opt-in if N is omitted)`,
-    '!poll [for <N>] [when] (or !createpoll) – direct command to create a match poll',
+    '!poll [for <N>] [when] [no-matchups] (or !createpoll, !optinpoll, !yesnopoll) – direct command to create a match poll (fixed spots or Yes/No opt-in)',
     '!matchups (or !draw, !rematch) – generate matchups from active tennis match poll',
     '!stoppoll (or !closepoll) – stop voting and reminders, setting poll status to stopped (creator or admin only)',
     '!resumepoll (or !reopenpoll) – resume voting and reminders for a stopped poll (creator or admin only)',
@@ -3273,6 +3560,11 @@ function helpText() {
     '!activepolls (or !active, !pollstatus active) – list match polls with status active, filled, or stopped',
     '!upcomingpolls (or !upcoming, !pollstatus upcoming) – list all match polls whose play time has not passed yet',
     '!cleanuppolls – (Admin only) debug: force a sweep that deletes expired/completed polls now',
+    '!recurringpoll [size] <matchTime> [at <postTime>] [no-matchups] – schedule a daily match poll, e.g. "!recurringpoll 4 7pm at 8am" or "!recurringpoll opt-in 7pm"',
+    '!recurringpolls – list all scheduled recurring daily polls',
+    '!cancelrecurringpoll <id> – cancel and delete a scheduled recurring daily poll (creator or admin only)',
+    '!clearallrecurringpolls (or !clearrecurringpolls, !cancelallrecurringpolls) – (Admin only) clear and delete all scheduled recurring daily polls',
+    '!pauserecurringpoll <id> (or !resumerecurringpoll <id>) – pause/resume a recurring daily poll',
     '!reset – (Admin only) clear the bot\'s conversation memory',
     TRIGGER_PREFIX ? `${TRIGGER_PREFIX} <question> – ask the bot anything (including setting rating, questions)` : '(bot also responds to any message)'
   ].join('\n');
@@ -3735,7 +4027,7 @@ function formatRatings() {
  *   "Yes" and "No". The bot then waits for a user prompt to generate matchups from Yes voters.
  * - If replacePollId or cancelExisting is specified, deletes the older poll from WhatsApp.
  */
-async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWord = null, timeWord = null, creatorName = null, creatorJid = null, includeCreator = true, replacePollId = null, cancelExisting = false, isCommand = false) {
+async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWord = null, timeWord = null, creatorName = null, creatorJid = null, includeCreator = true, replacePollId = null, cancelExisting = false, isCommand = false, noMatchups = false) {
   const isOptIn = !size;
 
   if (size !== null && size !== undefined) {
@@ -3892,6 +4184,7 @@ async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWor
     status: 'active', // 'active' | 'filled' | 'resolved' | 'cancelled' | 'stopped' | 'expired'
     isManual: false,
     isCommand: Boolean(isCommand),
+    noMatchups: Boolean(noMatchups),
     creator: (shouldIncludeCreator || leadingVirtualCount > 0) ? { name: creatorName || 'Player 1', jid: creatorJid || null } : null,
     lastConflictSignature: null,
     voteBuffer: new Map(), // voterJid -> raw pollUpdate entry
@@ -4193,24 +4486,24 @@ async function processPollVoteEvent(sock, pollMessageKey, rawPollUpdates) {
       players.push(voterJid ? nameFor(voterJid) : opt);
     }
 
-    // If created by direct command (!createpoll / !poll), do NOT auto-create matchups.
+    // If created with no-matchups option, do NOT auto-create matchups.
     // Set status to 'filled' and wait for explicit matchup request (!matchups / @tenbot matchups).
-    if (pollState.isCommand) {
+    if (pollState.noMatchups) {
       if (pollState.status !== 'filled') {
         pollState.status = 'filled';
         pollState.lastPlayers = players;
         persistPolls();
-        console.log(`[poll] Command-created poll ${pollId} filled (${players.length} players: ${players.join(', ')}). Status set to filled; waiting for matchup request.`);
+        console.log(`[poll] Poll ${pollId} filled (${players.length} players: ${players.join(', ')}). Auto-matchup disabled; status set to filled; waiting for matchup request.`);
       }
       return;
     }
 
-    // For polls created with @tenbot prompt, auto-create matchups immediately
+    // Auto-create matchups immediately after voting completes
     pollState.status = 'resolved';
     pollState.lastPlayers = players;
     persistPolls();
 
-    console.log(`[poll] Prompt-created poll ${pollId} filled -- auto-posting matchups for: ${players.join(', ')}`);
+    console.log(`[poll] Poll ${pollId} filled -- auto-posting matchups for: ${players.join(', ')}`);
 
     await ratings.ensureRated(players);
     const schedule = generateMatchups(players);
@@ -4731,6 +5024,12 @@ function buildContextBlurb(chatId) {
     ? rated.map((p) => `${p.name}: ${ratings.formatRating(p.rating)}`).join(', ')
     : 'nobody rated yet';
 
+  const chatRecurring = [...recurringPolls.values()].filter((s) => !chatId.endsWith('@g.us') || s.remoteJid === chatId);
+  let recurringText = 'none';
+  if (chatRecurring.length > 0) {
+    recurringText = chatRecurring.map((s) => `[ID: ${s.id}] ${s.size ? `${s.size} spots` : 'Opt-in'} for ${s.matchDisplay} (posts daily at ${s.postDisplay}, status: ${s.enabled ? 'active' : 'paused'})`).join('; ');
+  }
+
   const groupChatLog = messageHistory.formatRecentMessagesForContext(chatId);
 
   return (
@@ -4739,7 +5038,8 @@ function buildContextBlurb(chatId) {
     `Leaderboard (top 5): ${leaderboardText}\n` +
     `Recent matches: ${recentText}\n` +
     `Player ratings (${ratings.formatRating(ratings.MIN_RATING)}-${ratings.MAX_RATING}, a pairing's rating is the sum of its two players'): ${ratingsText}\n` +
-    `Active poll: ${pollText}\n\n` +
+    `Active poll: ${pollText}\n` +
+    `Recurring daily polls: ${recurringText}\n\n` +
     `--- Group Chat History (Past 2 Weeks) ---\n${groupChatLog}\n--- End of Group Chat History ---`
   );
 }
