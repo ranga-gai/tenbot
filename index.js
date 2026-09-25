@@ -3026,8 +3026,9 @@ async function getResponse(sock, text, chatId, sender, msg) {
     let manualLineup = parseLineup(text, knownPlayers(chatId));
 
     if (!manualLineup) {
-      // Check in order with short-circuit evaluation (court -> set -> vs -> @)
-      const hasLineupHint = /\bcourts?\b|\bct\b|\bc\d+\b/i.test(text) ||
+      // Check in order with short-circuit evaluation (lineup -> court -> set -> vs -> @)
+      const hasLineupHint = /\blineups?\b/i.test(text) ||
+                            /\bcourts?\b|\bct\b|\bc\d+\b/i.test(text) ||
                             /\bsets?\b/i.test(text) ||
                             /\b(?:vs\.?|v\.?|versus)\b/i.test(text) ||
                             /@\w+/i.test(text);
