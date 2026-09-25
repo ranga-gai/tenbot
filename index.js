@@ -112,6 +112,7 @@ const pollStore = require('./lib/pollStore');
 const namesStore = require('./lib/names');
 const messageHistory = require('./lib/messageHistory');
 const recurringPollsModule = require('./lib/recurringPolls');
+const scvcc = require('./lib/scvcc');
 const { resolvePlayDateTime, getSanJoseNow, getSanJoseParts, parseTimeString } = require('./lib/pollTime');
 
 // ---- CONFIG ----
@@ -521,7 +522,77 @@ const CLAUDE_TOOLS = [
       type: 'object',
       properties: {}
     }
-  }
+  },
+  {
+    name: 'check_court_availability',
+    description: 'Checks real-time court status and available open slots at Silver Creek Valley Country Club (SCVCC) for tennis courts (Courts 1-6) and pickleball courts.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        when: {
+          type: 'string',
+          description: 'Date or day description to check (e.g. "today", "tomorrow", "Saturday", "9/26/2026"). Defaults to today.'
+        },
+        time: {
+          type: 'string',
+          description: 'Optional time or period filter (e.g. "6pm", "7:00 PM", "9am", "morning", "afternoon", "evening").'
+        },
+        court: {
+          type: 'string',
+          description: 'Optional specific court filter (e.g. "Court 2", "Court 4", "Pickleball 1").'
+        },
+        sport: {
+          type: 'string',
+          description: 'Sport type: "tennis" (Courts 1-6, default) or "pickleball" (Pickleball Courts) or "all".'
+        }
+      }
+    }
+  },
+  {
+    name: 'book_court',
+    description: 'Books a tennis court (Courts 1-6) or pickleball court at Silver Creek Valley Country Club (SCVCC) for the member.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        when: {
+          type: 'string',
+          description: 'Date and time description (e.g. "tomorrow 6pm", "Saturday 9am", "today 7pm").'
+        },
+        date: {
+          type: 'string',
+          description: 'Optional explicit date (e.g. "9/26/2026", "tomorrow").'
+        },
+        time: {
+          type: 'string',
+          description: 'Start time of booking (e.g. "6:00 PM", "6pm", "9am").'
+        },
+        court: {
+          type: 'string',
+          description: 'Optional specific court preference (e.g. "Court 2", "Court 4", "Pickleball 1"). If omitted, books the first available court.'
+        },
+        duration: {
+          type: 'string',
+          description: 'Duration of the court reservation: "60 Minutes" (default), "90 Minutes", or "120 Minutes".'
+        },
+        partySize: {
+          type: 'string',
+          description: 'Party size: "Doubles" (default) or "Singles".'
+        },
+        sport: {
+          type: 'string',
+          description: 'Sport type: "tennis" (default) or "pickleball".'
+        }
+      }
+    }
+  },
+  {
+    name: 'get_my_court_bookings',
+    description: 'Retrieves active upcoming court reservations at Silver Creek Valley Country Club (SCVCC) for the member.',
+    input_schema: {
+      type: 'object',
+      properties: {}
+    }
+  },
 ];
 
 // How many past messages (per chat) to keep for conversational context
@@ -2944,6 +3015,18 @@ async function executeTool(sock, chatId, sender, toolUse, msg) {
     const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
     return await handleCancelRecurringPoll(sock, chatId, sender, senderJid, input.scheduleId);
   }
+    if (name === 'check_court_availability') {
+    const res = await scvcc.checkCourtAvailability(input);
+    return res?.message || 'Checked court availability.';
+  }
+  if (name === 'book_court') {
+    const res = await scvcc.bookCourt(input);
+    return res?.message || 'Court booked.';
+  }
+  if (name === 'get_my_court_bookings') {
+    const res = await scvcc.getMyReservations();
+    return res?.message || 'Retrieved court reservations.';
+  }
   if (name === 'clear_all_recurring_polls' || name === 'cancel_all_recurring_polls') {
     const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
     return await handleClearAllRecurringPolls(sock, chatId, sender, senderJid);
@@ -3057,6 +3140,27 @@ async function getResponse(sock, text, chatId, sender, msg) {
     chatHistories.delete(chatId);
     messageHistory.clear(chatId);
     return 'Conversation history and recent 2-week group message logs cleared.';
+  }
+
+  // --- SCVCC Court Status & Booking Commands ---
+  if (lower === '!courts' || lower.startsWith('!courts ') || lower === '!courtstatus' || lower.startsWith('!courtstatus ') || lower === '!courtavailability' || lower.startsWith('!courtavailability ')) {
+    const parsed = scvcc.parseCourtsCommand(text);
+    const res = await scvcc.checkCourtAvailability(parsed);
+    return res?.message || 'Could not retrieve court status.';
+  }
+
+  if (lower.startsWith('!bookcourt') || lower.startsWith('!reservecourt')) {
+    const parsed = scvcc.parseBookCourtCommand(text);
+    if (!parsed) {
+      return 'Please specify a time to book, e.g. "!bookcourt 6pm tomorrow" or "!bookcourt 9am Saturday Court 2 singles".';
+    }
+    const res = await scvcc.bookCourt(parsed);
+    return res?.message || 'Could not complete court booking.';
+  }
+
+  if (lower === '!mybookings' || lower === '!myreservations' || lower === '!mycourts') {
+    const res = await scvcc.getMyReservations();
+    return res?.message || 'Could not retrieve your court reservations.';
   }
 
   // --- Availability ---
@@ -3549,6 +3653,9 @@ function helpText() {
     `!setrating <rating> (or ${TRIGGER_PREFIX} my rating is <rating>) – set or update your rating (${ratings.MIN_RATING}–${ratings.MAX_RATING}) (admins can set ratings for other players)`,
     `!resetrating [player] (or ${TRIGGER_PREFIX} reset my rating) – reset rating back to baseline TennisRecord rating`,
     '!weather [location] – forecast for outdoor play (defaults to ' + DEFAULT_LOCATION + ')',
+    '!courts [when] [time] [court] [pb] – check court availability at SCVCC, e.g. "!courts tomorrow", "!courts 6pm saturday", "!courts pb tomorrow"',
+    '!bookcourt <time> [when] [court] [duration] [singles|doubles] – book a court at SCVCC, e.g. "!bookcourt 6pm tomorrow Court 2", "!bookcourt 9am sat Court 1 singles"',
+    '!mybookings (or !myreservations) – list your active upcoming court reservations at SCVCC',
     `${TRIGGER_PREFIX} create a poll [for <N>] [when] – post a match poll (N spots for singles/doubles, or Yes/No opt-in if N is omitted)`,
     '!poll [for <N>] [when] [no-matchups] (or !createpoll, !optinpoll, !yesnopoll) – direct command to create a match poll (fixed spots or Yes/No opt-in)',
     '!matchups (or !draw, !rematch) – generate matchups from active tennis match poll',
