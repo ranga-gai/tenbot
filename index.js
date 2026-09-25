@@ -113,6 +113,7 @@ const namesStore = require('./lib/names');
 const messageHistory = require('./lib/messageHistory');
 const recurringPollsModule = require('./lib/recurringPolls');
 const scvcc = require('./lib/scvcc');
+const { helpText } = require('./lib/help');
 const { resolvePlayDateTime, getSanJoseNow, getSanJoseParts, parseTimeString } = require('./lib/pollTime');
 
 // ---- CONFIG ----
@@ -3085,7 +3086,10 @@ async function getResponse(sock, text, chatId, sender, msg) {
   // --- Basic commands ---
   if (lower === '!ping') return 'pong 🏓';
 
-  if (lower.startsWith('!help')) return helpText();
+  if (lower === '!help' || lower.startsWith('!help ')) {
+    const specificCmd = text.slice('!help'.length).trim().replace(/^!/, '').toLowerCase();
+    return helpText(specificCmd || null);
+  }
 
   if (lower === '!reset') {
     const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
@@ -3584,50 +3588,7 @@ async function getResponse(sock, text, chatId, sender, msg) {
   }
 }
 
-function helpText() {
-  return [
-    'Commands:',
-    '!free <when> – mark yourself free to play, e.g. "!free Sat 9am"',
-    '!free – show who\'s free and when',
-    '!notfree – remove yourself from the availability list',
-    '!clearfree – (Admin only) clear the whole availability list',
-    '!score <winner> def <loser> <score> – record a match and update ratings, e.g. "!score Mike & Sara def John & Alex 6-4 6-2"',
-    `  (or tell me in words: "${TRIGGER_PREFIX} Mike & Sara beat John & Alex 6-4", or "${TRIGGER_PREFIX} we won" after a draw – no score means 6-3)`,
-    '!leaderboard – show the win/loss leaderboard',
-    '!ratings – show player ratings used to balance the courts',
-    '!alias <alias> (or !alias <name> = <alias>) – add an alias for yourself or another player, e.g. "!alias PK" or "!alias John = JD"',
-    '!deletealias <name> = <alias> (or !deletealias <alias>) – remove an alias for a player',
-    '!aliases – list all registered players and their aliases',
-    '!fullname <full name> (or !setfullname <name> = <full name>) – set your full name and lookup initial TennisRecord rating',
-    '!refreshratings – (Admin only) refresh player ratings from TennisRecord.com now',
-    `!setrating <rating> (or ${TRIGGER_PREFIX} my rating is <rating>) – set or update your rating (${ratings.MIN_RATING}–${ratings.MAX_RATING}) (admins can set ratings for other players)`,
-    `!resetrating [player] (or ${TRIGGER_PREFIX} reset my rating) – reset rating back to baseline TennisRecord rating`,
-    '!weather [location] – forecast for outdoor play (defaults to ' + DEFAULT_LOCATION + ')',
-    '!courts [when] [time] [court] [pb] – check court availability at SCVCC, e.g. "!courts tomorrow", "!courts 6pm saturday", "!courts pb tomorrow"',
-    `${TRIGGER_PREFIX} create a poll [for <N>] [when] – post a match poll (N spots for singles/doubles, or Yes/No opt-in if N is omitted)`,
-    '!poll [for <N>] [when] [no-matchups] (or !createpoll, !optinpoll, !yesnopoll) – direct command to create a match poll (fixed spots or Yes/No opt-in)',
-    '!matchups (or !draw, !rematch) – generate matchups from active tennis match poll',
-    '!stoppoll (or !closepoll) – stop voting and reminders, setting poll status to stopped (creator or admin only)',
-    '!resumepoll (or !reopenpoll) – resume voting and reminders for a stopped poll (creator or admin only)',
-    '!pausereminders [pollId] (or !pausereminder) – pause upcoming match reminders for active poll(s)',
-    '!resumereminders [pollId] (or !resumereminder) – resume upcoming match reminders for active poll(s)',
-    '!remind [pollId] (or !sendreminder, !remindpoll) – manually trigger a reminder for active match poll(s)',
-    '!cancelpoll (or !deletepoll) – cancel and delete the active poll from WhatsApp (creator or admin only)',
-    '!clearallpolls (or !clearpolls) – (Admin only) remove all polls from bot state without deleting them from WhatsApp',
-    '!pollstatus – debug: show raw vote count and voters for active match poll(s) in this chat',
-    '!allpolls (or !pollstatus all) – (Admin only) debug: show detailed status of all tracked polls',
-    '!activepolls (or !active, !pollstatus active) – list match polls with status active, filled, or stopped',
-    '!upcomingpolls (or !upcoming, !pollstatus upcoming) – list all match polls whose play time has not passed yet',
-    '!cleanuppolls – (Admin only) debug: force a sweep that deletes expired/completed polls now',
-    '!recurringpoll [size] <matchTime> [at <postTime>] [days] [no-matchups] – schedule a recurring match poll, e.g. "!recurringpoll 4 7pm mon-thu", "!recurringpoll 4 7pm at 8am on weekdays", "!recurringpoll 4 9am on weekends", "!recurringpoll opt-in 7pm mon, wed, fri"',
-    '!recurringpolls – list all scheduled recurring match polls',
-    '!cancelrecurringpoll <id> – cancel and delete a scheduled recurring daily poll (creator or admin only)',
-    '!clearallrecurringpolls (or !clearrecurringpolls, !cancelallrecurringpolls) – (Admin only) clear and delete all scheduled recurring daily polls',
-    '!pauserecurringpoll <id> (or !resumerecurringpoll <id>) – pause/resume a recurring daily poll',
-    '!reset – (Admin only) clear the bot\'s conversation memory',
-    TRIGGER_PREFIX ? `${TRIGGER_PREFIX} <question> – ask the bot anything (including setting rating, questions)` : '(bot also responds to any message)'
-  ].join('\n');
-}
+
 
 async function handleSetRating(sock, chatId, senderJid, senderName, playerName, ratingVal) {
   if (typeof ratingVal !== 'number' || Number.isNaN(ratingVal) || ratingVal < ratings.MIN_RATING || ratingVal > ratings.MAX_RATING) {
