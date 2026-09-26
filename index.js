@@ -4256,12 +4256,7 @@ async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWor
   let leadingVirtualCount = 0;
   let startIdx = 1;
 
-  if (isOptIn) {
-    values = ['Yes', 'No'];
-    const timeLabel = resolvedWhen ? resolvedWhen : 'today';
-    const creatorLabel = shouldIncludeCreator && creatorName ? `${creatorName}'s poll: ` : '';
-    pollTitle = `🎾 ${creatorLabel}${timeLabel} (Vote Yes/No)`;
-  } else {
+  if (!isOptIn) {
     const givenCount = size;
     if (isValidPlayerCount(givenCount)) {
       validCount = givenCount;
@@ -4278,12 +4273,66 @@ async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWor
       const count = givenCount;
       values = Array.from({ length: count }, (_, i) => `Player ${i + startIdx}`);
     }
-    const timeLabel = resolvedWhen ? resolvedWhen : 'today';
+  } else {
+    values = ['Yes', 'No'];
+  }
+
+  // Obtain available courts from SCVCC (available for >= 90 mins, excluding Court 4)
+  let courtLine = '';
+  try {
+    let queryTime = effectiveTimeWord;
+    if (!queryTime && playAt) {
+      const sjParts = getSanJoseParts(playAt);
+      const h = sjParts.hour === 0 ? 12 : (sjParts.hour > 12 ? sjParts.hour - 12 : sjParts.hour);
+      const m = String(sjParts.minute).padStart(2, '0');
+      const ampm = sjParts.hour >= 12 ? 'pm' : 'am';
+      queryTime = `${h}:${m}${ampm}`;
+    }
+
+    if (queryTime) {
+      const targetDateMDY = scvcc.resolveDateToMDY(effectiveDayWord || resolvedWhen || playAt);
+      const avail = await scvcc.checkCourtAvailability({
+        when: targetDateMDY,
+        time: queryTime,
+        sport: 'tennis'
+      });
+      if (avail && avail.success) {
+        let openCourts = 0;
+        if (avail.slots && avail.slots.length > 0) {
+          const slot = avail.slots[0];
+          openCourts = slot.courts.filter(c => 
+            c.status === 'available' && 
+            (c.availableMinutes || 0) >= 90 && 
+            !/court\s*4\b|ct\s*4\b/i.test(c.court)
+          ).length;
+        } else if (typeof avail.totalAvailable === 'number') {
+          openCourts = avail.totalAvailable;
+        }
+        const courtWord = openCourts === 1 ? 'COURT' : 'COURTS';
+        const rawCourtText = `${openCourts} ${courtWord} AVAILABLE`;
+        const largeCourtText = rawCourtText.replace(/[A-Z0-9]/g, (ch) => {
+          const code = ch.charCodeAt(0);
+          if (code >= 48 && code <= 57) return String.fromCodePoint(0x1D7EC + (code - 48));
+          if (code >= 65 && code <= 90) return String.fromCodePoint(0x1D5D4 + (code - 65));
+          return ch;
+        });
+        courtLine = `\n\n_${largeCourtText}_\n`;
+      }
+    }
+  } catch (err) {
+    console.warn('[poll] Could not fetch SCVCC court availability for poll title:', err.message);
+  }
+
+  const timeLabel = resolvedWhen ? resolvedWhen : 'today';
+
+  if (isOptIn) {
+    const creatorLabel = shouldIncludeCreator && creatorName ? `${creatorName}'s poll: ` : '';
+    pollTitle = `🎾 ${creatorLabel}${timeLabel} (Vote Yes/No)${courtLine}`;
+  } else {
     const slotCount = values.length;
     const slotLabel = slotCount === 1 ? '1 slot' : `${slotCount} slots`;
     const creatorLabel = (shouldIncludeCreator || leadingVirtualCount > 0) && creatorName ? `${creatorName}'s poll: ` : '';
-
-    pollTitle = `🎾 ${creatorLabel}${timeLabel} (${slotLabel} / ${validCount})`;
+    pollTitle = `🎾 ${creatorLabel}${timeLabel} (${slotLabel} / ${validCount})${courtLine}`;
   }
 
   const sent = await sock.sendMessage(remoteJid, {
