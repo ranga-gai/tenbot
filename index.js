@@ -149,7 +149,7 @@ const SYSTEM_PROMPT =
   'conversational (1-3 sentences) unless asked for more detail. You have ' +
   "access to tools to create match polls (fixed-spot polls for 2 singles or 4/8/12 doubles, " +
   "or Yes/No opt-in polls when no number of players is specified), generate matchups from poll votes, " +
-  "set/update player ratings, check weather, cancel/delete polls, schedule recurring match polls on specific days of the week or every day (schedule_recurring_poll), list recurring schedules (list_recurring_polls), and access the group's availability list, win/loss leaderboard, " +
+  "set/update player ratings, check weather, cancel/delete polls, schedule recurring match polls on specific days of the week or every day (schedule_recurring_poll), modify recurring schedules (modify_recurring_poll), list recurring schedules (list_recurring_polls), and access the group's availability list, win/loss leaderboard, " +
   'and active polls (given below). Multiple polls can be created for different times or by different users. ' +
   'The live local time in San Jose, CA is provided at the top of the context blurb below. ' +
   'Polls created manually by users for organizing tennis matches are passively tracked by the bot (marked as user-created / isManual). ' +
@@ -492,6 +492,53 @@ const CLAUDE_TOOLS = [
         }
       },
       required: ['matchTime']
+    }
+  },
+  {
+    name: 'modify_recurring_poll',
+    description: 'Modifies an existing scheduled recurring match poll (e.g. change time, post time, player spots, days of the week, or auto-matchups). Only the poll creator or group admins can modify it.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        scheduleId: {
+          type: 'string',
+          description: 'The schedule ID of the recurring poll to modify (e.g. "rec_1", "rec_...").'
+        },
+        size: {
+          type: 'integer',
+          description: 'Optional new player count (2 for singles, 4/8/12 for doubles). If type is opt_in, set to null.'
+        },
+        type: {
+          type: 'string',
+          enum: ['spots', 'opt_in'],
+          description: 'Poll format: "spots" for fixed player count or "opt_in" for Yes/No poll.'
+        },
+        matchTime: {
+          type: 'string',
+          description: 'Optional new match time (e.g. "7pm", "9am", "6:30pm").'
+        },
+        postTime: {
+          type: 'string',
+          description: 'Optional new post time (e.g. "8am", "7:30am", "7pm").'
+        },
+        days: {
+          type: 'string',
+          description: 'Optional new days of week (e.g. "weekdays", "mon-thu", "weekends", "mon,wed,fri", "everyday").'
+        },
+        autoMatchups: {
+          type: 'boolean',
+          description: 'Optional: whether to automatically generate matchups when poll fills.'
+        },
+        noMatchups: {
+          type: 'boolean',
+          description: 'Optional: if true, disable automatic matchups generation when poll fills.'
+        },
+        includeCreator: {
+          type: 'boolean',
+          description: 'Optional: whether to automatically include creator as Player 1.'
+        }
+      },
+      required: ['scheduleId']
     }
   },
   {
@@ -2003,6 +2050,43 @@ async function handleClearAllRecurringPolls(sock, chatId, sender, senderJid) {
   return await recurringPollsModule.clearAllRecurringPolls({ recurringPolls, persistPolls, sender, chatId });
 }
 
+async function handleModifyRecurringPoll(sock, chatId, sender, senderJid, scheduleId, updates) {
+  const cleanId = String(scheduleId || '').trim();
+  if (!cleanId) {
+    return 'Please provide the schedule ID to modify, e.g. "!modifyrecurringpoll rec_1 8 6pm at 7am mon-thu" (see "!recurringpolls" for active IDs).';
+  }
+
+  let targetKey = cleanId;
+  if (!recurringPolls.has(targetKey)) {
+    for (const key of recurringPolls.keys()) {
+      if (key.toLowerCase() === cleanId.toLowerCase()) {
+        targetKey = key;
+        break;
+      }
+    }
+  }
+
+  if (!recurringPolls.has(targetKey)) {
+    return `Schedule ID "\`${cleanId}\`" was not found. Use "!recurringpolls" to view active schedules.`;
+  }
+
+  const sched = recurringPolls.get(targetKey);
+  const isCreator = sched.creator ? isSameUser(sched.creator.jid, senderJid, sched.creator.name, sender) : false;
+  const isAdmin = await isUserAdmin(sock, chatId, senderJid);
+
+  if (!isCreator && !isAdmin) {
+    return '⚠️ Only the creator of this recurring poll or group admins can modify it.';
+  }
+
+  return await recurringPollsModule.modifyRecurringPoll({
+    recurringPolls,
+    persistPolls,
+    sender,
+    scheduleId: targetKey,
+    updates
+  });
+}
+
 async function handlePauseRecurringPoll(sock, chatId, sender, senderJid, scheduleId) {
   const cleanId = String(scheduleId || '').trim();
   if (!cleanId || !recurringPolls.has(cleanId)) {
@@ -2968,6 +3052,10 @@ async function executeTool(sock, chatId, sender, toolUse, msg) {
   if (name === 'list_recurring_polls') {
     return handleListRecurringPolls(chatId);
   }
+  if (name === 'modify_recurring_poll') {
+    const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
+    return await handleModifyRecurringPoll(sock, chatId, sender, senderJid, input.scheduleId, input);
+  }
   if (name === 'cancel_recurring_poll') {
     const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
     return await handleCancelRecurringPoll(sock, chatId, sender, senderJid, input.scheduleId);
@@ -3080,7 +3168,11 @@ async function handleManualLineup(sock, chatId, sender, lineup, msg) {
   return null;
 }
 
-async function getResponse(sock, text, chatId, sender, msg) {
+async function getResponse(sock, rawText, chatId, sender, msg) {
+  const text = (rawText || '')
+    .replace(/[\u200B-\u200D\u2060\uFEFF]/g, '')
+    .replace(/[\u00A0\u202F\u2000-\u200A]/g, ' ')
+    .trim();
   const lower = text.toLowerCase();
 
   // --- Basic commands ---
@@ -3334,6 +3426,14 @@ async function getResponse(sock, text, chatId, sender, msg) {
     return await handleCancelRecurringPoll(sock, chatId, sender, senderJid, specificId);
   }
 
+  if (/^!(?:modifyrecurringpoll|editrecurringpoll|updaterecurringpoll|changerecurringpoll|modifyrecurring|editrecurring|updaterecurring)\b/i.test(text)) {
+    const parsed = recurringPollsModule.parseRecurringPollText(text);
+    if (parsed && parsed.action === 'modify') {
+      const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
+      return await handleModifyRecurringPoll(sock, chatId, sender, senderJid, parsed.scheduleId, parsed.updates);
+    }
+  }
+
   if (lower.startsWith('!pauserecurringpoll') || lower.startsWith('!stoprecurringpoll')) {
     const parts = text.split(/\s+/);
     const specificId = parts.length > 1 ? parts[1].trim() : null;
@@ -3365,6 +3465,10 @@ async function getResponse(sock, text, chatId, sender, msg) {
       if (parsed.action === 'pause') {
         const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
         return await handlePauseRecurringPoll(sock, chatId, sender, senderJid, parsed.scheduleId);
+      }
+      if (parsed.action === 'modify') {
+        const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
+        return await handleModifyRecurringPoll(sock, chatId, sender, senderJid, parsed.scheduleId, parsed.updates);
       }
       if (parsed.action === 'resume') {
         const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
@@ -3550,6 +3654,10 @@ async function getResponse(sock, text, chatId, sender, msg) {
     if (directRecurringParsed.action === 'pause') {
       const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
       return await handlePauseRecurringPoll(sock, chatId, sender, senderJid, directRecurringParsed.scheduleId);
+    }
+    if (directRecurringParsed.action === 'modify') {
+      const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
+      return await handleModifyRecurringPoll(sock, chatId, sender, senderJid, directRecurringParsed.scheduleId, directRecurringParsed.updates);
     }
     if (directRecurringParsed.action === 'resume') {
       const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
