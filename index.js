@@ -233,6 +233,14 @@ const CLAUDE_TOOLS = [
         noMatchups: {
           type: 'boolean',
           description: 'If true, do not automatically create matchups when voting completes.'
+        },
+        noCourts: {
+          type: 'boolean',
+          description: 'If true, do not fetch or include SCVCC court availability in the poll title.'
+        },
+        includeCourts: {
+          type: 'boolean',
+          description: 'Whether to include court availability in the poll title (default: true). Set to false if user requests without court availability.'
         }
       }
     }
@@ -489,6 +497,10 @@ const CLAUDE_TOOLS = [
         noMatchups: {
           type: 'boolean',
           description: 'If true, do not automatically create matchups when the poll ends/fills.'
+        },
+        noCourts: {
+          type: 'boolean',
+          description: 'If true, do not include court availability in the poll title for this recurring schedule.'
         }
       },
       required: ['matchTime']
@@ -536,6 +548,14 @@ const CLAUDE_TOOLS = [
         includeCreator: {
           type: 'boolean',
           description: 'Optional: whether to automatically include creator as Player 1.'
+        },
+        noCourts: {
+          type: 'boolean',
+          description: 'Optional: if true, disable court availability in poll title.'
+        },
+        includeCourts: {
+          type: 'boolean',
+          description: 'Optional: whether to include court availability in poll title.'
         }
       },
       required: ['scheduleId']
@@ -1082,6 +1102,9 @@ function parsePollCreationText(text) {
   // Determine noMatchups
   const noMatchups = /(?:^|\s)(?:--no-?matchups?|--no-?draw)\b|\b(?:no[-_\s]*matchups?|no[-_\s]*draw|without\s+(?:auto[-_\s]*|automatic\s+)?matchups?|without\s+(?:auto[-_\s]*|automatic\s+)?draw|(?:do\s*not|don\x27?t)\s+(?:create|make|generate|post|auto-?generate)\s+(?:matchups?|draw|the\s+draw|the\s+matchups?)|no[-_\s]*(?:auto\s+|automatic\s+)?matchups?)\b/i.test(text);
 
+  // Determine noCourts
+  const noCourts = /(?:^|\s)(?:--no-?courts?|--no-?court-?avail(?:ability)?|--no-?avail(?:ability)?)\b|\b(?:no[-_\s]*courts?|without[-_\s]*courts?|without[-_\s]*(?:court\s+)?availability|no[-_\s]*(?:court\s+)?availability|exclude[-_\s]*courts?|hide[-_\s]*courts?|dont\s+include\s+(?:the\s+)?court(?:s|\s+availability)?|do\s*not\s+include\s+(?:the\s+)?court(?:s|\s+availability)?)\b/i.test(text);
+
   return {
     size,
     when,
@@ -1089,7 +1112,8 @@ function parsePollCreationText(text) {
     timeWord,
     includeCreator,
     cancelExisting,
-    noMatchups
+    noMatchups,
+    noCourts
   };
 }
 
@@ -1097,7 +1121,7 @@ function parsePollCreationText(text) {
  * Handles direct poll creation from parsed message parameters without calling the LLM.
  */
 async function handleDirectPollCreation(sock, chatId, sender, msg, parsed, opts = {}) {
-  const { size, when, dayWord, timeWord, includeCreator, cancelExisting } = parsed;
+  const { size, when, dayWord, timeWord, includeCreator, cancelExisting, noMatchups, noCourts } = parsed;
   const isCommand = opts.isCommand === true;
   const creatorName = sender !== 'Someone' ? sender : (msg?.key?.participant ? nameFor(msg.key.participant) : 'Player 1');
   const creatorJid = msg?.key?.participant || msg?.key?.remoteJid || null;
@@ -1116,7 +1140,8 @@ async function handleDirectPollCreation(sock, chatId, sender, msg, parsed, opts 
     null,
     cancelExisting,
     isCommand,
-    parsed.noMatchups || false
+    noMatchups || false,
+    noCourts || false
   );
 
   if (res?.err) {
@@ -2979,7 +3004,8 @@ async function executeTool(sock, chatId, sender, toolUse, msg) {
     const targetChatId = chatId.endsWith('@g.us') ? chatId : (await getTargetGroupJid(sock) || chatId);
 
     const noMatchups = input.noMatchups === true || input.autoMatchups === false;
-    const res = await createMatchPoll(sock, targetChatId, size, when, dayWord, timeWord, creatorName, creatorJid, includeCreator, replacePollId, cancelExisting, false, noMatchups);
+    const noCourts = input.noCourts === true || input.includeCourts === false;
+    const res = await createMatchPoll(sock, targetChatId, size, when, dayWord, timeWord, creatorName, creatorJid, includeCreator, replacePollId, cancelExisting, false, noMatchups, noCourts);
     if (res?.err) {
       return `Could not create poll: ${res.err}`;
     }
@@ -4198,7 +4224,7 @@ function formatRatings() {
  *   "Yes" and "No". The bot then waits for a user prompt to generate matchups from Yes voters.
  * - If replacePollId or cancelExisting is specified, deletes the older poll from WhatsApp.
  */
-async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWord = null, timeWord = null, creatorName = null, creatorJid = null, includeCreator = true, replacePollId = null, cancelExisting = false, isCommand = false, noMatchups = false) {
+async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWord = null, timeWord = null, creatorName = null, creatorJid = null, includeCreator = true, replacePollId = null, cancelExisting = false, isCommand = false, noMatchups = false, noCourts = false) {
   const isOptIn = !size;
 
   if (size !== null && size !== undefined) {
@@ -4320,50 +4346,52 @@ async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWor
     values = ['Yes', 'No'];
   }
 
-  // Obtain available courts from SCVCC (available for >= 90 mins, excluding Court 4)
+  // Obtain available courts from SCVCC (available for >= 90 mins, excluding Court 4) if not disabled
   let courtLine = '';
-  try {
-    let queryTime = effectiveTimeWord;
-    if (!queryTime && playAt) {
-      const sjParts = getSanJoseParts(playAt);
-      const h = sjParts.hour === 0 ? 12 : (sjParts.hour > 12 ? sjParts.hour - 12 : sjParts.hour);
-      const m = String(sjParts.minute).padStart(2, '0');
-      const ampm = sjParts.hour >= 12 ? 'pm' : 'am';
-      queryTime = `${h}:${m}${ampm}`;
-    }
-
-    if (queryTime) {
-      const targetDateMDY = scvcc.resolveDateToMDY(effectiveDayWord || resolvedWhen || playAt);
-      const avail = await scvcc.checkCourtAvailability({
-        when: targetDateMDY,
-        time: queryTime,
-        sport: 'tennis'
-      });
-      if (avail && avail.success) {
-        let openCourts = 0;
-        if (avail.slots && avail.slots.length > 0) {
-          const slot = avail.slots[0];
-          openCourts = slot.courts.filter(c => 
-            c.status === 'available' && 
-            (c.availableMinutes || 0) >= 90 && 
-            !/court\s*4\b|ct\s*4\b/i.test(c.court)
-          ).length;
-        } else if (typeof avail.totalAvailable === 'number') {
-          openCourts = avail.totalAvailable;
-        }
-        const courtWord = openCourts === 1 ? 'COURT' : 'COURTS';
-        const rawCourtText = `${openCourts} ${courtWord} AVAILABLE`;
-        const largeCourtText = rawCourtText.replace(/[A-Z0-9]/g, (ch) => {
-          const code = ch.charCodeAt(0);
-          if (code >= 48 && code <= 57) return String.fromCodePoint(0x1D7EC + (code - 48));
-          if (code >= 65 && code <= 90) return String.fromCodePoint(0x1D5D4 + (code - 65));
-          return ch;
-        });
-        courtLine = `\n\n_${largeCourtText}_\n`;
+  if (!noCourts) {
+    try {
+      let queryTime = effectiveTimeWord;
+      if (!queryTime && playAt) {
+        const sjParts = getSanJoseParts(playAt);
+        const h = sjParts.hour === 0 ? 12 : (sjParts.hour > 12 ? sjParts.hour - 12 : sjParts.hour);
+        const m = String(sjParts.minute).padStart(2, '0');
+        const ampm = sjParts.hour >= 12 ? 'pm' : 'am';
+        queryTime = `${h}:${m}${ampm}`;
       }
+
+      if (queryTime) {
+        const targetDateMDY = scvcc.resolveDateToMDY(effectiveDayWord || resolvedWhen || playAt);
+        const avail = await scvcc.checkCourtAvailability({
+          when: targetDateMDY,
+          time: queryTime,
+          sport: 'tennis'
+        });
+        if (avail && avail.success) {
+          let openCourts = 0;
+          if (avail.slots && avail.slots.length > 0) {
+            const slot = avail.slots[0];
+            openCourts = slot.courts.filter(c => 
+              c.status === 'available' && 
+              (c.availableMinutes || 0) >= 90 && 
+              !/court\s*4\b|ct\s*4\b/i.test(c.court)
+            ).length;
+          } else if (typeof avail.totalAvailable === 'number') {
+            openCourts = avail.totalAvailable;
+          }
+          const courtWord = openCourts === 1 ? 'COURT' : 'COURTS';
+          const rawCourtText = `${openCourts} ${courtWord} AVAILABLE`;
+          const largeCourtText = rawCourtText.replace(/[A-Z0-9]/g, (ch) => {
+            const code = ch.charCodeAt(0);
+            if (code >= 48 && code <= 57) return String.fromCodePoint(0x1D7EC + (code - 48));
+            if (code >= 65 && code <= 90) return String.fromCodePoint(0x1D5D4 + (code - 65));
+            return ch;
+          });
+          courtLine = `\n\n_${largeCourtText}_\n`;
+        }
+      }
+    } catch (err) {
+      console.warn('[poll] Could not fetch SCVCC court availability for poll title:', err.message);
     }
-  } catch (err) {
-    console.warn('[poll] Could not fetch SCVCC court availability for poll title:', err.message);
   }
 
   const timeLabel = resolvedWhen ? resolvedWhen : 'today';
