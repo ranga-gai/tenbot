@@ -964,6 +964,69 @@ function resolveManualPollPlayers(targetPollState, currentPlayers) {
 }
 
 /**
+ * For fixed-spot polls (including auto-scheduled prebooked court polls):
+ * Resolves the list of playing players, filled slot count, total slot count, and whether all slots are filled.
+ * Handles:
+ * - Prebooked court slots: "<canonical name>'s Spot", which default to the prebooked group player
+ *   unless a voter votes on and overrides that slot.
+ * - Leading creator/virtual spots (if first option > 1).
+ * - Regular voting slots ("Player X").
+ */
+function resolveFixedPollRoster(pollState, aggregated = [], bySlot = null) {
+  const options = pollState.options || [];
+  const slotMap = bySlot || new Map((aggregated || []).map((o) => [o.name, o.voters && o.voters.length > 0 ? o.voters[0] : null]));
+
+  const prebookedSlotMap = new Map();
+  if (Array.isArray(pollState.prebookedPlayers)) {
+    for (const p of pollState.prebookedPlayers) {
+      if (typeof p === 'string') {
+        prebookedSlotMap.set(`${p}'s Spot`, p);
+      } else if (p && typeof p === 'object') {
+        const sName = p.slotName || p.slot || `${p.defaultPlayer || p.name}'s Spot`;
+        const pName = p.defaultPlayer || p.name || p.canonicalName;
+        if (sName && pName) prebookedSlotMap.set(sName, pName);
+      }
+    }
+  }
+
+  const hasPrebooked = prebookedSlotMap.size > 0;
+  const firstSlotNum = hasPrebooked ? null : getFirstSlotNumber(options);
+  const leadingSpots = (!hasPrebooked && firstSlotNum && firstSlotNum > 1)
+    ? (firstSlotNum - 1)
+    : (!hasPrebooked && pollState.creator ? 1 : 0);
+  const creatorName = pollState.creator?.name || (pollState.creator?.jid ? nameFor(pollState.creator.jid) : 'Creator');
+
+  const players = [];
+  // For polls with leading virtual/creator spots
+  for (let i = 0; i < leadingSpots; i++) {
+    addNextCreatorPlayer(players, creatorName);
+  }
+
+  let filledCount = leadingSpots;
+  const totalSlotsCount = leadingSpots + options.length;
+
+  for (const opt of options) {
+    const voterJid = slotMap.get(opt);
+    if (voterJid) {
+      // Voted slot (or overridden prebooked slot)
+      const playerName = nameFor(voterJid);
+      players.push(playerName);
+      filledCount++;
+    } else if (prebookedSlotMap.has(opt)) {
+      // Unvoted prebooked slot -> defaults to prebooked player
+      const defaultPlayer = prebookedSlotMap.get(opt);
+      players.push(defaultPlayer);
+      filledCount++;
+    } else {
+      // Unvoted normal slot -> empty
+    }
+  }
+
+  const isAllFilled = (filledCount >= totalSlotsCount);
+  return { players, filledCount, totalSlotsCount, isAllFilled, prebookedSlotMap };
+}
+
+/**
  * Extracts options, votes, and interested players from a poll.
  */
 function getPollVoters(pollId, pollState, mePn) {
@@ -1321,7 +1384,26 @@ function isUserInPoll(pollState, userJid, userName) {
     }
   }
 
-  // 3. Check lastPlayers if poll was resolved
+  // 3. Check prebookedPlayers (if default spot not overridden)
+  if (Array.isArray(pollState.prebookedPlayers)) {
+    const userKey = ratings.keyFor(userName);
+    const resolvedName = userJid ? nameFor(userJid) : null;
+    const resolvedKey = resolvedName ? ratings.keyFor(resolvedName) : null;
+
+    for (const pb of pollState.prebookedPlayers) {
+      const pbName = typeof pb === 'string' ? pb : (pb.defaultPlayer || pb.name || pb.canonicalName);
+      const pbFullName = typeof pb === 'object' ? pb.fullName : null;
+      const pbKey = ratings.keyFor(pbName);
+      const pbFullKey = pbFullName ? ratings.keyFor(pbFullName) : null;
+
+      if ((userKey && (userKey === pbKey || userKey === pbFullKey)) ||
+          (resolvedKey && (resolvedKey === pbKey || resolvedKey === pbFullKey))) {
+        return true;
+      }
+    }
+  }
+
+  // 4. Check lastPlayers if poll was resolved
   if (Array.isArray(pollState.lastPlayers)) {
     const userKey = ratings.keyFor(userName);
     const resolvedName = userJid ? nameFor(userJid) : null;
@@ -1907,32 +1989,14 @@ async function sendPollReminder(sock, pollId, pollState, isManualTrigger = false
       players.unshift(pollState.creator.name);
     }
   } else {
-    const options = pollState.options || [];
-    const firstSlotNum = getFirstSlotNumber(options);
-    const leadingSpots = (firstSlotNum && firstSlotNum > 1) ? (firstSlotNum - 1) : (pollState.creator ? 1 : 0);
-    neededVotes = options.length > 0 ? options.length : (pollState.size ? (pollState.creator ? pollState.size - 1 : pollState.size) : 4);
-    totalSpots = leadingSpots + neededVotes;
-
-    const filledVotes = aggregated && aggregated.length > 0
-      ? aggregated.filter((o) => o.voters.length > 0).length
-      : (interestedPlayers ? interestedPlayers.length : (pollState.voteBuffer ? pollState.voteBuffer.size : 0));
-    openSpots = Math.max(0, neededVotes - filledVotes);
+    const { players: resolvedPlayers, filledCount, totalSlotsCount } = resolveFixedPollRoster(pollState, aggregated);
+    totalSpots = totalSlotsCount;
+    openSpots = Math.max(0, totalSlotsCount - filledCount);
+    neededVotes = totalSlotsCount;
 
     if (openSpots <= 0 && !isManualTrigger) return false;
 
-    if (Array.isArray(pollState.prebookedPlayers) && pollState.prebookedPlayers.length > 0) {
-      for (const p of pollState.prebookedPlayers) {
-        players.push(p);
-      }
-    } else {
-      const creatorName = pollState.creator?.name || (pollState.creator?.jid ? nameFor(pollState.creator.jid) : 'Creator');
-      for (let i = 0; i < leadingSpots; i++) {
-        addNextCreatorPlayer(players, creatorName);
-      }
-    }
-    for (const p of interestedPlayers) {
-      if (!players.includes(p)) players.push(p);
-    }
+    players = resolvedPlayers;
   }
 
   const playerList = players.length > 0 ? players.join(', ') : 'None yet';
@@ -4354,7 +4418,7 @@ async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWor
     }
   }
 
-  let shouldIncludeCreator = includeCreator;
+  let shouldIncludeCreator = isAuto ? false : includeCreator;
   let excludedReason = null;
 
   // Check if a poll already exists for the same person within 90 minutes of the new poll's start time
@@ -4390,6 +4454,7 @@ async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWor
   let courtLine = '';
 
   let prebookedCourtPlayers = [];
+  let prebookedInfo = [];
   let queryTime = effectiveTimeWord;
   if (!queryTime && playAt) {
     const sjParts = getSanJoseParts(playAt);
@@ -4451,9 +4516,19 @@ async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWor
     validCount = totalCourtsCount > 0 ? totalCourtsCount * 4 : 4;
 
     const courtLines = [];
+    prebookedInfo = [];
     for (const pb of selectedPrebooked) {
       courtLines.push(`${pb.court} - ${pb.player} Booking`);
-      addNextCreatorPlayer(prebookedCourtPlayers, pb.player);
+      const match = namesStore.findIdByNameOrAlias(pb.player);
+      const canonicalName = (match && match.entry?.name) ? match.entry.name : pb.player;
+      const slotPlayerName = addNextCreatorPlayer(prebookedCourtPlayers, canonicalName);
+      const slotLabel = `${slotPlayerName}'s Spot`;
+      prebookedInfo.push({
+        slotName: slotLabel,
+        defaultPlayer: slotPlayerName,
+        fullName: pb.player,
+        court: pb.court
+      });
     }
     for (const fc of selectedFree) {
       courtLines.push(`${fc.court} - Available`);
@@ -4463,19 +4538,21 @@ async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWor
       courtLine = `\n\n${courtLines.join('\n')}\n`;
     }
 
-    // Each pre-booked court includes the first matching group player as already a player, reducing vote slots by 1.
-    // E.g. 2 pre-booked courts + 1 available court = 2 pre-booked players + 10 vote slots = 12 total.
-    if (prebookedCourtPlayers.length > 0) {
-      const occupiedCount = prebookedCourtPlayers.length;
-      const count = Math.max(1, validCount - occupiedCount);
-      startIdx = occupiedCount + 1;
+    if (prebookedInfo.length > 0) {
+      const prebookedCount = prebookedInfo.length;
+      values = [];
+      for (const pb of prebookedInfo) {
+        values.push(pb.slotName);
+      }
+      for (let i = prebookedCount + 1; i <= validCount; i++) {
+        values.push(`Player ${i}`);
+      }
+      startIdx = 1;
       leadingVirtualCount = 0;
-      values = Array.from({ length: count }, (_, i) => `Player ${i + startIdx}`);
     } else {
-      startIdx = shouldIncludeCreator ? 2 : 1;
-      const count = shouldIncludeCreator ? validCount - 1 : validCount;
-      leadingVirtualCount = shouldIncludeCreator ? 1 : 0;
-      values = Array.from({ length: count }, (_, i) => `Player ${i + startIdx}`);
+      startIdx = 1;
+      leadingVirtualCount = 0;
+      values = Array.from({ length: validCount }, (_, i) => `Player ${i + 1}`);
     }
   } else if (!isOptIn) {
     const givenCount = size;
@@ -4567,13 +4644,14 @@ async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWor
 
   const timeLabel = resolvedWhen ? resolvedWhen : 'today';
 
+  const hasPrebooked = Array.isArray(prebookedCourtPlayers) && prebookedCourtPlayers.length > 0;
   if (isOptIn) {
     const creatorLabel = shouldIncludeCreator && creatorName ? `${creatorName}'s poll: ` : '';
     pollTitle = `🎾 ${creatorLabel}${timeLabel} (Vote Yes/No)${courtLine}`;
   } else {
     const slotCount = values.length;
     const slotLabel = slotCount === 1 ? '1 slot' : `${slotCount} slots`;
-    const creatorLabel = (shouldIncludeCreator || leadingVirtualCount > 0) && creatorName ? `${creatorName}'s poll: ` : '';
+    const creatorLabel = (!isAuto && !hasPrebooked && (shouldIncludeCreator || leadingVirtualCount > 0) && creatorName) ? `${creatorName}'s poll: ` : '';
     pollTitle = `🎾 ${creatorLabel}${timeLabel} (${slotLabel} / ${validCount})${courtLine}`;
   }
 
@@ -4604,8 +4682,8 @@ async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWor
     isManual: false,
     isCommand: Boolean(isCommand),
     noMatchups: Boolean(noMatchups),
-    prebookedPlayers: prebookedCourtPlayers.length > 0 ? prebookedCourtPlayers : null,
-    creator: (prebookedCourtPlayers.length > 0 || shouldIncludeCreator || leadingVirtualCount > 0) ? { name: (prebookedCourtPlayers[0] || creatorName || 'Player 1'), jid: creatorJid || null } : null,
+    prebookedPlayers: hasPrebooked ? prebookedInfo : null,
+    creator: (!isAuto && !hasPrebooked && (shouldIncludeCreator || leadingVirtualCount > 0)) ? { name: (creatorName || 'Player 1'), jid: creatorJid || null } : null,
     lastConflictSignature: null,
     voteBuffer: new Map(), // voterJid -> raw pollUpdate entry
     lastPlayers: null,
@@ -4614,8 +4692,14 @@ async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWor
   latestPollIdByChat.set(remoteJid, pollId);
   persistPolls();
 
-  // Fetch rating for creator if not seen before
-  if (creatorName && !ratings.isPlaceholder(creatorName) && !GENERIC_NAMES.has(ratings.keyFor(creatorName))) {
+  // Fetch rating for prebooked players & creator if not seen before
+  if (hasPrebooked) {
+    for (const pb of prebookedInfo) {
+      if (pb.defaultPlayer && !ratings.isPlaceholder(pb.defaultPlayer)) {
+        ratings.ensureRated([pb.defaultPlayer]).catch(() => {});
+      }
+    }
+  } else if (!isAuto && creatorName && !ratings.isPlaceholder(creatorName) && !GENERIC_NAMES.has(ratings.keyFor(creatorName))) {
     const creatorLid = creatorJid ? namesStore.resolveCanonicalId(creatorJid) : null;
     ratings.ensureRated([{
       name: creatorName,
@@ -4859,15 +4943,13 @@ async function processPollVoteEvent(sock, pollMessageKey, rawPollUpdates) {
     return;
   }
 
-  const filled = aggregated.filter((o) => o.voters.length > 0);
   const conflicts = aggregated.filter((o) => o.voters.length > 1);
   const options = pollState.options || [];
-  const firstSlotNum = getFirstSlotNumber(options);
-  const leadingSpots = (firstSlotNum && firstSlotNum > 1) ? (firstSlotNum - 1) : (pollState.creator ? 1 : 0);
-  const neededVotes = options.length > 0 ? options.length : (pollState.creator ? pollState.size - 1 : pollState.size);
+
+  const { players, filledCount, totalSlotsCount, isAllFilled } = resolveFixedPollRoster(pollState, aggregated);
 
   console.log(
-    `[poll] Poll ${pollId}: ${filled.length}/${neededVotes} slot(s) filled (${pollState.size} players total), ` +
+    `[poll] Poll ${pollId}: ${filledCount}/${totalSlotsCount} slot(s) filled (${pollState.size} players total), ` +
     `${conflicts.length} conflicting slot(s), ${pollState.voteBuffer.size} raw vote(s) buffered.`
   );
 
@@ -4889,28 +4971,7 @@ async function processPollVoteEvent(sock, pollMessageKey, rawPollUpdates) {
 
   if (pollState.status !== 'active' && pollState.status !== 'filled') return;
 
-  if (filled.length === neededVotes) {
-    // Build the player list in slot order.
-    const bySlot = new Map(aggregated.map((o) => [o.name, o.voters[0]]));
-    const players = [];
-
-    if (Array.isArray(pollState.prebookedPlayers) && pollState.prebookedPlayers.length > 0) {
-      for (const p of pollState.prebookedPlayers) {
-        players.push(p);
-      }
-    } else {
-      const creatorName = pollState.creator?.name || (pollState.creator?.jid ? nameFor(pollState.creator.jid) : 'Creator');
-      // Add leading creator and virtual players
-      for (let i = 0; i < leadingSpots; i++) {
-        addNextCreatorPlayer(players, creatorName);
-      }
-    }
-
-    // Add voted players in slot order
-    for (const opt of options) {
-      const voterJid = bySlot.get(opt);
-      players.push(voterJid ? nameFor(voterJid) : opt);
-    }
+  if (isAllFilled) {
 
     // If created with no-matchups option, do NOT auto-create matchups.
     // Set status to 'filled' and wait for explicit matchup request (!matchups / @tenbot matchups).
@@ -5090,26 +5151,11 @@ async function generateMatchupsFromPoll(sock, chatId, specificPollId = null, spe
       }
       players = adjustedPlayers;
     } else if (targetPollState.type !== 'opt_in') {
-      const options = targetPollState.options || [];
-      const firstSlotNum = getFirstSlotNumber(options);
-      const leadingSpots = (firstSlotNum && firstSlotNum > 1) ? (firstSlotNum - 1) : (targetPollState.creator ? 1 : 0);
-      const creatorName = targetPollState.creator?.name || (targetPollState.creator?.jid ? nameFor(targetPollState.creator.jid) : 'Creator');
-      const fullList = [];
-
-      if (Array.isArray(targetPollState.prebookedPlayers) && targetPollState.prebookedPlayers.length > 0) {
-        for (const p of targetPollState.prebookedPlayers) {
-          fullList.push(p);
-        }
-      } else {
-        for (let i = 0; i < leadingSpots; i++) {
-          addNextCreatorPlayer(fullList, creatorName);
-        }
+      const { aggregated } = getPollVoters(targetPollId, targetPollState, mePn);
+      const { players: rosterPlayers } = resolveFixedPollRoster(targetPollState, aggregated);
+      if (rosterPlayers.length > 0) {
+        players = rosterPlayers;
       }
-
-      for (const p of interestedPlayers) {
-        if (!fullList.includes(p)) fullList.push(p);
-      }
-      players = fullList;
     }
   } else if (targetPollState.lastPlayers && targetPollState.lastPlayers.length > 0) {
     players = targetPollState.lastPlayers;
@@ -5321,14 +5367,19 @@ function pollStatusText(chatId = null, opts = {}) {
       return lines.join('\n');
     }
 
-    const voters = [...pollState.voteBuffer.keys()].map(nameFor);
+    const { aggregated } = getPollVoters(pollId, pollState, mePn);
+    const { players: currentPlayers, filledCount, totalSlotsCount } = resolveFixedPollRoster(pollState, aggregated);
     const options = pollState.options || [];
     const firstSlotNum = getFirstSlotNumber(options);
-    const leadingSpots = (firstSlotNum && firstSlotNum > 1) ? (firstSlotNum - 1) : (pollState.creator ? 1 : 0);
-    const neededVotes = options.length > 0 ? options.length : (pollState.creator ? pollState.size - 1 : pollState.size);
+    const hasPrebooked = Array.isArray(pollState.prebookedPlayers) && pollState.prebookedPlayers.length > 0;
+    const leadingSpots = (firstSlotNum && firstSlotNum > 1) ? (firstSlotNum - 1) : (pollState.creator && !hasPrebooked ? 1 : 0);
     const creatorDesc = leadingSpots > 1
       ? `Creator: ${pollState.creator?.name || 'Creator'} (holding spots 1..${leadingSpots})`
-      : (pollState.creator ? `Creator (Player 1): ${pollState.creator.name || 'Player 1'}` : 'Creator: None (all spots open)');
+      : (pollState.creator && !hasPrebooked ? `Creator (Player 1): ${pollState.creator.name || 'Player 1'}` : 'Creator: None (all spots open)');
+
+    const prebookedNote = hasPrebooked
+      ? ` (pre-booked: ${pollState.prebookedPlayers.map(p => typeof p === 'string' ? `${p}'s Spot` : p.slotName).join(', ')})`
+      : '';
 
     const lines = [
       `${groupHeader}Poll ${pollId}${pollState.when ? ` (${pollState.when})` : ''}: ${pollState.size} spots (${pollState.size === 2 ? 'Singles' : 'Doubles'}).`,
@@ -5336,8 +5387,8 @@ function pollStatusText(chatId = null, opts = {}) {
       `Status: ${pollState.status}`,
       `Play time: ${playAtLocal} (kept for 2 weeks after scheduled play time)`,
       remindersLine,
-      `Raw votes recorded: ${pollState.voteBuffer.size}/${neededVotes} needed`,
-      `Voters seen so far: ${voters.length ? voters.join(', ') : '(none yet)'}`
+      `Slots filled: ${filledCount}/${totalSlotsCount}${prebookedNote}`,
+      `Currently playing (${currentPlayers.length}): ${currentPlayers.join(', ')}`
     ];
     return lines.join('\n');
   });
@@ -5440,14 +5491,18 @@ function buildContextBlurb(chatId) {
         }
       }
 
-      const filledCount = pollState.voteBuffer?.size || 0;
-      const neededVotes = pollState.creator ? pollState.size - 1 : pollState.size;
-      const creatorSuffix = pollState.creator ? ` (created by ${pollState.creator.name || 'Player 1'}, who is Player 1)` : ' (all spots open)';
+      const { aggregated } = getPollVoters(id, pollState, mePn);
+      const { players: currentPlayers, filledCount, totalSlotsCount } = resolveFixedPollRoster(pollState, aggregated);
+      const hasPrebooked = Array.isArray(pollState.prebookedPlayers) && pollState.prebookedPlayers.length > 0;
+      const creatorSuffix = pollState.creator && !hasPrebooked ? ` (created by ${pollState.creator.name || 'Player 1'}, who is Player 1)` : ' (all spots open)';
+      const prebookedSuffix = hasPrebooked
+        ? ` (includes prebooked spots: ${pollState.prebookedPlayers.map(p => typeof p === 'string' ? `${p}'s Spot` : p.slotName).join(', ')})`
+        : '';
       if (pollState.status === 'cancelled') {
         return `[Poll ${id}] a ${pollState.size}-spot poll${whenSuffix} was cancelled`;
       } else {
-        const statusNote = pollState.status === 'resolved' ? 'status: resolved/drawn (can rematch)' : (pollState.status === 'stopped' ? 'status: stopped (voting stopped)' : (pollState.status === 'expired' ? 'status: expired (play time passed, can still generate matchups if requested)' : 'status: active'));
-        return `[Poll ${id}] a ${pollState.size}-spot poll${whenSuffix}${creatorSuffix} is tracked with ${filledCount}/${neededVotes} votes. (${statusNote})`;
+        const statusNote = pollState.status === 'resolved' ? 'status: resolved/drawn (can rematch)' : (pollState.status === 'filled' ? 'status: filled (all slots filled, waiting for matchup request)' : (pollState.status === 'stopped' ? 'status: stopped (voting stopped)' : (pollState.status === 'expired' ? 'status: expired (play time passed, can still generate matchups if requested)' : 'status: active')));
+        return `[Poll ${id}] a ${pollState.size}-spot poll${whenSuffix}${creatorSuffix}${prebookedSuffix} is tracked with ${filledCount}/${totalSlotsCount} slots filled. Players currently in/playing (${currentPlayers.length}): ${currentPlayers.join(', ')}. (${statusNote})`;
       }
     });
     pollText = pollDescriptions.join('; ');
