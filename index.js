@@ -149,7 +149,7 @@ const SYSTEM_PROMPT =
   'conversational (1-3 sentences) unless asked for more detail. You have ' +
   "access to tools to create match polls (fixed-spot polls for 2 singles or 4/8/12 doubles, " +
   "or Yes/No opt-in polls when no number of players is specified), generate matchups from poll votes, " +
-  "set/update player ratings, check weather, cancel/delete polls, schedule recurring match polls on specific days of the week or every day (schedule_recurring_poll), modify recurring schedules (modify_recurring_poll), list recurring schedules (list_recurring_polls), and access the group's availability list, win/loss leaderboard, " +
+  "set/update player ratings, check weather, cancel/delete polls, schedule recurring match polls on specific days of the week or every day with customizable poll creation times per day of the week (schedule_recurring_poll), modify recurring schedules (modify_recurring_poll), list recurring schedules (list_recurring_polls), and access the group's availability list, win/loss leaderboard, " +
   'and active polls (given below). Multiple polls can be created for different times or by different users. ' +
   'The live local time in San Jose, CA is provided at the top of the context blurb below. ' +
   'Polls created manually by users for organizing tennis matches are passively tracked by the bot (marked as user-created / isManual). ' +
@@ -465,7 +465,7 @@ const CLAUDE_TOOLS = [
   },
   {
     name: 'schedule_recurring_poll',
-    description: 'Schedules a recurring tennis match poll to be created and posted automatically on specified days of the week or every day. Example: schedule a poll for 4 at 7pm on weekdays, posted at 8am.',
+    description: 'Schedules a recurring tennis match poll to be created and posted automatically on specified days of the week or every day. The poll creation time can be configured uniformly, on a day-of-week basis, or more than 24 hours in advance of match playtime (e.g. play at 7pm on Monday with poll created at Sunday 6pm, 1 day before at 6pm, or 2 days before at 8am).',
     input_schema: {
       type: 'object',
       properties: {
@@ -482,8 +482,11 @@ const CLAUDE_TOOLS = [
           description: 'Days of the week when the match takes place (e.g. "everyday", "weekdays", "weekends", "mon-thu", "mon,wed,fri", "tuesdays and thursdays", "saturday"). Defaults to "everyday".'
         },
         postTime: {
-          type: 'string',
-          description: 'Optional time of day when the poll should be posted to the group (e.g. "8am", "7:30am", "7pm"). If omitted, defaults to 8:00 AM (or 7:00 PM the evening before for early morning matches).'
+          description: 'Optional time/day when the poll should be posted to the group. Can be a same-day time ("8am", "7:30am"), day-of-week specific ("7am on weekdays, 8am on weekends"), or >24h in advance of match play time (e.g. "sunday 6pm" for Monday matches, "1 day before at 6pm", "2 days before at 8am"). If omitted, defaults to 8:00 AM (or 7:00 PM the evening before for early morning matches).'
+        },
+        postTimesByDay: {
+          type: 'object',
+          description: 'Optional map of day names or day indices to specific post times (e.g. {"mon": "7am", "tue": "7am", "sat": "8am", "sun": "8am"} or {"weekdays": "7am", "weekends": "8am"}).'
         },
         includeCreator: {
           type: 'boolean',
@@ -529,8 +532,11 @@ const CLAUDE_TOOLS = [
           description: 'Optional new match time (e.g. "7pm", "9am", "6:30pm").'
         },
         postTime: {
-          type: 'string',
-          description: 'Optional new post time (e.g. "8am", "7:30am", "7pm").'
+          description: 'Optional new post time (e.g. "8am", "7:30am", "7pm", or day-of-week specific like "7am on weekdays, 8am on weekends" or {"weekdays": "7am", "weekends": "8am"}).'
+        },
+        postTimesByDay: {
+          type: 'object',
+          description: 'Optional map of day names or day indices to specific post times (e.g. {"mon": "7am", "tue": "7am", "sat": "8am", "sun": "8am"} or {"weekdays": "7am", "weekends": "8am"}).'
         },
         days: {
           type: 'string',
