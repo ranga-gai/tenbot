@@ -572,6 +572,35 @@ const CLAUDE_TOOLS = [
     }
   },
   {
+    name: 'get_court_bookings',
+    description: 'Retrieves the court schedule and member bookings/reservations (player names, court number, match type, and duration) at Silver Creek Valley Country Club (SCVCC) for tennis or pickleball courts.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        when: {
+          type: 'string',
+          description: 'Date or day description (e.g. "today", "tomorrow", "Saturday", "9/26/2026"). Defaults to today.'
+        },
+        time: {
+          type: 'string',
+          description: 'Optional time or period filter (e.g. "6pm", "7:00 PM", "9am", "morning", "afternoon", "evening").'
+        },
+        court: {
+          type: 'string',
+          description: 'Optional specific court filter (e.g. "Court 2", "Court 4", "Pickleball 1").'
+        },
+        sport: {
+          type: 'string',
+          description: 'Sport type: "tennis" (default), "pickleball", or "all".'
+        },
+        player: {
+          type: 'string',
+          description: 'Optional player name filter to check when a specific player is booked.'
+        }
+      }
+    }
+  },
+  {
     name: 'check_court_availability',
     description: 'Checks real-time court status and available open slots at Silver Creek Valley Country Club (SCVCC) for tennis courts (Courts 1-6) and pickleball courts.',
     input_schema: {
@@ -3060,7 +3089,11 @@ async function executeTool(sock, chatId, sender, toolUse, msg) {
     const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
     return await handleCancelRecurringPoll(sock, chatId, sender, senderJid, input.scheduleId);
   }
-    if (name === 'check_court_availability') {
+    if (name === 'get_court_bookings' || name === 'get_court_reservations') {
+    const res = await scvcc.getCourtBookings(input);
+    return res?.message || 'Retrieved court bookings.';
+  }
+  if (name === 'check_court_availability') {
     const res = await scvcc.checkCourtAvailability(input);
     return res?.message || 'Checked court availability.';
   }
@@ -3195,6 +3228,16 @@ async function getResponse(sock, rawText, chatId, sender, msg) {
   }
 
   // --- SCVCC Court Status & Booking Commands ---
+  if (lower === '!courtbookings' || lower.startsWith('!courtbookings ') ||
+      lower === '!bookings' || lower.startsWith('!bookings ') ||
+      lower === '!courtreservations' || lower.startsWith('!courtreservations ') ||
+      lower === '!reservations' || lower.startsWith('!reservations ') ||
+      lower === '!courtschedule' || lower.startsWith('!courtschedule ')) {
+    const parsed = scvcc.parseBookingsCommand(text);
+    const res = await scvcc.getCourtBookings(parsed);
+    return res?.message || 'Could not retrieve court bookings.';
+  }
+
   if (lower === '!courts' || lower.startsWith('!courts ') || lower === '!courtstatus' || lower.startsWith('!courtstatus ') || lower === '!courtavailability' || lower.startsWith('!courtavailability ')) {
     const parsed = scvcc.parseCourtsCommand(text);
     const res = await scvcc.checkCourtAvailability(parsed);
