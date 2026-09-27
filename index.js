@@ -199,8 +199,7 @@ const CLAUDE_TOOLS = [
       type: 'object',
       properties: {
         size: {
-          type: 'integer',
-          description: 'Total number of players for the match (2 for singles, 4/8/12/16 for doubles). If omitted or not specified, a Yes/No opt-in poll is created.'
+          description: 'Total number of players for the match (2 for singles, 4/8/12/16 for doubles) or "auto" to automatically calculate spots (4, 8, or 12) based on SCVCC pre-booked and free courts. If omitted or not specified, a Yes/No opt-in poll is created.'
         },
         when: {
           type: 'string',
@@ -1072,18 +1071,22 @@ function parsePollCreationText(text) {
     /^!(?:optinpoll|yesnopoll|createoptinpoll|createyesnopoll)\b/i.test(text);
   let size = null;
   if (!isExplicitOptIn) {
-    const sizeMatch = textWithoutTime.match(/\b(?:for|size|spots?|players?)\s*[:=]?\s*(\d+)\b/i) ||
-      textWithoutTime.match(/\b(\d+)\s*(?:spots?|players?|people|courts?)\b/i) ||
-      textWithoutTime.match(/\bpoll\s+for\s+(\d+)\b/i) ||
-      textWithoutTime.match(/^!(?:createpoll|poll|makepoll|newpoll)\s+(\d+)\b/i) ||
-      textWithoutTime.match(/\bcreate\s+(?:a\s+)?(?:match\s+)?poll\s+(\d+)\b/i) ||
-      textWithoutTime.match(/\b([248]|12|16)\s*(?:players?|spots?)?\b/i);
-    if (sizeMatch) {
-      size = parseInt(sizeMatch[1], 10);
-    } else if (/\bsingles\b/i.test(textWithoutTime)) {
-      size = 2;
-    } else if (/\bdoubles\b/i.test(textWithoutTime)) {
-      size = 4;
+    if (/\bauto\b/i.test(textWithoutTime) || /\bauto[-_\s]*(?:spots?|players?|courts?|size)\b/i.test(textWithoutTime)) {
+      size = 'auto';
+    } else {
+      const sizeMatch = textWithoutTime.match(/\b(?:for|size|spots?|players?)\s*[:=]?\s*(\d+)\b/i) ||
+        textWithoutTime.match(/\b(\d+)\s*(?:spots?|players?|people|courts?)\b/i) ||
+        textWithoutTime.match(/\bpoll\s+for\s+(\d+)\b/i) ||
+        textWithoutTime.match(/^!(?:createpoll|poll|makepoll|newpoll)\s+(\d+)\b/i) ||
+        textWithoutTime.match(/\bcreate\s+(?:a\s+)?(?:match\s+)?poll\s+(\d+)\b/i) ||
+        textWithoutTime.match(/\b([248]|12|16)\s*(?:players?|spots?)?\b/i);
+      if (sizeMatch) {
+        size = parseInt(sizeMatch[1], 10);
+      } else if (/\bsingles\b/i.test(textWithoutTime)) {
+        size = 2;
+      } else if (/\bdoubles\b/i.test(textWithoutTime)) {
+        size = 4;
+      }
     }
   }
 
@@ -1917,9 +1920,15 @@ async function sendPollReminder(sock, pollId, pollState, isManualTrigger = false
 
     if (openSpots <= 0 && !isManualTrigger) return false;
 
-    const creatorName = pollState.creator?.name || (pollState.creator?.jid ? nameFor(pollState.creator.jid) : 'Creator');
-    for (let i = 0; i < leadingSpots; i++) {
-      addNextCreatorPlayer(players, creatorName);
+    if (Array.isArray(pollState.prebookedPlayers) && pollState.prebookedPlayers.length > 0) {
+      for (const p of pollState.prebookedPlayers) {
+        players.push(p);
+      }
+    } else {
+      const creatorName = pollState.creator?.name || (pollState.creator?.jid ? nameFor(pollState.creator.jid) : 'Creator');
+      for (let i = 0; i < leadingSpots; i++) {
+        addNextCreatorPlayer(players, creatorName);
+      }
     }
     for (const p of interestedPlayers) {
       if (!players.includes(p)) players.push(p);
@@ -4214,6 +4223,57 @@ function formatRatings() {
   return `📊 Player ratings (${ratings.formatRating(ratings.MIN_RATING)}–${ratings.MAX_RATING}):\n${lines.join('\n')}`;
 }
 
+/**
+ * Builds the list of known registered players' full names for matching SCVCC court bookings.
+ * Only includes full names (no nicknames, aliases, or short canonical names).
+ */
+function buildKnownFullNamesList() {
+  const fullNames = new Set();
+  for (const entry of namesStore.getAllEntries()) {
+    if (entry.fullName && typeof entry.fullName === 'string') {
+      const trimmed = entry.fullName.trim();
+      if (trimmed && trimmed.split(/\s+/).length >= 2) {
+        fullNames.add(trimmed);
+      }
+    }
+  }
+  return [...fullNames];
+}
+
+/**
+ * Matches an SCVCC player name strictly against known registered group players' full names.
+ */
+function matchPlayerWithFullNames(scvccPlayerName, knownFullNames) {
+  if (!scvccPlayerName) return null;
+  const cleanScvcc = scvccPlayerName.trim().toLowerCase();
+  const scvccWords = cleanScvcc.split(/[^a-z0-9]+/i).filter(Boolean);
+  if (scvccWords.length === 0) return null;
+
+  for (const fullName of knownFullNames) {
+    const cleanFull = fullName.trim().toLowerCase();
+    const fullWords = cleanFull.split(/[^a-z0-9]+/i).filter(Boolean);
+    if (fullWords.length < 2) continue;
+
+    // Exact full name match
+    if (cleanScvcc === cleanFull) {
+      return scvccPlayerName;
+    }
+
+    // First and last name match (e.g. "Chandra Sekhar Cheruku" vs "Chandra Cheruku")
+    if (scvccWords.length >= 2) {
+      const scvccFirst = scvccWords[0];
+      const scvccLast = scvccWords[scvccWords.length - 1];
+      const fullFirst = fullWords[0];
+      const fullLast = fullWords[fullWords.length - 1];
+
+      if (scvccFirst === fullFirst && scvccLast === fullLast) {
+        return scvccPlayerName;
+      }
+    }
+  }
+  return null;
+}
+
 // ---- Poll creation & vote handling ----
 
 /**
@@ -4225,15 +4285,18 @@ function formatRatings() {
  * - If replacePollId or cancelExisting is specified, deletes the older poll from WhatsApp.
  */
 async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWord = null, timeWord = null, creatorName = null, creatorJid = null, includeCreator = true, replacePollId = null, cancelExisting = false, isCommand = false, noMatchups = false, noCourts = false) {
-  const isOptIn = !size;
+  const isAuto = size === 'auto' || String(size).toLowerCase() === 'auto';
+  const isOptIn = !size && !isAuto;
 
-  if (size !== null && size !== undefined) {
-    if (!Number.isInteger(size) || size <= 0) {
-      return { err: `Give me a valid number of players, e.g. "${TRIGGER_PREFIX} create a poll for 2" (singles) or "${TRIGGER_PREFIX} create a poll for 8" (doubles), or leave size empty for a Yes/No poll.` };
+  if (size !== null && size !== undefined && !isAuto) {
+    const num = parseInt(size, 10);
+    if (!Number.isInteger(num) || num <= 0) {
+      return { err: `Give me a valid number of players (2, 4, 8, 12, 16) or 'auto', e.g. "${TRIGGER_PREFIX} create a poll for 4" or "${TRIGGER_PREFIX} create a poll for auto", or leave size empty for a Yes/No poll.` };
     }
-    if (size > 40) {
+    if (num > 40) {
       return { err: 'That\'s a lot of players for one poll -- try 40 or fewer.' };
     }
+    size = num;
   }
 
   // Extract dayWord and timeWord from when if not explicitly provided
@@ -4321,11 +4384,100 @@ async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWor
 
   let values;
   let pollTitle;
-  let validCount = size;
+  let validCount = isAuto ? null : size;
   let leadingVirtualCount = 0;
   let startIdx = 1;
+  let courtLine = '';
 
-  if (!isOptIn) {
+  let prebookedCourtPlayers = [];
+  let queryTime = effectiveTimeWord;
+  if (!queryTime && playAt) {
+    const sjParts = getSanJoseParts(playAt);
+    const h = sjParts.hour === 0 ? 12 : (sjParts.hour > 12 ? sjParts.hour - 12 : sjParts.hour);
+    const m = String(sjParts.minute).padStart(2, '0');
+    const ampm = sjParts.hour >= 12 ? 'pm' : 'am';
+    queryTime = `${h}:${m}${ampm}`;
+  }
+  const targetDateMDY = scvcc.resolveDateToMDY(effectiveDayWord || resolvedWhen || playAt);
+
+  if (isAuto) {
+    let prebookedCourts = [];
+    let freeCourts = [];
+    const seenPrebooked = new Set();
+    const knownFullNames = buildKnownFullNamesList();
+
+    try {
+      const [avail, bookingsRes] = await Promise.all([
+        scvcc.checkCourtAvailability({ when: targetDateMDY, time: queryTime, sport: 'tennis' }).catch(() => null),
+        scvcc.getCourtBookings({ when: targetDateMDY, time: queryTime, sport: 'tennis' }).catch(() => null)
+      ]);
+
+      const bookings = bookingsRes?.bookings || [];
+      for (const b of bookings) {
+        if (seenPrebooked.has(b.court)) continue;
+        let matchedName = null;
+        for (const p of b.players) {
+          matchedName = matchPlayerWithFullNames(p, knownFullNames);
+          if (matchedName) break;
+        }
+        if (matchedName) {
+          prebookedCourts.push({ court: b.court, player: matchedName });
+          seenPrebooked.add(b.court);
+        }
+      }
+
+      if (avail?.slots && avail.slots.length > 0) {
+        const slot = avail.slots[0];
+        for (const c of slot.courts) {
+          if (
+            c.status === 'available' &&
+            (c.availableMinutes || 0) >= 90 &&
+            !/court\s*4\b|ct\s*4\b/i.test(c.court) &&
+            !seenPrebooked.has(c.court)
+          ) {
+            freeCourts.push({ court: c.court });
+          }
+        }
+      }
+    } catch (err) {
+      console.warn('[poll] Error checking court availability/bookings for auto poll:', err.message);
+    }
+
+    const selectedPrebooked = prebookedCourts.slice(0, 3);
+    const remainingNeeded = Math.min(freeCourts.length, Math.max(0, 3 - selectedPrebooked.length));
+    const selectedFree = freeCourts.slice(0, remainingNeeded);
+
+    const totalCourtsCount = selectedPrebooked.length + selectedFree.length;
+    validCount = totalCourtsCount > 0 ? totalCourtsCount * 4 : 4;
+
+    const courtLines = [];
+    for (const pb of selectedPrebooked) {
+      courtLines.push(`${pb.court} - ${pb.player} Booking`);
+      addNextCreatorPlayer(prebookedCourtPlayers, pb.player);
+    }
+    for (const fc of selectedFree) {
+      courtLines.push(`${fc.court} - Available`);
+    }
+
+    if (courtLines.length > 0 && !noCourts) {
+      courtLine = `\n\n${courtLines.join('\n')}\n`;
+    }
+
+    // Each pre-booked court includes the first matching group player as already a player, reducing vote slots by 1.
+    // E.g. 2 pre-booked courts + 1 available court = 2 pre-booked players + 10 vote slots = 12 total.
+    if (prebookedCourtPlayers.length > 0) {
+      const occupiedCount = prebookedCourtPlayers.length;
+      const count = Math.max(1, validCount - occupiedCount);
+      startIdx = occupiedCount + 1;
+      leadingVirtualCount = 0;
+      values = Array.from({ length: count }, (_, i) => `Player ${i + startIdx}`);
+    } else {
+      startIdx = shouldIncludeCreator ? 2 : 1;
+      const count = shouldIncludeCreator ? validCount - 1 : validCount;
+      leadingVirtualCount = shouldIncludeCreator ? 1 : 0;
+      values = Array.from({ length: count }, (_, i) => `Player ${i + startIdx}`);
+    }
+  } else if (!isOptIn) {
     const givenCount = size;
     if (isValidPlayerCount(givenCount)) {
       validCount = givenCount;
@@ -4334,33 +4486,16 @@ async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWor
       leadingVirtualCount = shouldIncludeCreator ? 1 : 0;
       values = Array.from({ length: count }, (_, i) => `Player ${i + startIdx}`);
     } else {
-      // If given player count does not match a valid count (2 singles, 4/8/12 doubles),
-      // assume creator and virtual players. Start labels from 'Player <valid count - given count + 1>'
       validCount = getNextValidPlayerCount(givenCount);
       leadingVirtualCount = validCount - givenCount;
       startIdx = validCount - givenCount + 1;
       const count = givenCount;
       values = Array.from({ length: count }, (_, i) => `Player ${i + startIdx}`);
     }
-  } else {
-    values = ['Yes', 'No'];
-  }
 
-  // Obtain available courts from SCVCC (available for >= 90 mins, excluding Court 4) if not disabled
-  let courtLine = '';
-  if (!noCourts) {
-    try {
-      let queryTime = effectiveTimeWord;
-      if (!queryTime && playAt) {
-        const sjParts = getSanJoseParts(playAt);
-        const h = sjParts.hour === 0 ? 12 : (sjParts.hour > 12 ? sjParts.hour - 12 : sjParts.hour);
-        const m = String(sjParts.minute).padStart(2, '0');
-        const ampm = sjParts.hour >= 12 ? 'pm' : 'am';
-        queryTime = `${h}:${m}${ampm}`;
-      }
-
-      if (queryTime) {
-        const targetDateMDY = scvcc.resolveDateToMDY(effectiveDayWord || resolvedWhen || playAt);
+    // Obtain available courts from SCVCC (available for >= 90 mins, excluding Court 4) if not disabled
+    if (!noCourts && queryTime) {
+      try {
         const avail = await scvcc.checkCourtAvailability({
           when: targetDateMDY,
           time: queryTime,
@@ -4388,9 +4523,45 @@ async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWor
           });
           courtLine = `\n\n_${largeCourtText}_\n`;
         }
+      } catch (err) {
+        console.warn('[poll] Could not fetch SCVCC court availability for poll title:', err.message);
       }
-    } catch (err) {
-      console.warn('[poll] Could not fetch SCVCC court availability for poll title:', err.message);
+    }
+  } else {
+    values = ['Yes', 'No'];
+
+    if (!noCourts && queryTime) {
+      try {
+        const avail = await scvcc.checkCourtAvailability({
+          when: targetDateMDY,
+          time: queryTime,
+          sport: 'tennis'
+        });
+        if (avail && avail.success) {
+          let openCourts = 0;
+          if (avail.slots && avail.slots.length > 0) {
+            const slot = avail.slots[0];
+            openCourts = slot.courts.filter(c => 
+              c.status === 'available' && 
+              (c.availableMinutes || 0) >= 90 && 
+              !/court\s*4\b|ct\s*4\b/i.test(c.court)
+            ).length;
+          } else if (typeof avail.totalAvailable === 'number') {
+            openCourts = avail.totalAvailable;
+          }
+          const courtWord = openCourts === 1 ? 'COURT' : 'COURTS';
+          const rawCourtText = `${openCourts} ${courtWord} AVAILABLE`;
+          const largeCourtText = rawCourtText.replace(/[A-Z0-9]/g, (ch) => {
+            const code = ch.charCodeAt(0);
+            if (code >= 48 && code <= 57) return String.fromCodePoint(0x1D7EC + (code - 48));
+            if (code >= 65 && code <= 90) return String.fromCodePoint(0x1D5D4 + (code - 65));
+            return ch;
+          });
+          courtLine = `\n\n_${largeCourtText}_\n`;
+        }
+      } catch (err) {
+        console.warn('[poll] Could not fetch SCVCC court availability for poll title:', err.message);
+      }
     }
   }
 
@@ -4433,7 +4604,8 @@ async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWor
     isManual: false,
     isCommand: Boolean(isCommand),
     noMatchups: Boolean(noMatchups),
-    creator: (shouldIncludeCreator || leadingVirtualCount > 0) ? { name: creatorName || 'Player 1', jid: creatorJid || null } : null,
+    prebookedPlayers: prebookedCourtPlayers.length > 0 ? prebookedCourtPlayers : null,
+    creator: (prebookedCourtPlayers.length > 0 || shouldIncludeCreator || leadingVirtualCount > 0) ? { name: (prebookedCourtPlayers[0] || creatorName || 'Player 1'), jid: creatorJid || null } : null,
     lastConflictSignature: null,
     voteBuffer: new Map(), // voterJid -> raw pollUpdate entry
     lastPlayers: null,
@@ -4721,11 +4893,17 @@ async function processPollVoteEvent(sock, pollMessageKey, rawPollUpdates) {
     // Build the player list in slot order.
     const bySlot = new Map(aggregated.map((o) => [o.name, o.voters[0]]));
     const players = [];
-    const creatorName = pollState.creator?.name || (pollState.creator?.jid ? nameFor(pollState.creator.jid) : 'Creator');
 
-    // Add leading creator and virtual players
-    for (let i = 0; i < leadingSpots; i++) {
-      addNextCreatorPlayer(players, creatorName);
+    if (Array.isArray(pollState.prebookedPlayers) && pollState.prebookedPlayers.length > 0) {
+      for (const p of pollState.prebookedPlayers) {
+        players.push(p);
+      }
+    } else {
+      const creatorName = pollState.creator?.name || (pollState.creator?.jid ? nameFor(pollState.creator.jid) : 'Creator');
+      // Add leading creator and virtual players
+      for (let i = 0; i < leadingSpots; i++) {
+        addNextCreatorPlayer(players, creatorName);
+      }
     }
 
     // Add voted players in slot order
@@ -4917,9 +5095,17 @@ async function generateMatchupsFromPoll(sock, chatId, specificPollId = null, spe
       const leadingSpots = (firstSlotNum && firstSlotNum > 1) ? (firstSlotNum - 1) : (targetPollState.creator ? 1 : 0);
       const creatorName = targetPollState.creator?.name || (targetPollState.creator?.jid ? nameFor(targetPollState.creator.jid) : 'Creator');
       const fullList = [];
-      for (let i = 0; i < leadingSpots; i++) {
-        addNextCreatorPlayer(fullList, creatorName);
+
+      if (Array.isArray(targetPollState.prebookedPlayers) && targetPollState.prebookedPlayers.length > 0) {
+        for (const p of targetPollState.prebookedPlayers) {
+          fullList.push(p);
+        }
+      } else {
+        for (let i = 0; i < leadingSpots; i++) {
+          addNextCreatorPlayer(fullList, creatorName);
+        }
       }
+
       for (const p of interestedPlayers) {
         if (!fullList.includes(p)) fullList.push(p);
       }
