@@ -240,6 +240,14 @@ const CLAUDE_TOOLS = [
         includeCourts: {
           type: 'boolean',
           description: 'Whether to include court availability in the poll title (default: true). Set to false if user requests without court availability.'
+        },
+        'prebooked-spots': {
+          type: 'boolean',
+          description: "Whether to include named voting slots for booking players on prebooked courts (e.g. \"Conrad's Spot\"). Defaults to false (standard numbered slots like Player 1, Player 2 are used)."
+        },
+        includePrebookedSpots: {
+          type: 'boolean',
+          description: "Whether to include named voting slots for booking players on prebooked courts (e.g. \"Conrad's Spot\"). Defaults to false (standard numbered slots like Player 1, Player 2 are used)."
         }
       }
     }
@@ -519,6 +527,14 @@ const CLAUDE_TOOLS = [
         noCourts: {
           type: 'boolean',
           description: 'If true, do not include court availability in the poll title for this recurring schedule.'
+        },
+        'prebooked-spots': {
+          type: 'boolean',
+          description: 'Whether to include named voting slots for booking players on prebooked courts in recurring polls. Defaults to false.'
+        },
+        includePrebookedSpots: {
+          type: 'boolean',
+          description: 'Whether to include named voting slots for booking players on prebooked courts in recurring polls. Defaults to false.'
         }
       },
       required: ['matchTime']
@@ -577,6 +593,14 @@ const CLAUDE_TOOLS = [
         includeCourts: {
           type: 'boolean',
           description: 'Optional: whether to include court availability in poll title.'
+        },
+        'prebooked-spots': {
+          type: 'boolean',
+          description: 'Optional: whether to include named voting slots for booking players on prebooked courts.'
+        },
+        includePrebookedSpots: {
+          type: 'boolean',
+          description: 'Optional: whether to include named voting slots for booking players on prebooked courts.'
         }
       },
       required: ['scheduleId']
@@ -1188,10 +1212,18 @@ function parsePollCreationText(text) {
   }
 
   // Determine noMatchups
-  const noMatchups = /(?:^|\s)(?:--no-?matchups?|--no-?draw)\b|\b(?:no[-_\s]*matchups?|no[-_\s]*draw|without\s+(?:auto[-_\s]*|automatic\s+)?matchups?|without\s+(?:auto[-_\s]*|automatic\s+)?draw|(?:do\s*not|don\x27?t)\s+(?:create|make|generate|post|auto-?generate)\s+(?:matchups?|draw|the\s+draw|the\s+matchups?)|no[-_\s]*(?:auto\s+|automatic\s+)?matchups?)\b/i.test(text);
+  const noMatchups = /(?:^|\s)(?:--no-?matchups?|--no-?draw)\b|\b(?:no[-_\s]*matchups?|no[-_\s]*draw|without\s+(?:auto[-_\s]*|automatic\s+)?matchups?|without\s+(?:auto[-_\s]*|automatic\s+)?draw|(?:do\s*not|don'?t)\s+(?:create|make|generate|post|auto-?generate)\s+(?:matchups?|draw|the\s+draw|the\s+matchups?)|no[-_\s]*(?:auto\s+|automatic\s+)?matchups?)\b/i.test(text);
 
   // Determine noCourts
   const noCourts = /(?:^|\s)(?:--no-?courts?|--no-?court-?avail(?:ability)?|--no-?avail(?:ability)?)\b|\b(?:no[-_\s]*courts?|without[-_\s]*courts?|without[-_\s]*(?:court\s+)?availability|no[-_\s]*(?:court\s+)?availability|exclude[-_\s]*courts?|hide[-_\s]*courts?|dont\s+include\s+(?:the\s+)?court(?:s|\s+availability)?|do\s*not\s+include\s+(?:the\s+)?court(?:s|\s+availability)?)\b/i.test(text);
+
+  // Determine includePrebookedSpots
+  let includePrebookedSpots = false;
+  if (/(?:^|\s)(?:--?no-?prebooked[-_]?spots?|no-?prebooked[-_]?spots?|--?no-?named-?spots?|--?prebooked[-_]?spots?=(?:false|no|0)|prebooked[-_]?spots?=(?:false|no|0))\b|\b(?:without|no)\s+(?:named\s+|the\s+)?prebooked[-_]?spots?\b/i.test(text)) {
+    includePrebookedSpots = false;
+  } else if (/(?:^|\s)(?:--?prebooked[-_]?spots?|prebooked[-_]?spots?)(?:=(?:true|yes|1))?\b|(?:^|\s)(?:--with-?prebooked-?spots?|--named-?prebooked-?slots?|--prebooked-?slots?)\b|\b(?:with|include)\s+(?:named\s+|the\s+)?prebooked[-_]?(?:spots?|slots?)\b/i.test(text)) {
+    includePrebookedSpots = true;
+  }
 
   return {
     size,
@@ -1201,7 +1233,10 @@ function parsePollCreationText(text) {
     includeCreator,
     cancelExisting,
     noMatchups,
-    noCourts
+    noCourts,
+    includePrebookedSpots,
+    'prebooked-spots': includePrebookedSpots,
+    prebookedSpots: includePrebookedSpots
   };
 }
 
@@ -1210,6 +1245,9 @@ function parsePollCreationText(text) {
  */
 async function handleDirectPollCreation(sock, chatId, sender, msg, parsed, opts = {}) {
   const { size, when, dayWord, timeWord, includeCreator, cancelExisting, noMatchups, noCourts } = parsed;
+  const includePrebookedSpots = parsed?.['prebooked-spots'] !== undefined
+    ? parsed['prebooked-spots']
+    : (parsed?.prebookedSpots !== undefined ? parsed.prebookedSpots : parsed?.includePrebookedSpots);
   const isCommand = opts.isCommand === true;
   const creatorName = sender !== 'Someone' ? sender : (msg?.key?.participant ? nameFor(msg.key.participant) : 'Player 1');
   const creatorJid = msg?.key?.participant || msg?.key?.remoteJid || null;
@@ -1229,7 +1267,8 @@ async function handleDirectPollCreation(sock, chatId, sender, msg, parsed, opts 
     cancelExisting,
     isCommand,
     noMatchups || false,
-    noCourts || false
+    noCourts || false,
+    includePrebookedSpots || false
   );
 
   if (res?.err) {
@@ -3100,7 +3139,8 @@ async function executeTool(sock, chatId, sender, toolUse, msg) {
 
     const noMatchups = input.noMatchups === true || input.autoMatchups === false;
     const noCourts = input.noCourts === true || input.includeCourts === false;
-    const res = await createMatchPoll(sock, targetChatId, size, when, dayWord, timeWord, creatorName, creatorJid, includeCreator, replacePollId, cancelExisting, false, noMatchups, noCourts);
+    const includePrebookedSpots = input['prebooked-spots'] === true || input.prebookedSpots === true || input.includePrebookedSpots === true;
+    const res = await createMatchPoll(sock, targetChatId, size, when, dayWord, timeWord, creatorName, creatorJid, includeCreator, replacePollId, cancelExisting, false, noMatchups, noCourts, includePrebookedSpots);
     if (res?.err) {
       return `Could not create poll: ${res.err}`;
     }
@@ -4392,7 +4432,7 @@ function matchPlayerWithFullNames(scvccPlayerName, knownFullNames) {
  *   "Yes" and "No". The bot then waits for a user prompt to generate matchups from Yes voters.
  * - If replacePollId or cancelExisting is specified, deletes the older poll from WhatsApp.
  */
-async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWord = null, timeWord = null, creatorName = null, creatorJid = null, includeCreator = true, replacePollId = null, cancelExisting = false, isCommand = false, noMatchups = false, noCourts = false) {
+async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWord = null, timeWord = null, creatorName = null, creatorJid = null, includeCreator = true, replacePollId = null, cancelExisting = false, isCommand = false, noMatchups = false, noCourts = false, includePrebookedSpots = false) {
   const isAuto = size === 'auto' || String(size).toLowerCase() === 'auto';
   const isOptIn = !size && !isAuto;
 
@@ -4565,14 +4605,16 @@ async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWor
       const match = namesStore.findIdByNameOrAlias(pb.player);
       const canonicalName = (match && match.entry?.name) ? match.entry.name : pb.player;
       courtLines.push(`${pb.court} - ${canonicalName}'s Booking`);
-      const slotPlayerName = addNextCreatorPlayer(prebookedCourtPlayers, canonicalName);
-      const slotLabel = `${slotPlayerName}'s Spot`;
-      prebookedInfo.push({
-        slotName: slotLabel,
-        defaultPlayer: slotPlayerName,
-        fullName: pb.player,
-        court: pb.court
-      });
+      if (includePrebookedSpots) {
+        const slotPlayerName = addNextCreatorPlayer(prebookedCourtPlayers, canonicalName);
+        const slotLabel = `${slotPlayerName}'s Spot`;
+        prebookedInfo.push({
+          slotName: slotLabel,
+          defaultPlayer: slotPlayerName,
+          fullName: pb.player,
+          court: pb.court
+        });
+      }
     }
     for (const fc of selectedFree) {
       courtLines.push(`${fc.court} - Available`);
@@ -4582,7 +4624,7 @@ async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWor
       courtLine = `\n\n${courtLines.join('\n')}\n`;
     }
 
-    if (prebookedInfo.length > 0) {
+    if (includePrebookedSpots && prebookedInfo.length > 0) {
       const prebookedCount = prebookedInfo.length;
       values = [];
       for (const pb of prebookedInfo) {
@@ -4688,7 +4730,7 @@ async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWor
 
   const timeLabel = resolvedWhen ? resolvedWhen : 'today';
 
-  const hasPrebooked = Array.isArray(prebookedCourtPlayers) && prebookedCourtPlayers.length > 0;
+  const hasPrebooked = Array.isArray(prebookedCourtPlayers) && prebookedCourtPlayers.length > 0 && includePrebookedSpots;
   if (isOptIn) {
     const creatorLabel = shouldIncludeCreator && creatorName ? `${creatorName}'s poll: ` : '';
     pollTitle = `🎾 ${creatorLabel}${timeLabel} (Vote Yes/No)${courtLine}`;
@@ -5727,9 +5769,11 @@ async function launchBot() {
   }
 }
 
-// Watchdog heartbeat every 30 seconds to keep process alive and verify connection
-setInterval(() => {
-  // Keeps the event loop actively referenced
-}, 30000);
+if (require.main === module) {
+  // Watchdog heartbeat every 30 seconds to keep process alive and verify connection
+  setInterval(() => {
+    // Keeps the event loop actively referenced
+  }, 30000);
 
-launchBot();
+  launchBot();
+}
