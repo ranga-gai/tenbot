@@ -4562,9 +4562,9 @@ async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWor
     const courtLines = [];
     prebookedInfo = [];
     for (const pb of selectedPrebooked) {
-      courtLines.push(`${pb.court} - ${pb.player} Booking`);
       const match = namesStore.findIdByNameOrAlias(pb.player);
       const canonicalName = (match && match.entry?.name) ? match.entry.name : pb.player;
+      courtLines.push(`${pb.court} - ${canonicalName}'s Booking`);
       const slotPlayerName = addNextCreatorPlayer(prebookedCourtPlayers, canonicalName);
       const slotLabel = `${slotPlayerName}'s Spot`;
       prebookedInfo.push({
