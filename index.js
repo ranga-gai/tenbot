@@ -161,7 +161,7 @@ const SYSTEM_PROMPT =
   'Do NOT include the creator unless they actually voted or are explicitly listed in "Players currently in/playing". ' +
   'For polls starting at slot 1, extra players / creator are NEVER included while voting is still in progress (only when all vote slots are filled and count is invalid). ' +
   'When a user asks to generate matchups, create the draw, make teams, or rematch for ANY match poll (including manually created match polls, opt-in polls, or previously resolved polls), ' +
-  'ALWAYS call the generate_matchups tool (or rematch tool). NEVER tell the user that a poll has ended, is closed, or is not active when they ask for matchups. ' +
+  'ALWAYS call the generate_matchups tool (or rematch tool). If the user asks to keep specific players on the same team or partner together (e.g. "keeping Vipul and Vishal in same team", "partner A with B", "with X and Y together"), ALWAYS pass those players in fixedPairs (e.g. [["Vipul", "Vishal"]]) or sameTeam (e.g. ["Vipul", "Vishal"]) to generate_matchups. NEVER tell the user that a poll has ended, is closed, or is not active when they ask for matchups. ' +
   'If there are multiple polls or a specific poll is requested (e.g. "for 10am", "Tennis 8am"), pass pollId or pollName to generate_matchups. ' +
   'Results can be reported to you in plain words ("Mike & Sara ' +
   'beat John & Alex 6-4", or "we won" right after a draw) and are logged automatically before ' +
@@ -259,7 +259,7 @@ const CLAUDE_TOOLS = [
   },
   {
     name: 'generate_matchups',
-    description: 'Generates and posts singles/doubles matchups and rotations from current poll votes. Always call this tool when the user asks to generate matchups, draw, or make teams for a poll (whether active, filled, or resolved/rematch). For manual match polls, uses poll labels and adds creator / extra players (<creatorName>, <creatorName> 2, etc.) until a valid player count configuration is reached.',
+    description: 'Generates and posts singles/doubles matchups and rotations from current poll votes. Always call this tool when the user asks to generate matchups, draw, or make teams for a poll (whether active, filled, or resolved/rematch). If the user asks to keep specific players on the same team or partner together (e.g. "keeping Vipul and Vishal in same team", "partner A with B", "with X and Y together"), pass them in fixedPairs or sameTeam. For manual match polls, uses poll labels and adds creator / extra players (<creatorName>, <creatorName> 2, etc.) until a valid player count configuration is reached.',
     input_schema: {
       type: 'object',
       properties: {
@@ -270,6 +270,19 @@ const CLAUDE_TOOLS = [
         pollName: {
           type: 'string',
           description: 'Optional poll name or time keyword (e.g. "8am", "10am", "Tennis 8am") to match the specific poll.'
+        },
+        fixedPairs: {
+          type: 'array',
+          items: {
+            type: 'array',
+            items: { type: 'string' }
+          },
+          description: 'Pairs of player names that MUST be partners on the same team (e.g. [["Vipul", "Vishal"]]). Use this whenever the user asks to keep players on the same team, partner them together, or pair them.'
+        },
+        sameTeam: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'List of player names that should be on the same team / partners together (e.g. ["Vipul", "Vishal"]).'
         }
       }
     }
@@ -383,7 +396,7 @@ const CLAUDE_TOOLS = [
   },
   {
     name: 'rematch',
-    description: 'Regenerates matchups and rotations from the current poll votes.',
+    description: 'Regenerates matchups and rotations from the current poll votes with optional pairing constraints.',
     input_schema: {
       type: 'object',
       properties: {
@@ -394,6 +407,19 @@ const CLAUDE_TOOLS = [
         pollName: {
           type: 'string',
           description: 'Optional poll name or time keyword (e.g. "8am", "10am", "Tennis 8am") to match the specific poll.'
+        },
+        fixedPairs: {
+          type: 'array',
+          items: {
+            type: 'array',
+            items: { type: 'string' }
+          },
+          description: 'Pairs of player names that MUST be partners on the same team (e.g. [["Vipul", "Vishal"]]).'
+        },
+        sameTeam: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'List of player names that should be on the same team / partners together (e.g. ["Vipul", "Vishal"]).'
         }
       }
     }
@@ -3096,7 +3122,15 @@ async function executeTool(sock, chatId, sender, toolUse, msg) {
     return 'Poll created and sent to WhatsApp. The poll title itself contains time and slots, so do not output a separate confirmation message.';
   }
   if (name === 'generate_matchups' || name === 'rematch') {
-    const res = await generateMatchupsFromPoll(sock, chatId, input.pollId, input.pollName || input.when);
+    let fixedPairs = Array.isArray(input.fixedPairs) ? [...input.fixedPairs] : [];
+    if (Array.isArray(input.sameTeam) && input.sameTeam.length >= 2) {
+      for (let i = 0; i < input.sameTeam.length; i += 2) {
+        if (input.sameTeam[i + 1]) {
+          fixedPairs.push([input.sameTeam[i], input.sameTeam[i + 1]]);
+        }
+      }
+    }
+    const res = await generateMatchupsFromPoll(sock, chatId, input.pollId, input.pollName || input.when, { fixedPairs });
     return res || 'Matchups generated and posted.';
   }
   if (name === 'add_alias') {
@@ -5016,7 +5050,7 @@ async function processPollVoteEvent(sock, pollMessageKey, rawPollUpdates) {
     console.log(`[poll] Poll ${pollId} filled -- auto-posting matchups for: ${players.join(', ')}`);
 
     await ratings.ensureRated(players);
-    const schedule = generateMatchups(players);
+    const schedule = generateMatchups(players, options);
     const whenHeader = formatMatchHeaderTime(pollState);
     const header = whenHeader ? `📅 ${whenHeader}\n\n` : '';
     await sock.sendMessage(pollState.remoteJid, { text: header + formatMatchups(schedule) });
@@ -5088,7 +5122,7 @@ function formatMatchHeaderTime(pollState) {
   return `${weekdayName} ${timeFormatted}`;
 }
 
-async function generateMatchupsFromPoll(sock, chatId, specificPollId = null, specificPollName = null) {
+async function generateMatchupsFromPoll(sock, chatId, specificPollId = null, specificPollName = null, options = {}) {
   const lookupChatId = (chatId && chatId.endsWith('@g.us')) ? chatId : (await getTargetGroupJid(sock) || chatId);
   let targetPollId = null;
   let targetPollState = null;
