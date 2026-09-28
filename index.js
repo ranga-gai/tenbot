@@ -4212,12 +4212,28 @@ function knownPlayers(chatId) {
   return byKey;
 }
 
+
+/** Helper to extract epoch timestamp for a poll to ensure deterministic chronological sorting. */
+function getPollPlayTime(pollState) {
+  if (pollState?.playAt) {
+    const t = new Date(pollState.playAt).getTime();
+    if (!Number.isNaN(t)) return t;
+  }
+  if (pollState?.createdAt) {
+    const t = new Date(pollState.createdAt).getTime();
+    if (!Number.isNaN(t)) return t;
+  }
+  return 0;
+}
+
 /** The most recent poll state for a chat, if there is one. */
 function lastPollStateFor(chatId) {
-  for (const [, pollState] of [...activePolls.entries()].reverse()) {
-    if (pollState.remoteJid === chatId && (pollState.lastSchedule || pollState.lastPlayers)) {
-      return pollState;
-    }
+  const matching = [...activePolls.entries()]
+    .filter(([, p]) => p.remoteJid === chatId && (p.lastSchedule || p.lastPlayers))
+    .sort((a, b) => getPollPlayTime(b[1]) - getPollPlayTime(a[1]));
+
+  if (matching.length > 0) {
+    return matching[0][1];
   }
   const pollId = latestPollIdByChat.get(chatId);
   return (pollId && activePolls.get(pollId)) || null;
@@ -5084,52 +5100,67 @@ async function generateMatchupsFromPoll(sock, chatId, specificPollId = null, spe
     }
   }
 
-  // 2. If a specific poll name / time keyword was requested, search for it
+  const hasVotersOrPlayers = (p) => {
+    if (Array.isArray(p.lastPlayers) && p.lastPlayers.length > 0) return true;
+    if (p.voteBuffer && p.voteBuffer instanceof Map && p.voteBuffer.size > 0) return true;
+    if (Array.isArray(p.prebookedPlayers) && p.prebookedPlayers.length > 0) return true;
+    return false;
+  };
+
+  const allChatPolls = [...activePolls.entries()]
+    .filter(([, p]) => p.remoteJid === chatId && p.status !== 'cancelled');
+
+  // 2. If a specific poll name / time keyword was requested, search for it (sorted latest first)
   if (!targetPollState && specificPollName) {
     const q = String(specificPollName).toLowerCase().trim();
-    for (const [pollId, pollState] of [...activePolls.entries()].reverse()) {
-      if (pollState.remoteJid === chatId && pollState.status !== 'cancelled') {
-        const pName = (pollState.name || '').toLowerCase();
-        const pWhen = (pollState.when || '').toLowerCase();
-        if (pName.includes(q) || pWhen.includes(q) || q.includes(pName)) {
-          targetPollId = pollId;
-          targetPollState = pollState;
-          break;
-        }
-      }
+    const matching = allChatPolls
+      .filter(([, p]) => {
+        const pName = (p.name || '').toLowerCase();
+        const pWhen = (p.when || '').toLowerCase();
+        return pName.includes(q) || pWhen.includes(q) || q.includes(pName);
+      })
+      .sort((a, b) => getPollPlayTime(b[1]) - getPollPlayTime(a[1]));
+
+    if (matching.length > 0) {
+      targetPollId = matching[0][0];
+      targetPollState = matching[0][1];
     }
   }
 
-  // 3. Look for active opt-in or manual match poll first
+  // 3. Look for active opt-in or manual match poll first (nearest upcoming first)
   if (!targetPollState) {
-    for (const [pollId, pollState] of [...activePolls.entries()].reverse()) {
-      if (pollState.remoteJid === chatId && (pollState.status === 'active' || pollState.status === 'filled') && (pollState.type === 'opt_in' || pollState.size === null || pollState.isManual)) {
-        targetPollId = pollId;
-        targetPollState = pollState;
-        break;
-      }
+    const activeOptInOrManual = allChatPolls
+      .filter(([, p]) => (p.status === 'active' || p.status === 'filled') && (p.type === 'opt_in' || p.size === null || p.isManual) && hasVotersOrPlayers(p))
+      .sort((a, b) => getPollPlayTime(a[1]) - getPollPlayTime(b[1]));
+
+    if (activeOptInOrManual.length > 0) {
+      targetPollId = activeOptInOrManual[0][0];
+      targetPollState = activeOptInOrManual[0][1];
     }
   }
 
-  // 4. Look for any active match poll with votes
+  // 4. Look for any active/filled match poll with votes or prebooked players (nearest upcoming first)
   if (!targetPollState) {
-    for (const [pollId, pollState] of [...activePolls.entries()].reverse()) {
-      if (pollState.remoteJid === chatId && (pollState.status === 'active' || pollState.status === 'filled') && pollState.voteBuffer.size > 0) {
-        targetPollId = pollId;
-        targetPollState = pollState;
-        break;
-      }
+    const activeWithVotes = allChatPolls
+      .filter(([, p]) => (p.status === 'active' || p.status === 'filled') && hasVotersOrPlayers(p))
+      .sort((a, b) => getPollPlayTime(a[1]) - getPollPlayTime(b[1]));
+
+    if (activeWithVotes.length > 0) {
+      targetPollId = activeWithVotes[0][0];
+      targetPollState = activeWithVotes[0][1];
     }
   }
 
   // 5. Look for any match poll with players/votes (including resolved, for rematch or re-draw)
+  // Sorted by scheduled play time DESCENDING so the latest/most recent match is picked
   if (!targetPollState) {
-    for (const [pollId, pollState] of [...activePolls.entries()].reverse()) {
-      if (pollState.remoteJid === chatId && pollState.status !== 'cancelled' && (pollState.lastPlayers || pollState.voteBuffer.size > 0)) {
-        targetPollId = pollId;
-        targetPollState = pollState;
-        break;
-      }
+    const resolvedOrPast = allChatPolls
+      .filter(([, p]) => hasVotersOrPlayers(p))
+      .sort((a, b) => getPollPlayTime(b[1]) - getPollPlayTime(a[1]));
+
+    if (resolvedOrPast.length > 0) {
+      targetPollId = resolvedOrPast[0][0];
+      targetPollState = resolvedOrPast[0][1];
     }
   }
 
