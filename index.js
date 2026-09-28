@@ -3691,8 +3691,9 @@ async function getResponse(sock, rawText, chatId, sender, msg) {
     return 'Poll cancelled and deleted from WhatsApp -- I won\'t auto-generate matchups from it anymore.';
   }
 
-  if (lower === '!rematch' || lower === '!matchups' || lower === '!draw') {
-    return await generateMatchupsFromPoll(sock, chatId);
+  if (lower === '!rematch' || lower === '!matchups' || lower === '!draw' || lower.startsWith('!rematch ') || lower.startsWith('!matchups ') || lower.startsWith('!draw ')) {
+    const arg = text.replace(/^!(?:rematch|matchups|draw)\b/i, '').trim();
+    return await generateMatchupsFromPoll(sock, chatId, null, arg || null);
   }
 
   if (lower === '!cleanuppolls') {
@@ -5088,13 +5089,14 @@ function formatMatchHeaderTime(pollState) {
 }
 
 async function generateMatchupsFromPoll(sock, chatId, specificPollId = null, specificPollName = null) {
+  const lookupChatId = (chatId && chatId.endsWith('@g.us')) ? chatId : (await getTargetGroupJid(sock) || chatId);
   let targetPollId = null;
   let targetPollState = null;
 
   // 1. If a specific poll ID was requested, check if it exists in this chat
   if (specificPollId && activePolls.has(specificPollId)) {
     const poll = activePolls.get(specificPollId);
-    if (poll.remoteJid === chatId && poll.status !== 'cancelled') {
+    if (poll.remoteJid === lookupChatId && poll.status !== 'cancelled') {
       targetPollId = specificPollId;
       targetPollState = poll;
     }
@@ -5108,7 +5110,7 @@ async function generateMatchupsFromPoll(sock, chatId, specificPollId = null, spe
   };
 
   const allChatPolls = [...activePolls.entries()]
-    .filter(([, p]) => p.remoteJid === chatId && p.status !== 'cancelled');
+    .filter(([, p]) => p.remoteJid === lookupChatId && p.status !== 'cancelled');
 
   // 2. If a specific poll name / time keyword was requested, search for it (sorted latest first)
   if (!targetPollState && specificPollName) {
@@ -5165,7 +5167,7 @@ async function generateMatchupsFromPoll(sock, chatId, specificPollId = null, spe
   }
 
   if (!targetPollState) {
-    const pollId = latestPollIdByChat.get(chatId);
+    const pollId = latestPollIdByChat.get(lookupChatId);
     targetPollState = pollId && activePolls.get(pollId);
     targetPollId = pollId;
   }
@@ -5222,7 +5224,7 @@ async function generateMatchupsFromPoll(sock, chatId, specificPollId = null, spe
   const schedule = generateMatchups(players);
   const whenHeader = formatMatchHeaderTime(targetPollState);
   const header = whenHeader ? `📅 ${whenHeader}\n\n` : '';
-  await sock.sendMessage(targetPollState.remoteJid, { text: header + formatMatchups(schedule) });
+  await sock.sendMessage(chatId, { text: header + formatMatchups(schedule) });
   pairHistory.recordDraw(targetPollId, schedule);
   targetPollState.lastSchedule = summarizeSchedule(schedule);
   persistPolls();
