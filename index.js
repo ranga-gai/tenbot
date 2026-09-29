@@ -136,8 +136,8 @@ const POLL_EXPIRY_GRACE_DAYS = 14;
 const POLL_CLEANUP_INTERVAL_MINUTES = 15;
 
 // Powers of 2 hours away from match playtime for sending reminders
-// Reminder intervals away from match playtime: 30m (0.5h), 1h, 2h, 4h, 8h, 16h, 24h, 32h, 64h
-const POLL_REMINDER_HOURS = [0.5, 1, 2, 4, 8, 16, 24, 32, 64];
+// Reminder intervals away from match playtime: 1h, 2h, 4h, 8h, 16h, 24h, 32h, 64h
+const POLL_REMINDER_HOURS = [1, 2, 4, 8, 16, 24, 32, 64];
 const POWERS_OF_2_REMINDER_HOURS = POLL_REMINDER_HOURS;
 const POLL_REMINDER_CHECK_INTERVAL_MS = 60 * 1000;
 const MAX_POLL_REMINDERS = 2;
@@ -2616,6 +2616,11 @@ async function checkAndSendPollReminders(sock) {
       const targetH = POWERS_OF_2_REMINDER_HOURS.find((h) => hoursRemaining <= h);
       if (!targetH) continue; // more than 64 hours away
 
+      // For bot created polls, stop reminders after 2h reminder if there have been at least 4 reminders already
+      if (!pollState.isManual && targetH < 2 && (pollState.reminderCount || 0) >= 4) {
+        continue;
+      }
+
       if (!Array.isArray(pollState.sentReminders)) {
         pollState.sentReminders = [];
       }
@@ -2648,6 +2653,17 @@ async function checkAndSendPollReminders(sock) {
               pollState.sentReminders.push(h);
             }
           }
+
+          // For bot created polls, stop reminders after 2h reminder if there have been at least 4 reminders already
+          if (!pollState.isManual && targetH <= 2 && (pollState.reminderCount || 0) >= 4) {
+            for (const h of POWERS_OF_2_REMINDER_HOURS) {
+              if (h < 2 && !pollState.sentReminders.includes(h)) {
+                pollState.sentReminders.push(h);
+              }
+            }
+            console.log(`[poll] Stopped reminders for bot created poll ${pollId} after 2h reminder (${pollState.reminderCount} reminders sent)`);
+          }
+
           persistPolls();
         }
       } catch (sendErr) {
@@ -5556,8 +5572,9 @@ function pollStatusText(chatId = null, opts = {}) {
       ? pollState.sentReminders.map((h) => h < 1 ? `${Math.round(h * 60)}m` : `${h}h`).join(', ')
       : '(none yet)';
     const isAutoPoll = isAutoCreatedPoll(pollState);
+    const stoppedAfter2h = !pollState.isManual && (pollState.reminderCount || 0) >= 4 && (pollState.sentReminders || []).includes(2);
     const countStr = isAutoPoll
-      ? `(${pollState.reminderCount || 0} sent)`
+      ? `(${pollState.reminderCount || 0} sent${stoppedAfter2h ? " - stopped after 2h" : ""})`
       : `(${pollState.reminderCount || 0}/${MAX_POLL_REMINDERS} sent)`;
     const remindersLine = pollState.remindersPaused
       ? `Reminders: PAUSED (sent so far: [${remindersStr}] ${countStr})`
