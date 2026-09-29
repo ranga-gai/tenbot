@@ -136,8 +136,8 @@ const POLL_EXPIRY_GRACE_DAYS = 14;
 const POLL_CLEANUP_INTERVAL_MINUTES = 15;
 
 // Powers of 2 hours away from match playtime for sending reminders
-// Reminder intervals away from match playtime: 10m (0.1667h), 1h, 2h, 4h, 8h, 16h, 24h, 32h, 64h
-const POLL_REMINDER_HOURS = [0.1667, 1, 2, 4, 8, 16, 24, 32, 64];
+// Reminder intervals away from match playtime: 30m (0.5h), 1h, 2h, 4h, 8h, 16h, 24h, 32h, 64h
+const POLL_REMINDER_HOURS = [0.5, 1, 2, 4, 8, 16, 24, 32, 64];
 const POWERS_OF_2_REMINDER_HOURS = POLL_REMINDER_HOURS;
 const POLL_REMINDER_CHECK_INTERVAL_MS = 60 * 1000;
 const MAX_POLL_REMINDERS = 2;
@@ -2559,6 +2559,15 @@ function buildPollReminderText(H, pollState, openSpots, totalSpots, playerList, 
  * hours (64h, 32h, 16h, 8h, 4h, 2h, 1h) away from playtime.
  * Always silenced between 10pm and 8am in San Jose, CA (Pacific Time).
  */
+function isAutoCreatedPoll(pollState) {
+  if (!pollState) return false;
+  if (pollState.isAuto || pollState.isRecurring || pollState.isAutoCreated || pollState.autoCreated) return true;
+  if (Array.isArray(pollState.prebookedCourts) && pollState.prebookedCourts.length > 0) return true;
+  if (Array.isArray(pollState.prebookedPlayers) && pollState.prebookedPlayers.length > 0) return true;
+  if (pollState.scheduleId || pollState.recurringScheduleId) return true;
+  return false;
+}
+
 async function checkAndSendPollReminders(sock) {
   if (!sock) return;
   try {
@@ -2574,7 +2583,7 @@ async function checkAndSendPollReminders(sock) {
     for (const [pollId, pollState] of activePolls.entries()) {
       if (pollState.status !== 'active') continue;
       if (pollState.remindersPaused) continue; // reminders paused by group member
-      if ((pollState.reminderCount || 0) >= MAX_POLL_REMINDERS) continue; // limit maximum number of reminders to 2
+      if (!isAutoCreatedPoll(pollState) && (pollState.reminderCount || 0) >= MAX_POLL_REMINDERS) continue; // limit maximum number of reminders to 2 (only for non-auto created polls)
       if (!pollState.playAt) continue;
 
       const playAtMs = new Date(pollState.playAt).getTime();
@@ -4445,7 +4454,7 @@ function matchPlayerWithFullNames(scvccPlayerName, knownFullNames) {
  *   "Yes" and "No". The bot then waits for a user prompt to generate matchups from Yes voters.
  * - If replacePollId or cancelExisting is specified, deletes the older poll from WhatsApp.
  */
-async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWord = null, timeWord = null, creatorName = null, creatorJid = null, includeCreator = true, replacePollId = null, cancelExisting = false, isCommand = false, noMatchups = false, noCourts = false, includePrebookedSpots = false) {
+async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWord = null, timeWord = null, creatorName = null, creatorJid = null, includeCreator = true, replacePollId = null, cancelExisting = false, isCommand = false, noMatchups = false, noCourts = false, includePrebookedSpots = false, isRecurring = false) {
   const isAuto = size === 'auto' || String(size).toLowerCase() === 'auto';
   const isOptIn = !size && !isAuto;
 
@@ -4781,6 +4790,9 @@ async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWor
     status: 'active', // 'active' | 'filled' | 'resolved' | 'cancelled' | 'stopped' | 'expired'
     isManual: false,
     isCommand: Boolean(isCommand),
+    isAuto: Boolean(isAuto),
+    isRecurring: Boolean(isRecurring),
+    isAutoCreated: Boolean(isAuto || isRecurring),
     noMatchups: Boolean(noMatchups),
     prebookedCourts: (selectedPrebooked && selectedPrebooked.length > 0) ? selectedPrebooked.map(pb => ({ court: pb.court, player: pb.player })) : null,
     prebookedPlayers: hasPrebooked ? prebookedInfo : null,
@@ -5539,7 +5551,10 @@ function pollStatusText(chatId = null, opts = {}) {
     const remindersStr = Array.isArray(pollState.sentReminders) && pollState.sentReminders.length > 0
       ? pollState.sentReminders.map((h) => h < 1 ? `${Math.round(h * 60)}m` : `${h}h`).join(', ')
       : '(none yet)';
-    const countStr = `(${pollState.reminderCount || 0}/${MAX_POLL_REMINDERS} sent)`;
+    const isAutoPoll = isAutoCreatedPoll(pollState);
+    const countStr = isAutoPoll
+      ? `(${pollState.reminderCount || 0} sent)`
+      : `(${pollState.reminderCount || 0}/${MAX_POLL_REMINDERS} sent)`;
     const remindersLine = pollState.remindersPaused
       ? `Reminders: PAUSED (sent so far: [${remindersStr}] ${countStr})`
       : `Sent reminders: [${remindersStr}] ${countStr}`;
