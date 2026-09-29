@@ -1419,8 +1419,11 @@ async function isUserAdmin(sock, remoteJid, senderJid) {
 function isSameUser(jid1, jid2, name1, name2) {
   const k1 = ratings.keyFor(name1);
   const k2 = ratings.keyFor(name2);
-  if (k1 && k2 && !GENERIC_NAMES.has(k1) && !GENERIC_NAMES.has(k2) && k1 === k2) {
-    return true;
+  if (k1 && k2 && !GENERIC_NAMES.has(k1) && !GENERIC_NAMES.has(k2)) {
+    if (k1 === k2) return true;
+    const m1 = namesStore.findIdByNameOrAlias(name1);
+    const m2 = namesStore.findIdByNameOrAlias(name2);
+    if (m1 && m2 && m1.id === m2.id) return true;
   }
   if (!jid1 || !jid2) return false;
   const norm1 = jidNormalizedUser(jid1);
@@ -4275,6 +4278,7 @@ function knownPlayers(chatId) {
 
   for (const entry of namesStore.getAllEntries()) {
     if (entry.name) add(entry.name, entry.name);
+    if (entry.fullName) add(entry.fullName, entry.name);
     for (const alias of entry.aliases || []) {
       add(alias, entry.name);
     }
