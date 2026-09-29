@@ -286,6 +286,11 @@ const CLAUDE_TOOLS = [
             items: { type: 'string' }
           },
           description: '2D array of player name pairs who MUST be partners on the same team across sets (e.g. [["PlayerA", "PlayerB"]]). Pass this whenever the user asks to keep players on the same team, partner them together, or pair them.'
+        },
+        prebookedCourts: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Optional list of prebooked courts (e.g. ["Court 2", "Court 3"]) to assign matches to first before unbooked matches (M1, M2).'
         }
       }
     }
@@ -418,6 +423,11 @@ const CLAUDE_TOOLS = [
             items: { type: 'string' }
           },
           description: '2D array of player name pairs who MUST be partners on the same team across sets (e.g. [["PlayerA", "PlayerB"]]).'
+        },
+        prebookedCourts: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Optional list of prebooked courts (e.g. ["Court 2", "Court 3"]) to assign matches to first before unbooked matches (M1, M2).'
         }
       }
     }
@@ -3152,7 +3162,10 @@ async function executeTool(sock, chatId, sender, toolUse, msg) {
     return 'Poll created and sent to WhatsApp. The poll title itself contains time and slots, so do not output a separate confirmation message.';
   }
   if (name === 'generate_matchups' || name === 'rematch') {
-    const res = await generateMatchupsFromPoll(sock, chatId, input.pollId, input.pollName || input.when, { fixedPairs: input.fixedPairs || [] });
+    const res = await generateMatchupsFromPoll(sock, chatId, input.pollId, input.pollName || input.when, {
+      fixedPairs: input.fixedPairs || [],
+      prebookedCourts: input.prebookedCourts || []
+    });
     return res || 'Matchups generated and posted.';
   }
   if (name === 'add_alias') {
@@ -4548,6 +4561,7 @@ async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWor
     queryTime = `${h}:${m}${ampm}`;
   }
   const targetDateMDY = scvcc.resolveDateToMDY(effectiveDayWord || resolvedWhen || playAt);
+  let selectedPrebooked = [];
 
   if (isAuto) {
     let prebookedCourts = [];
@@ -4592,7 +4606,7 @@ async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWor
       console.warn('[poll] Error checking court availability/bookings for auto poll:', err.message);
     }
 
-    const selectedPrebooked = prebookedCourts.slice(0, 3);
+    selectedPrebooked = prebookedCourts.slice(0, 3);
     const remainingNeeded = Math.min(freeCourts.length, Math.max(0, 3 - selectedPrebooked.length));
     const selectedFree = freeCourts.slice(0, remainingNeeded);
 
@@ -4768,6 +4782,7 @@ async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWor
     isManual: false,
     isCommand: Boolean(isCommand),
     noMatchups: Boolean(noMatchups),
+    prebookedCourts: (selectedPrebooked && selectedPrebooked.length > 0) ? selectedPrebooked.map(pb => ({ court: pb.court, player: pb.player })) : null,
     prebookedPlayers: hasPrebooked ? prebookedInfo : null,
     creator: (!isAuto && !hasPrebooked && (shouldIncludeCreator || leadingVirtualCount > 0)) ? { name: (creatorName || 'Player 1'), jid: creatorJid || null } : null,
     lastConflictSignature: null,
@@ -5079,7 +5094,8 @@ async function processPollVoteEvent(sock, pollMessageKey, rawPollUpdates) {
     console.log(`[poll] Poll ${pollId} filled -- auto-posting matchups for: ${players.join(', ')}`);
 
     await ratings.ensureRated(players);
-    const schedule = generateMatchups(players, options);
+    const prebookedCourts = await getPrebookedCourtsForPoll(pollState);
+    const schedule = generateMatchups(players, { prebookedCourts });
     const whenHeader = formatMatchHeaderTime(pollState);
     const header = whenHeader ? `📅 ${whenHeader}\n\n` : '';
     await sock.sendMessage(pollState.remoteJid, { text: header + formatMatchups(schedule) });
@@ -5174,6 +5190,93 @@ function formatMatchHeaderTime(pollState) {
     return pollState.when;
   }
   return `${weekdayName} ${timeFormatted}`;
+}
+
+async function getPrebookedCourtsForPoll(pollState) {
+  if (!pollState) return [];
+  const courts = [];
+
+  // 1. From pollState.prebookedCourts
+  if (Array.isArray(pollState.prebookedCourts)) {
+    for (const c of pollState.prebookedCourts) {
+      if (typeof c === "string") {
+        courts.push({ court: c });
+      } else if (c && typeof c === "object") {
+        courts.push(c);
+      }
+    }
+  }
+
+  // 2. From pollState.prebookedPlayers
+  if (Array.isArray(pollState.prebookedPlayers)) {
+    for (const pb of pollState.prebookedPlayers) {
+      if (pb && pb.court) {
+        courts.push({
+          court: pb.court,
+          player: pb.defaultPlayer || pb.name || pb.fullName
+        });
+      }
+    }
+  }
+
+  // 3. From pollState.name (court booking lines in poll title)
+  if (pollState.name) {
+    const bookingRegex = /(?:^|\n)\s*(Court\s*\d+|PB\s*\d+|Pickleball\s*\d+)\s*-\s*([^'\n]+?)(?:\'s)?\s*Booking/gi;
+    let m;
+    while ((m = bookingRegex.exec(pollState.name)) !== null) {
+      courts.push({ court: m[1], player: m[2].trim() });
+    }
+  }
+
+  // 4. If still empty, query SCVCC for match date & time if available
+  if (courts.length === 0 && (pollState.playAt || pollState.when)) {
+    try {
+      const targetDateMDY = scvcc.resolveDateToMDY(pollState.when || pollState.playAt);
+      let queryTime = null;
+      if (pollState.playAt) {
+        const sjParts = getSanJoseParts(new Date(pollState.playAt));
+        const h = sjParts.hour === 0 ? 12 : (sjParts.hour > 12 ? sjParts.hour - 12 : sjParts.hour);
+        const m = String(sjParts.minute).padStart(2, "0");
+        const ampm = sjParts.hour >= 12 ? "pm" : "am";
+        queryTime = `${h}:${m}${ampm}`;
+      } else if (pollState.when) {
+        const timeMatch = pollState.when.match(/\b(\d{1,2}(?:[:.]\d{2})?\s*(?:am|pm))\b/i) || pollState.when.match(/\b(\d{1,2}[:.]\d{2})\b/i);
+        if (timeMatch) queryTime = timeMatch[1];
+      }
+
+      if (targetDateMDY && queryTime) {
+        const bookingsRes = await scvcc.getCourtBookings({ when: targetDateMDY, time: queryTime, sport: "tennis" });
+        const knownFullNames = buildKnownFullNamesList();
+        const seen = new Set();
+        for (const b of bookingsRes?.bookings || []) {
+          if (seen.has(b.court)) continue;
+          let matchedName = null;
+          for (const p of b.players) {
+            matchedName = matchPlayerWithFullNames(p, knownFullNames);
+            if (matchedName) break;
+          }
+          if (matchedName) {
+            courts.push({ court: b.court, player: matchedName });
+            seen.add(b.court);
+          }
+        }
+      }
+    } catch (err) {
+      console.warn("[poll] Error checking SCVCC bookings in getPrebookedCourtsForPoll:", err.message);
+    }
+  }
+
+  // Deduplicate courts preserving order
+  const unique = [];
+  const seenCourts = new Set();
+  for (const c of courts) {
+    const key = (c.court || "").trim().toLowerCase();
+    if (key && !seenCourts.has(key)) {
+      seenCourts.add(key);
+      unique.push(c);
+    }
+  }
+  return unique;
 }
 
 async function generateMatchupsFromPoll(sock, chatId, specificPollId = null, specificPollName = null, options = {}) {
@@ -5309,7 +5412,10 @@ async function generateMatchupsFromPoll(sock, chatId, specificPollId = null, spe
   console.log(`[poll] Generating matchups for poll ${targetPollId} ("${targetPollState.name || targetPollState.type}") with ${players.length} player(s): ${players.join(', ')}`);
 
   await ratings.ensureRated(players);
-  const schedule = generateMatchups(players, options);
+  const prebookedCourts = (options && Array.isArray(options.prebookedCourts) && options.prebookedCourts.length > 0)
+    ? options.prebookedCourts
+    : await getPrebookedCourtsForPoll(targetPollState);
+  const schedule = generateMatchups(players, { ...options, prebookedCourts });
   const whenHeader = formatMatchHeaderTime(targetPollState);
   const header = whenHeader ? `📅 ${whenHeader}\n\n` : '';
   await sock.sendMessage(chatId, { text: header + formatMatchups(schedule) });
