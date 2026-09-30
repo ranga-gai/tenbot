@@ -560,6 +560,10 @@ const CLAUDE_TOOLS = [
           type: 'string',
           description: 'The schedule ID of the recurring poll to modify (e.g. "rec_1", "rec_...").'
         },
+        modifyInstance: {
+          type: 'boolean',
+          description: 'Set to true if modifying the active/current poll instance created by this schedule instead of modifying the recurring schedule template.'
+        },
         size: {
           type: 'integer',
           description: 'Optional new player count (2 for singles, 4/8/12 for doubles). If type is opt_in, set to null.'
@@ -622,6 +626,69 @@ const CLAUDE_TOOLS = [
     input_schema: {
       type: 'object',
       properties: {}
+    }
+  },
+  {
+    name: 'limit_poll_slots',
+    description: 'Internally sets or limits the number of player slots for an active match poll or recurring poll instance without deleting or modifying the WhatsApp poll message. If votes reach or cross this limit, the poll is marked filled, and any votes exceeding this limit will not be considered (with a warning sent).',
+    input_schema: {
+      type: 'object',
+      properties: {
+        targetId: {
+          type: 'string',
+          description: 'The poll ID, schedule ID (e.g. "rec_mujmt71n"), or poll time/name of the instance to limit.'
+        },
+        slots: {
+          type: 'integer',
+          description: 'The new maximum number of slots/players for this poll instance (e.g. 4, 8, 12).'
+        }
+      },
+      required: ['slots']
+    }
+  },
+  {
+    name: 'modify_poll_instance',
+    description: 'Modifies a specific active match poll or recurring poll instance (e.g. change time, spots count, courts, or auto-matchups) without altering the recurring schedule for future weeks. The instance can be identified by its poll ID, schedule ID (e.g. "rec_mujmt71n"), or poll time/name. Deletes the older poll from WhatsApp and posts the updated poll.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        targetId: {
+          type: 'string',
+          description: 'The poll ID, schedule ID (e.g. "rec_mujmt71n"), or poll time/name of the instance to modify.'
+        },
+        size: {
+          description: 'Optional new number of players (2 for singles, 4/8/12/16 for doubles), "auto", or null for Yes/No opt-in.'
+        },
+        when: {
+          type: 'string',
+          description: 'Optional new day/time description (e.g. "7:30pm", "Wednesday 8pm", "Tomorrow 6pm").'
+        },
+        timeWord: {
+          type: 'string',
+          description: 'Optional new time (e.g. "7:30pm", "8pm").'
+        },
+        dayWord: {
+          type: 'string',
+          description: 'Optional new day (e.g. "Wednesday", "tomorrow").'
+        },
+        autoMatchups: {
+          type: 'boolean',
+          description: 'Optional: whether to auto-generate matchups when filled.'
+        },
+        noMatchups: {
+          type: 'boolean',
+          description: 'Optional: if true, disable automatic matchups.'
+        },
+        noCourts: {
+          type: 'boolean',
+          description: 'Optional: if true, disable SCVCC court list in title.'
+        },
+        'prebooked-spots': {
+          type: 'boolean',
+          description: 'Optional: whether to include named slots for prebooked courts.'
+        }
+      },
+      required: ['targetId']
     }
   },
   {
@@ -1078,10 +1145,10 @@ function resolveFixedPollRoster(pollState, aggregated = [], bySlot = null) {
     : (!hasPrebooked && pollState.creator ? 1 : 0);
   const creatorName = pollState.creator?.name || (pollState.creator?.jid ? nameFor(pollState.creator.jid) : 'Creator');
 
-  const players = [];
+  const allPlayers = [];
   // For polls with leading virtual/creator spots
   for (let i = 0; i < leadingSpots; i++) {
-    addNextCreatorPlayer(players, creatorName);
+    addNextCreatorPlayer(allPlayers, creatorName);
   }
 
   let filledCount = leadingSpots;
@@ -1092,20 +1159,38 @@ function resolveFixedPollRoster(pollState, aggregated = [], bySlot = null) {
     if (voterJid) {
       // Voted slot (or overridden prebooked slot)
       const playerName = nameFor(voterJid);
-      players.push(playerName);
+      allPlayers.push(playerName);
       filledCount++;
     } else if (prebookedSlotMap.has(opt)) {
       // Unvoted prebooked slot -> defaults to prebooked player
       const defaultPlayer = prebookedSlotMap.get(opt);
-      players.push(defaultPlayer);
+      allPlayers.push(defaultPlayer);
       filledCount++;
     } else {
       // Unvoted normal slot -> empty
     }
   }
 
-  const isAllFilled = (filledCount >= totalSlotsCount);
-  return { players, filledCount, totalSlotsCount, isAllFilled, prebookedSlotMap };
+  const effectiveLimit = (typeof pollState.slotLimit === 'number' && pollState.slotLimit > 0)
+    ? pollState.slotLimit
+    : totalSlotsCount;
+
+  const players = allPlayers.slice(0, effectiveLimit);
+  const excessPlayers = allPlayers.slice(effectiveLimit);
+  const effFilledCount = Math.min(filledCount, effectiveLimit);
+  const effTotalSlotsCount = effectiveLimit;
+  const isAllFilled = (filledCount >= effectiveLimit);
+
+  return {
+    players,
+    allPlayers,
+    excessPlayers,
+    filledCount: effFilledCount,
+    totalSlotsCount: effTotalSlotsCount,
+    naturalTotalSlots: totalSlotsCount,
+    isAllFilled,
+    prebookedSlotMap
+  };
 }
 
 /**
@@ -2277,6 +2362,450 @@ async function handleClearAllRecurringPolls(sock, chatId, sender, senderJid) {
   return await recurringPollsModule.clearAllRecurringPolls({ recurringPolls, persistPolls, sender, chatId });
 }
 
+function parseModifyInstanceCommand(rawText) {
+  const text = (rawText || '').trim();
+  let m = text.match(/^!(?:modifyinstance|modifyrecurringinstance|modifypoll|editpoll|updatepoll|editinstance|updateinstance)\s*(.*)$/i);
+  let rest = m ? m[1].trim() : null;
+
+  if (!m) {
+    const m2 = text.match(/^!(?:modifyrecurringpoll|editrecurringpoll|updaterecurringpoll|changerecurringpoll)\s*(.*)$/i);
+    if (m2) {
+      const r = m2[1].trim();
+      if (/\b(?:--instance|-i|instance)\b/i.test(r)) {
+        rest = r.replace(/\b(?:--instance|-i|instance)\b/ig, ' ').trim();
+      } else {
+        return null;
+      }
+    } else {
+      return null;
+    }
+  }
+
+  if (!rest) {
+    return { targetId: null, updates: {} };
+  }
+
+  let targetId = null;
+  let rem = '';
+  const qMatch = rest.match(/^["']([^"']+)["']\s*(.*)$/);
+  if (qMatch) {
+    targetId = qMatch[1].trim();
+    rem = qMatch[2].trim();
+  } else {
+    const parts = rest.split(/\s+/, 2);
+    targetId = parts[0].trim();
+    rem = rest.slice(parts[0].length).trim();
+  }
+
+  const updates = {};
+  if (/\b(?:opt-?in|yes\s*\/\s*no|yesno|open)\b/i.test(rem)) {
+    updates.type = 'opt_in';
+    updates.size = null;
+  } else if (/\bauto\b/i.test(rem)) {
+    updates.size = 'auto';
+  } else {
+    const sizeM = rem.match(/\b(?:for|size|spots?|players?)\s*[:=]?\s*(\d+)\b/i) ||
+                  rem.match(/\b(\d+)\s*(?:spots?|players?|people|courts?)\b/i) ||
+                  rem.match(/\b([248]|12|16)\b/);
+    if (sizeM) {
+      updates.size = parseInt(sizeM[1], 10);
+    }
+  }
+
+  const timeM = rem.match(/\b(\d{1,2}(?:[:.]\d{2})?\s*(?:am|pm))\b/i) || rem.match(/\b(\d{1,2}[:.]\d{2})\b/i);
+  if (timeM) {
+    updates.timeWord = timeM[1].trim();
+  }
+
+  const dayM = rem.match(/\b(today|tonight|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tue|wed|thu|fri|sat|sun)\b/i);
+  if (dayM) {
+    updates.dayWord = dayM[1].trim();
+  }
+
+  if (updates.dayWord && updates.timeWord) {
+    const cap = updates.dayWord.charAt(0).toUpperCase() + updates.dayWord.slice(1).toLowerCase();
+    updates.when = `${cap} ${updates.timeWord}`;
+  } else if (updates.timeWord) {
+    updates.when = updates.timeWord;
+  } else if (updates.dayWord) {
+    updates.when = updates.dayWord.charAt(0).toUpperCase() + updates.dayWord.slice(1).toLowerCase();
+  }
+
+  if (/(?:--no-?matchups?|no[-_\s]*matchups?|without[-_\s]*matchups?)/i.test(rem)) {
+    updates.noMatchups = true;
+  } else if (/(?:--auto-?matchups?|with[-_\s]*matchups?)/i.test(rem)) {
+    updates.noMatchups = false;
+  }
+
+  if (/(?:--no-?courts?|no[-_\s]*courts?|without[-_\s]*courts?)/i.test(rem)) {
+    updates.noCourts = true;
+  } else if (/(?:--include-?courts?|with[-_\s]*courts?)/i.test(rem)) {
+    updates.noCourts = false;
+  }
+
+  if (/(?:--?prebooked[-_]?spots?|with[-_\s]*prebooked[-_]?spots?)/i.test(rem)) {
+    updates.includePrebookedSpots = true;
+  } else if (/(?:--?no-?prebooked[-_]?spots?|without[-_\s]*prebooked[-_]?spots?)/i.test(rem)) {
+    updates.includePrebookedSpots = false;
+  }
+
+  return { targetId, updates };
+}
+
+/**
+ * Modifies a specific active match poll or recurring poll instance by deleting
+ * the older poll from WhatsApp and sending an updated poll with the new parameters.
+ */
+async function handleModifyPollInstance(sock, chatId, sender, senderJid, targetId, updates = {}) {
+  const isDM = Boolean(chatId && !chatId.endsWith('@g.us'));
+  const effectiveChatId = isDM ? (targetGroupJid || await getTargetGroupJid(sock) || chatId) : chatId;
+
+  let cleanTarget = String(targetId || '').replace(/^["']|["']$/g, '').trim();
+
+  // Find candidate poll in activePolls
+  let matchedPollId = null;
+  let matchedPollState = null;
+
+  if (cleanTarget) {
+    const cleanLower = cleanTarget.toLowerCase();
+
+    // 1. Exact poll ID match
+    for (const [id, state] of activePolls.entries()) {
+      if ((state.remoteJid === effectiveChatId || isDM) && id.toLowerCase() === cleanLower) {
+        matchedPollId = id;
+        matchedPollState = state;
+        break;
+      }
+    }
+
+    // 2. Schedule ID match (for recurring poll instances)
+    if (!matchedPollState) {
+      for (const [id, state] of activePolls.entries()) {
+        if ((state.remoteJid === effectiveChatId || isDM) && (state.status === 'active' || state.status === 'filled' || state.status === 'stopped')) {
+          const sid = getPollScheduleId(state);
+          if (sid && sid.toLowerCase() === cleanLower) {
+            matchedPollId = id;
+            matchedPollState = state;
+            break;
+          }
+          if (state.scheduleId && state.scheduleId.toLowerCase() === cleanLower) {
+            matchedPollId = id;
+            matchedPollState = state;
+            break;
+          }
+        }
+      }
+    }
+
+    // 3. Name or when match
+    if (!matchedPollState) {
+      for (const [id, state] of activePolls.entries()) {
+        if ((state.remoteJid === effectiveChatId || isDM) && (state.status === 'active' || state.status === 'filled' || state.status === 'stopped')) {
+          const pName = (state.name || '').toLowerCase();
+          const pWhen = (state.when || '').toLowerCase();
+          if (pName.includes(cleanLower) || pWhen.includes(cleanLower) || cleanLower.includes(pWhen)) {
+            matchedPollId = id;
+            matchedPollState = state;
+            break;
+          }
+        }
+      }
+    }
+  } else {
+    // If no target ID provided, check if exactly 1 active poll exists
+    const chatPolls = [...activePolls.entries()].filter(([, state]) =>
+      (state.remoteJid === effectiveChatId || isDM) && (state.status === 'active' || state.status === 'filled' || state.status === 'stopped')
+    );
+    if (chatPolls.length === 1) {
+      matchedPollId = chatPolls[0][0];
+      matchedPollState = chatPolls[0][1];
+    } else if (chatPolls.length === 0) {
+      return '📅 No active match polls found to modify.';
+    } else {
+      const descriptions = chatPolls.map(([id, state]) => `\`${id}\` (${state.when || state.name || 'unnamed'})`).join(', ');
+      return `Please specify which poll instance to modify: ${descriptions}. Example: "!modifyinstance ${chatPolls[0][0]} 12 7pm"`;
+    }
+  }
+
+  if (!matchedPollState) {
+    return `⚠️ No active match poll instance found matching "${cleanTarget}". Use "!activepolls" or "!pollstatus" to view active polls.`;
+  }
+
+  // Permission check: schedule creator, poll creator, or group admin
+  const schedId = getPollScheduleId(matchedPollState);
+  const sched = schedId ? recurringPolls.get(schedId) : null;
+  const isSchedCreator = sched?.creator ? isSameUser(sched.creator.jid, senderJid, sched.creator.name, sender) : false;
+  const isPollCreator = matchedPollState.creator ? isSameUser(matchedPollState.creator.jid, senderJid, matchedPollState.creator.name, sender) : false;
+  const isAdmin = await isUserAdmin(sock, effectiveChatId, senderJid);
+
+  if (!isSchedCreator && !isPollCreator && !isAdmin) {
+    return '⚠️ Only the creator of this poll/schedule or group admins can modify this poll instance.';
+  }
+
+  // Determine updated values, falling back to existing poll state
+  const isAuto = updates.size === 'auto' || (updates.size === undefined && matchedPollState.isAuto);
+  let newSize = updates.size;
+  if (newSize === undefined) {
+    newSize = isAuto ? 'auto' : (matchedPollState.type === 'opt_in' ? null : matchedPollState.size);
+  }
+
+  let newWhen = updates.when || null;
+  let newDayWord = updates.dayWord || null;
+  let newTimeWord = updates.timeWord || null;
+
+  // If timeWord provided but not dayWord, keep the original day from playAt
+  if (newTimeWord && !newDayWord && matchedPollState.playAt) {
+    const oldPlayAt = new Date(matchedPollState.playAt);
+    if (!Number.isNaN(oldPlayAt.getTime())) {
+      const weekday = new Intl.DateTimeFormat('en-US', { timeZone: 'America/Los_Angeles', weekday: 'long' }).format(oldPlayAt);
+      newDayWord = weekday;
+      newWhen = `${weekday} ${newTimeWord}`;
+    }
+  } else if (!newWhen && !newTimeWord && !newDayWord) {
+    newWhen = matchedPollState.when;
+  }
+
+  const noMatchups = updates.noMatchups !== undefined ? updates.noMatchups : Boolean(matchedPollState.noMatchups);
+  const noCourts = updates.noCourts !== undefined ? updates.noCourts : false;
+  const includePrebookedSpots = updates.includePrebookedSpots !== undefined
+    ? updates.includePrebookedSpots
+    : Boolean(matchedPollState.prebookedPlayers && matchedPollState.prebookedPlayers.length > 0);
+
+  const creatorName = matchedPollState.creator?.name || sender;
+  const creatorJid = matchedPollState.creator?.jid || senderJid;
+  const includeCreator = Boolean(matchedPollState.creator);
+  const isRecurring = Boolean(matchedPollState.isRecurring || schedId);
+
+  const targetRemoteJid = matchedPollState.remoteJid || effectiveChatId;
+
+  const res = await createMatchPoll(
+    sock,
+    targetRemoteJid,
+    newSize,
+    newWhen,
+    newDayWord,
+    newTimeWord,
+    creatorName,
+    creatorJid,
+    includeCreator,
+    matchedPollId, // replacePollId: deletes older poll from WhatsApp and replaces it!
+    false,
+    true,
+    noMatchups,
+    noCourts,
+    includePrebookedSpots,
+    isRecurring,
+    schedId
+  );
+
+  if (res?.err) {
+    return `Could not modify poll instance: ${res.err}`;
+  }
+
+  const instanceTitle = res?.when || newWhen || matchedPollState.when || 'Match';
+  const sizeDesc = res?.isOptIn ? 'Opt-in (Yes/No)' : `${res?.size || newSize} spots`;
+  const schedNote = schedId ? ` (Schedule: \`${schedId}\`)` : '';
+
+  return `✅ Modified recurring poll instance for *${instanceTitle}*${schedNote}:\n` +
+    `• *Format:* ${sizeDesc}\n` +
+    `• *Matchups:* ${noMatchups ? 'Manual only' : 'Auto-generated when filled'}\n` +
+    `Older poll was deleted from WhatsApp and replaced. (Note: Future recurring schedules remain unchanged).`;
+}
+
+/**
+ * Internally sets or limits the number of slots for a poll instance without deleting
+ * or modifying the WhatsApp poll. Emits warnings if votes cross the new limit.
+ */
+async function handleSetPollSlots(sock, chatId, sender, senderJid, targetId, count) {
+  const isDM = Boolean(chatId && !chatId.endsWith('@g.us'));
+  const effectiveChatId = isDM ? (targetGroupJid || await getTargetGroupJid(sock) || chatId) : chatId;
+
+  let cleanTarget = String(targetId || '').replace(/^["']|["']$/g, '').trim();
+  let cleanCount = count;
+
+  // If user typed e.g. !setslots 8 (without targetId) and only 1 active poll exists
+  if (!cleanCount && cleanTarget && (/^\d+$/.test(cleanTarget) || /^(?:reset|clear|none)$/i.test(cleanTarget))) {
+    cleanCount = cleanTarget;
+    cleanTarget = null;
+  }
+
+  // Find candidate poll in activePolls
+  let matchedPollId = null;
+  let matchedPollState = null;
+
+  if (cleanTarget) {
+    const cleanLower = cleanTarget.toLowerCase();
+
+    // 1. Exact poll ID match
+    for (const [id, state] of activePolls.entries()) {
+      if ((state.remoteJid === effectiveChatId || isDM) && id.toLowerCase() === cleanLower) {
+        matchedPollId = id;
+        matchedPollState = state;
+        break;
+      }
+    }
+
+    // 2. Schedule ID match (for recurring poll instances)
+    if (!matchedPollState) {
+      for (const [id, state] of activePolls.entries()) {
+        if ((state.remoteJid === effectiveChatId || isDM) && (state.status === 'active' || state.status === 'filled' || state.status === 'stopped')) {
+          const sid = getPollScheduleId(state);
+          if (sid && sid.toLowerCase() === cleanLower) {
+            matchedPollId = id;
+            matchedPollState = state;
+            break;
+          }
+          if (state.scheduleId && state.scheduleId.toLowerCase() === cleanLower) {
+            matchedPollId = id;
+            matchedPollState = state;
+            break;
+          }
+        }
+      }
+    }
+
+    // 3. Name or when match
+    if (!matchedPollState) {
+      for (const [id, state] of activePolls.entries()) {
+        if ((state.remoteJid === effectiveChatId || isDM) && (state.status === 'active' || state.status === 'filled' || state.status === 'stopped')) {
+          const pName = (state.name || '').toLowerCase();
+          const pWhen = (state.when || '').toLowerCase();
+          if (pName.includes(cleanLower) || pWhen.includes(cleanLower) || cleanLower.includes(pWhen)) {
+            matchedPollId = id;
+            matchedPollState = state;
+            break;
+          }
+        }
+      }
+    }
+  } else {
+    // Auto-select if exactly 1 active poll exists
+    const chatPolls = [...activePolls.entries()].filter(([, state]) =>
+      (state.remoteJid === effectiveChatId || isDM) && (state.status === 'active' || state.status === 'filled' || state.status === 'stopped')
+    );
+    if (chatPolls.length === 1) {
+      matchedPollId = chatPolls[0][0];
+      matchedPollState = chatPolls[0][1];
+    } else if (chatPolls.length === 0) {
+      return '📅 No active match polls found on record.';
+    } else {
+      const descriptions = chatPolls.map(([id, state]) => `\`${id}\` (${state.when || state.name || 'unnamed'})`).join(', ');
+      return `Please specify which poll instance to limit: ${descriptions}. Example: "!setslots ${chatPolls[0][0]} 8"`;
+    }
+  }
+
+  if (!matchedPollState) {
+    return `⚠️ No active match poll instance found matching "${cleanTarget}". Use "!activepolls" or "!pollstatus" to view active polls.`;
+  }
+
+  // Permission check: schedule creator, poll creator, or group admin
+  const schedId = getPollScheduleId(matchedPollState);
+  const sched = schedId ? recurringPolls.get(schedId) : null;
+  const isSchedCreator = sched?.creator ? isSameUser(sched.creator.jid, senderJid, sched.creator.name, sender) : false;
+  const isPollCreator = matchedPollState.creator ? isSameUser(matchedPollState.creator.jid, senderJid, matchedPollState.creator.name, sender) : false;
+  const isAdmin = await isUserAdmin(sock, effectiveChatId, senderJid);
+
+  if (!isSchedCreator && !isPollCreator && !isAdmin) {
+    return '⚠️ Only the creator of this poll/schedule or group admins can set slot limits.';
+  }
+
+  // Handle reset/clearing limit if user specifies 'reset', 'clear', or 0
+  if (cleanCount === 'reset' || cleanCount === 'clear' || cleanCount === 'none' || cleanCount === '0' || cleanCount === 0) {
+    matchedPollState.slotLimit = null;
+    if (matchedPollState.originalSize) {
+      matchedPollState.size = matchedPollState.originalSize;
+    }
+    matchedPollState.lastExcessSignature = null;
+    persistPolls();
+    return `🔄 Removed slot limit on poll "${matchedPollState.name || matchedPollState.when || matchedPollId}". Slots reverted to original size (${matchedPollState.size || 'default'}).`;
+  }
+
+  const num = parseInt(cleanCount, 10);
+  if (!Number.isInteger(num) || num <= 0) {
+    return 'Please provide a valid positive number of slots, e.g. "!setslots rec_1 8" or "!setslots 8".';
+  }
+
+  if (num > 40) {
+    return 'Slot limit cannot exceed 40 players.';
+  }
+
+  if (!matchedPollState.originalSize) {
+    matchedPollState.originalSize = matchedPollState.size;
+  }
+  matchedPollState.slotLimit = num;
+  matchedPollState.size = num;
+
+  const mePn = jidNormalizedUser(sock?.user?.id || sock?.authState?.creds?.me?.id || '');
+  const { aggregated, interestedPlayers } = getPollVoters(matchedPollId, matchedPollState, mePn);
+
+  let players = [];
+  let excessPlayers = [];
+  let isAllFilled = false;
+  let filledCount = 0;
+
+  if (matchedPollState.type === 'opt_in' || matchedPollState.options?.some((o) => /^yes$/i.test(o))) {
+    const yesOption = aggregated.find((o) => /^yes$/i.test(o.name.trim()));
+    const yesVoters = yesOption ? yesOption.voters.map(nameFor) : interestedPlayers;
+    players = yesVoters.slice(0, num);
+    excessPlayers = yesVoters.slice(num);
+    filledCount = players.length;
+    isAllFilled = (yesVoters.length >= num);
+  } else {
+    const roster = resolveFixedPollRoster(matchedPollState, aggregated);
+    players = roster.players;
+    excessPlayers = roster.excessPlayers;
+    filledCount = roster.filledCount;
+    isAllFilled = roster.isAllFilled;
+  }
+
+  if (isAllFilled) {
+    matchedPollState.status = 'filled';
+    matchedPollState.lastPlayers = players;
+  } else if (matchedPollState.status === 'filled') {
+    matchedPollState.status = 'active';
+  }
+
+  let excessWarning = '';
+  if (excessPlayers.length > 0) {
+    matchedPollState.lastExcessSignature = excessPlayers.join('|');
+    excessWarning = `\n⚠️ *Warning:* Votes from [${excessPlayers.join(', ')}] exceed the new ${num}-slot limit and will not be considered!`;
+  }
+
+  persistPolls();
+
+  // If auto-matchups are enabled and poll is filled and not manual/noMatchups, auto-generate matchups!
+  let autoMatchupNote = '';
+  if (isAllFilled && !matchedPollState.noMatchups && !matchedPollState.isManual && isValidPlayerCount(players.length)) {
+    matchedPollState.status = 'resolved';
+    persistPolls();
+    setTimeout(async () => {
+      try {
+        await ratings.ensureRated(players);
+        const prebookedCourts = await getPrebookedCourtsForPoll(matchedPollState);
+        const schedule = generateMatchups(players, { prebookedCourts });
+        const whenHeader = formatMatchHeaderTime(matchedPollState);
+        const header = whenHeader ? `📅 ${whenHeader}\n\n` : '';
+        await sock.sendMessage(matchedPollState.remoteJid, { text: header + formatMatchups(schedule) });
+        pairHistory.recordDraw(matchedPollId, schedule);
+        matchedPollState.lastSchedule = summarizeSchedule(schedule);
+        persistPolls();
+      } catch (err) {
+        console.error('[poll] Auto matchups error after setslots:', err);
+      }
+    }, 500);
+    autoMatchupNote = '\n🎉 Poll is now filled! Auto-generating matchups...';
+  }
+
+  const pollTitle = matchedPollState.when || matchedPollState.name || 'Match';
+  const schedNote = schedId ? ` (Schedule: \`${schedId}\`)` : '';
+  const statusNote = isAllFilled ? 'FILLED' : `${Math.max(0, num - filledCount)} spot(s) remaining`;
+
+  return `🎯 Set slot limit for poll instance *${pollTitle}*${schedNote} to *${num} slots*:\n` +
+    `• WhatsApp poll message was kept intact (not deleted).\n` +
+    `• Slots filled: ${filledCount}/${num} (${statusNote}).\n` +
+    `• Active roster (${players.length}): ${players.length ? players.join(', ') : 'None yet'}${excessWarning}${autoMatchupNote}`;
+}
+
 async function handleModifyRecurringPoll(sock, chatId, sender, senderJid, scheduleId, updates) {
   const cleanId = String(scheduleId || '').trim();
   if (!cleanId) {
@@ -3385,8 +3914,19 @@ async function executeTool(sock, chatId, sender, toolUse, msg) {
     const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
     return await handleResumeRecurringPoll(sock, chatId, sender, senderJid, input.scheduleId || null);
   }
+  if (name === 'limit_poll_slots' || name === 'set_poll_slots') {
+    const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
+    return await handleSetPollSlots(sock, chatId, sender, senderJid, input.targetId || null, input.slots);
+  }
+  if (name === 'modify_poll_instance') {
+    const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
+    return await handleModifyPollInstance(sock, chatId, sender, senderJid, input.targetId, input);
+  }
   if (name === 'modify_recurring_poll') {
     const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
+    if (input.modifyInstance === true) {
+      return await handleModifyPollInstance(sock, chatId, sender, senderJid, input.scheduleId, input);
+    }
     return await handleModifyRecurringPoll(sock, chatId, sender, senderJid, input.scheduleId, input);
   }
   if (name === 'cancel_recurring_poll') {
@@ -3780,6 +4320,34 @@ async function getResponse(sock, rawText, chatId, sender, msg) {
       return await handleClearAllRecurringPolls(sock, chatId, sender, senderJid);
     }
     return await handleCancelRecurringPoll(sock, chatId, sender, senderJid, specificId);
+  }
+
+  if (lower.startsWith('!setslots') || lower.startsWith('!limitslots') || lower.startsWith('!setpollslots') || lower.startsWith('!limitsize') || lower.startsWith('!setsize') || lower.startsWith('!pollslots')) {
+    const parts = text.trim().split(/\s+/);
+    let target = null;
+    let count = null;
+    if (parts.length === 2) {
+      if (/^\d+$/.test(parts[1]) || /^(?:reset|clear|none)$/i.test(parts[1])) {
+        count = parts[1];
+      } else {
+        target = parts[1];
+      }
+    } else if (parts.length >= 3) {
+      target = parts[1];
+      count = parts[2];
+    }
+    const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
+    return await handleSetPollSlots(sock, chatId, sender, senderJid, target, count);
+  }
+
+  // Check for modifying specific poll / recurring poll instances
+  const modifyInstanceCmd = parseModifyInstanceCommand(text);
+  if (modifyInstanceCmd) {
+    if (!modifyInstanceCmd.targetId) {
+      return 'Please specify which poll instance to modify, e.g. "!modifyinstance rec_1 12 7pm" or "!modifyinstance <pollId> 8".';
+    }
+    const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
+    return await handleModifyPollInstance(sock, chatId, sender, senderJid, modifyInstanceCmd.targetId, modifyInstanceCmd.updates);
   }
 
   if (/^!(?:modifyrecurringpoll|editrecurringpoll|updaterecurringpoll|changerecurringpoll|modifyrecurring|editrecurring|updaterecurring)\b/i.test(text)) {
@@ -5395,6 +5963,26 @@ async function processPollVoteEvent(sock, pollMessageKey, rawPollUpdates) {
     const noOption = aggregated.find((o) => /^no$/i.test(o.name.trim()));
     const yesCount = yesOption ? yesOption.voters.length : 0;
     const noCount = noOption ? noOpt.voters.length : 0;
+
+    if (pollState.slotLimit) {
+      const yesVoters = yesOption ? yesOption.voters.map(nameFor) : [];
+      if (yesVoters.length > pollState.slotLimit) {
+        const excessVoters = yesVoters.slice(pollState.slotLimit);
+        const excessSig = excessVoters.join('|');
+        if (pollState.lastExcessSignature !== excessSig) {
+          const prevExcess = (pollState.lastExcessSignature || '').split('|').filter(Boolean);
+          const newExcess = excessVoters.filter((p) => !prevExcess.includes(p));
+          pollState.lastExcessSignature = excessSig;
+          persistPolls();
+          if (newExcess.length > 0) {
+            const warnText = `⚠️ *Notice:* The slot limit for this match poll has been set to ${pollState.slotLimit} players and the poll is already filled! The Yes vote(s) from *${newExcess.join(', ')}* cross this limit and will not be considered.`;
+            console.log(`[poll] Sending excess opt-in votes warning in ${pollState.remoteJid}: ${newExcess.join(', ')}`);
+            await sock.sendMessage(pollState.remoteJid, { text: warnText });
+          }
+        }
+      }
+    }
+
     console.log(`[poll] Opt-in poll ${pollId}: ${yesCount} Yes vote(s), ${noCount} No vote(s) recorded.`);
     return;
   }
@@ -5417,7 +6005,23 @@ async function processPollVoteEvent(sock, pollMessageKey, rawPollUpdates) {
   const conflicts = aggregated.filter((o) => o.voters.length > 1);
   const options = pollState.options || [];
 
-  const { players, filledCount, totalSlotsCount, isAllFilled } = resolveFixedPollRoster(pollState, aggregated);
+  const { players, excessPlayers, filledCount, totalSlotsCount, isAllFilled } = resolveFixedPollRoster(pollState, aggregated);
+
+  // If slotLimit is set and there are excess players crossing the limit, emit warning message to chat
+  if (pollState.slotLimit && excessPlayers && excessPlayers.length > 0) {
+    const excessSig = excessPlayers.join('|');
+    if (pollState.lastExcessSignature !== excessSig) {
+      const prevExcess = (pollState.lastExcessSignature || '').split('|').filter(Boolean);
+      const newExcess = excessPlayers.filter((p) => !prevExcess.includes(p));
+      pollState.lastExcessSignature = excessSig;
+      persistPolls();
+      if (newExcess.length > 0) {
+        const warnText = `⚠️ *Notice:* The slot limit for this match poll has been set to ${pollState.slotLimit} players and the poll is already filled! The vote(s) from *${newExcess.join(', ')}* cross this limit and will not be considered.`;
+        console.log(`[poll] Sending excess votes warning in ${pollState.remoteJid}: ${newExcess.join(', ')}`);
+        await sock.sendMessage(pollState.remoteJid, { text: warnText });
+      }
+    }
+  }
 
   console.log(
     `[poll] Poll ${pollId}: ${filledCount}/${totalSlotsCount} slot(s) filled (${pollState.size} players total), ` +
@@ -6092,7 +6696,7 @@ function pollStatusText(chatId = null, opts = {}) {
     }
 
     const { aggregated } = getPollVoters(pollId, pollState, mePn);
-    const { players: currentPlayers, filledCount, totalSlotsCount } = resolveFixedPollRoster(pollState, aggregated);
+    const { players: currentPlayers, excessPlayers, filledCount, totalSlotsCount, naturalTotalSlots } = resolveFixedPollRoster(pollState, aggregated);
     const options = pollState.options || [];
     const firstSlotNum = getFirstSlotNumber(options);
     const hasPrebooked = Array.isArray(pollState.prebookedPlayers) && pollState.prebookedPlayers.length > 0;
@@ -6105,15 +6709,19 @@ function pollStatusText(chatId = null, opts = {}) {
       ? ` (pre-booked: ${pollState.prebookedPlayers.map(p => typeof p === 'string' ? `${p}'s Spot` : p.slotName).join(', ')})`
       : '';
 
+    const limitNote = pollState.slotLimit ? ` (limit: ${pollState.slotLimit} spots, original: ${pollState.originalSize || naturalTotalSlots})` : '';
+    const excessLine = (excessPlayers && excessPlayers.length > 0) ? `⚠️ Excess votes not considered (${excessPlayers.length}): ${excessPlayers.join(', ')}` : null;
+
     const lines = [
-      `${groupHeader}Poll ${pollId}${pollState.when ? ` (${pollState.when})` : ''}: ${pollState.size} spots (${pollState.size === 2 ? 'Singles' : 'Doubles'}).`,
+      `${groupHeader}Poll ${pollId}${pollState.when ? ` (${pollState.when})` : ''}: ${pollState.size} spots (${pollState.size === 2 ? 'Singles' : 'Doubles'})${limitNote}.`,
       getPollScheduleId(pollState) ? `🔁 Recurring Schedule: \`${getPollScheduleId(pollState)}\` (created as per schedule)` : (pollState.isRecurring ? '🔁 Recurring Schedule: (created as per schedule)' : null),
       creatorDesc,
       `Status: ${pollState.status}`,
       `Play time: ${playAtLocal} (kept for 2 weeks after scheduled play time)`,
       remindersLine,
       `Slots filled: ${filledCount}/${totalSlotsCount}${prebookedNote}`,
-      `Currently playing (${currentPlayers.length}): ${currentPlayers.join(', ')}`
+      `Currently playing (${currentPlayers.length}): ${currentPlayers.join(', ')}`,
+      excessLine
     ];
     return lines.filter(Boolean).join('\n');
   });
