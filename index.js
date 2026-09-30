@@ -4438,6 +4438,37 @@ function getDirectCourtBookingLids() {
 }
 
 /**
+ * Checks if a court is configured to be ignored in .env (e.g. IGNORED_COURTS=Court 4).
+ */
+function isIgnoredCourt(courtName) {
+  if (!courtName) return false;
+  const envVal = process.env.IGNORED_COURTS || process.env.IGNORED_COURT || '';
+  if (!envVal || !envVal.trim()) return false;
+
+  const cleanCourt = String(courtName).trim().toLowerCase();
+  const ignoredList = envVal.split(/[,;]+/).map((s) => s.trim().toLowerCase()).filter(Boolean);
+
+  for (const item of ignoredList) {
+    if (cleanCourt === item) return true;
+
+    // Check by number: e.g. item "4" matches "Court 4", "Ct 4", "4"
+    const itemNumMatch = item.match(/\b(\d+)\b/);
+    const courtNumMatch = cleanCourt.match(/\b(?:court|ct)?\s*(\d+)\b/i);
+    if (itemNumMatch && courtNumMatch && itemNumMatch[1] === courtNumMatch[1]) {
+      return true;
+    }
+
+    // Regex boundary check: e.g. item "court 4" matches "court 4 (90m)"
+    const itemEscaped = item.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    if (new RegExp(`\\b${itemEscaped}\\b`, 'i').test(cleanCourt)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+/**
  * Checks if a group member's LID (or phone number) matches any of the direct booking user LIDs.
  */
 function isDirectBookingUser(member) {
@@ -4530,6 +4561,7 @@ function matchScvccPlayerToGroupMember(scvccPlayerName) {
  */
 function detectPrebookedCourt(booking) {
   if (!booking || !Array.isArray(booking.players)) return null;
+  if (isIgnoredCourt(booking.court)) return null;
 
   // Filter out TBD or blocked placeholders to inspect real players
   const actualPlayers = booking.players.filter((p) => !isPlaceholderPlayer(p));
@@ -4746,6 +4778,7 @@ async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWor
 
       const bookings = bookingsRes?.bookings || [];
       for (const b of bookings) {
+        if (isIgnoredCourt(b.court)) continue;
         if (seenPrebooked.has(b.court)) continue;
         const prebookedMatch = detectPrebookedCourt(b);
         if (prebookedMatch) {
@@ -4764,7 +4797,7 @@ async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWor
           if (
             c.status === 'available' &&
             (c.availableMinutes || 0) >= 90 &&
-            !/court\s*4\b|ct\s*4\b/i.test(c.court) &&
+            !isIgnoredCourt(c.court) &&
             !seenPrebooked.has(c.court)
           ) {
             freeCourts.push({ court: c.court });
@@ -4854,7 +4887,7 @@ async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWor
             openCourts = slot.courts.filter(c => 
               c.status === 'available' && 
               (c.availableMinutes || 0) >= 90 && 
-              !/court\s*4\b|ct\s*4\b/i.test(c.court)
+              !isIgnoredCourt(c.court)
             ).length;
           } else if (typeof avail.totalAvailable === 'number') {
             openCourts = avail.totalAvailable;
@@ -4890,7 +4923,7 @@ async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWor
             openCourts = slot.courts.filter(c => 
               c.status === 'available' && 
               (c.availableMinutes || 0) >= 90 && 
-              !/court\s*4\b|ct\s*4\b/i.test(c.court)
+              !isIgnoredCourt(c.court)
             ).length;
           } else if (typeof avail.totalAvailable === 'number') {
             openCourts = avail.totalAvailable;
@@ -5375,10 +5408,9 @@ async function getPrebookedCourtsForPoll(pollState) {
   // 1. From pollState.prebookedCourts
   if (Array.isArray(pollState.prebookedCourts)) {
     for (const c of pollState.prebookedCourts) {
-      if (typeof c === "string") {
-        courts.push({ court: c });
-      } else if (c && typeof c === "object") {
-        courts.push(c);
+      const courtName = typeof c === "string" ? c : c?.court;
+      if (courtName && !isIgnoredCourt(courtName)) {
+        courts.push(typeof c === "string" ? { court: c } : c);
       }
     }
   }
@@ -5386,7 +5418,7 @@ async function getPrebookedCourtsForPoll(pollState) {
   // 2. From pollState.prebookedPlayers
   if (Array.isArray(pollState.prebookedPlayers)) {
     for (const pb of pollState.prebookedPlayers) {
-      if (pb && pb.court) {
+      if (pb && pb.court && !isIgnoredCourt(pb.court)) {
         courts.push({
           court: pb.court,
           player: pb.defaultPlayer || pb.name || pb.fullName
@@ -5400,6 +5432,7 @@ async function getPrebookedCourtsForPoll(pollState) {
     const bookingRegex = /(?:^|\n)\s*(Court\s*\d+|PB\s*\d+|Pickleball\s*\d+)\s*-\s*([^'\n]+?)(?:\'s)?\s*Booking/gi;
     let m;
     while ((m = bookingRegex.exec(pollState.name)) !== null) {
+      if (isIgnoredCourt(m[1])) continue;
       courts.push({ court: m[1], player: m[2].trim() });
     }
   }
@@ -5424,6 +5457,7 @@ async function getPrebookedCourtsForPoll(pollState) {
         const bookingsRes = await scvcc.getCourtBookings({ when: targetDateMDY, time: queryTime, sport: "tennis" });
         const seen = new Set();
         for (const b of bookingsRes?.bookings || []) {
+          if (isIgnoredCourt(b.court)) continue;
           if (seen.has(b.court)) continue;
           const prebookedMatch = detectPrebookedCourt(b);
           if (prebookedMatch) {
@@ -5441,6 +5475,7 @@ async function getPrebookedCourtsForPoll(pollState) {
   const unique = [];
   const seenCourts = new Set();
   for (const c of courts) {
+    if (isIgnoredCourt(c.court)) continue;
     const key = (c.court || "").trim().toLowerCase();
     if (key && !seenCourts.has(key)) {
       seenCourts.add(key);
