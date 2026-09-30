@@ -4414,53 +4414,167 @@ function formatRatings() {
 }
 
 /**
- * Builds the list of known registered players' full names for matching SCVCC court bookings.
- * Only includes full names (no nicknames, aliases, or short canonical names).
+ * Retrieves the set of direct court booking user LIDs configured in .env.
  */
-function buildKnownFullNamesList() {
-  const fullNames = new Set();
-  for (const entry of namesStore.getAllEntries()) {
-    if (entry.fullName && typeof entry.fullName === 'string') {
-      const trimmed = entry.fullName.trim();
-      if (trimmed && trimmed.split(/\s+/).length >= 2) {
-        fullNames.add(trimmed);
-      }
+function getDirectCourtBookingLids() {
+  const envVal = process.env.DIRECT_COURT_BOOKING_USER_LIDS ||
+    process.env.DIRECT_COURT_BOOKING_LIDS ||
+    process.env.DIRECT_BOOKING_USER_LIDS ||
+    process.env.DIRECT_BOOKING_LIDS || '';
+  if (!envVal || !envVal.trim()) return new Set();
+
+  const lids = new Set();
+  const tokens = envVal.split(/[,;\s]+/).map((t) => t.trim()).filter(Boolean);
+  for (const token of tokens) {
+    const raw = token.replace(/['"]/g, '');
+    lids.add(raw.toLowerCase());
+    if (!raw.endsWith('@lid')) {
+      lids.add(`${raw}@lid`.toLowerCase());
+    } else {
+      lids.add(raw.replace(/@lid$/i, '').toLowerCase());
     }
   }
-  return [...fullNames];
+  return lids;
 }
 
 /**
- * Matches an SCVCC player name strictly against known registered group players' full names.
+ * Checks if a group member's LID (or phone number) matches any of the direct booking user LIDs.
  */
-function matchPlayerWithFullNames(scvccPlayerName, knownFullNames) {
+function isDirectBookingUser(member) {
+  if (!member) return false;
+  const directLids = getDirectCourtBookingLids();
+  if (directLids.size === 0) return false;
+
+  const id = (member.id || '').toLowerCase();
+  const idNum = id.split('@')[0];
+  const pn = (member.pn || '').toLowerCase();
+  const pnNum = pn.split('@')[0];
+
+  return directLids.has(id) || directLids.has(idNum) || (pn && (directLids.has(pn) || directLids.has(pnNum)));
+}
+
+/**
+ * Checks if a player name is a placeholder (TBD, Blocked, etc.).
+ */
+function isPlaceholderPlayer(name) {
+  if (!name) return true;
+  const c = name.trim().toLowerCase();
+  return !c || c === 'tbd' || c === 'blocked';
+}
+
+/**
+ * Obtains a clean short display name for a member (e.g. "Conrad", "PI", "Vijay").
+ */
+function getPlayerShortName(entry) {
+  if (!entry) return '';
+  const name = entry.name || entry.fullName || '';
+  const words = name.trim().split(/\s+/);
+  return words.length > 1 ? words[0] : name.trim();
+}
+
+/**
+ * Matches an SCVCC player name to a group member entry in namesStore.
+ */
+function matchScvccPlayerToGroupMember(scvccPlayerName) {
   if (!scvccPlayerName) return null;
-  const cleanScvcc = scvccPlayerName.trim().toLowerCase();
-  const scvccWords = cleanScvcc.split(/[^a-z0-9]+/i).filter(Boolean);
+  const clean = scvccPlayerName.trim().toLowerCase();
+  if (!clean || clean === 'tbd' || clean === 'blocked') return null;
+
+  const scvccWords = clean.split(/[^a-z0-9]+/i).filter(Boolean);
   if (scvccWords.length === 0) return null;
 
-  for (const fullName of knownFullNames) {
-    const cleanFull = fullName.trim().toLowerCase();
-    const fullWords = cleanFull.split(/[^a-z0-9]+/i).filter(Boolean);
-    if (fullWords.length < 2) continue;
+  const allEntries = namesStore.getAllEntries();
 
-    // Exact full name match
-    if (cleanScvcc === cleanFull) {
-      return scvccPlayerName;
-    }
+  // 1. Exact full name or display name match
+  for (const entry of allEntries) {
+    const full = (entry.fullName || '').trim().toLowerCase();
+    const disp = (entry.name || '').trim().toLowerCase();
+    if (full && clean === full) return entry;
+    if (disp && clean === disp) return entry;
+  }
 
-    // First and last name match (e.g. "Chandra Sekhar Cheruku" vs "Chandra Cheruku")
-    if (scvccWords.length >= 2) {
-      const scvccFirst = scvccWords[0];
-      const scvccLast = scvccWords[scvccWords.length - 1];
-      const fullFirst = fullWords[0];
-      const fullLast = fullWords[fullWords.length - 1];
+  // 2. First and last name match (e.g. "Chandra Sekhar Cheruku" vs "Chandra Cheruku")
+  if (scvccWords.length >= 2) {
+    const scvccFirst = scvccWords[0];
+    const scvccLast = scvccWords[scvccWords.length - 1];
 
-      if (scvccFirst === fullFirst && scvccLast === fullLast) {
-        return scvccPlayerName;
+    for (const entry of allEntries) {
+      const full = (entry.fullName || '').trim().toLowerCase();
+      if (full) {
+        const fullWords = full.split(/[^a-z0-9]+/i).filter(Boolean);
+        if (fullWords.length >= 2) {
+          if (scvccFirst === fullWords[0] && scvccLast === fullWords[fullWords.length - 1]) {
+            return entry;
+          }
+        }
       }
     }
   }
+
+  // 3. Fallback to findIdByNameOrAlias
+  const byAlias = namesStore.findIdByNameOrAlias(scvccPlayerName);
+  if (byAlias && byAlias.entry) {
+    return byAlias.entry;
+  }
+
+  return null;
+}
+
+/**
+ * Detects if an SCVCC court booking is a prebooked court for this group.
+ * Rule:
+ * 1. Direct court booking user lids can be specified in .env file in a property:
+ *    If any of these users appear in a court booking, then that is a prebooked court.
+ * 2. Otherwise:
+ *    ALL the players in the court booking must be members of this group.
+ */
+function detectPrebookedCourt(booking) {
+  if (!booking || !Array.isArray(booking.players)) return null;
+
+  // Filter out TBD or blocked placeholders to inspect real players
+  const actualPlayers = booking.players.filter((p) => !isPlaceholderPlayer(p));
+  if (actualPlayers.length === 0) return null;
+
+  let directBookingMember = null;
+  let allMembers = true;
+  const matchedMembers = [];
+
+  for (const p of actualPlayers) {
+    const member = matchScvccPlayerToGroupMember(p);
+    if (member) {
+      matchedMembers.push(member);
+      if (isDirectBookingUser(member)) {
+        if (!directBookingMember) directBookingMember = member;
+      }
+    } else {
+      allMembers = false;
+    }
+  }
+
+  // 1. If any direct booking user appears in the booking:
+  if (directBookingMember) {
+    const playerName = getPlayerShortName(directBookingMember);
+    return {
+      isPrebooked: true,
+      player: playerName,
+      fullName: directBookingMember.fullName || directBookingMember.name,
+      member: directBookingMember
+    };
+  }
+
+  // 2. Otherwise, ALL the players in the court booking must be members of this group:
+  if (allMembers && matchedMembers.length > 0) {
+    // In SCVCC booking system, the 1st player is the member who booked the court
+    const ownerMember = matchedMembers[0];
+    const playerName = getPlayerShortName(ownerMember);
+    return {
+      isPrebooked: true,
+      player: playerName,
+      fullName: ownerMember.fullName || ownerMember.name,
+      member: ownerMember
+    };
+  }
+
   return null;
 }
 
@@ -4623,7 +4737,6 @@ async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWor
     let prebookedCourts = [];
     let freeCourts = [];
     const seenPrebooked = new Set();
-    const knownFullNames = buildKnownFullNamesList();
 
     try {
       const [avail, bookingsRes] = await Promise.all([
@@ -4634,13 +4747,13 @@ async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWor
       const bookings = bookingsRes?.bookings || [];
       for (const b of bookings) {
         if (seenPrebooked.has(b.court)) continue;
-        let matchedName = null;
-        for (const p of b.players) {
-          matchedName = matchPlayerWithFullNames(p, knownFullNames);
-          if (matchedName) break;
-        }
-        if (matchedName) {
-          prebookedCourts.push({ court: b.court, player: matchedName });
+        const prebookedMatch = detectPrebookedCourt(b);
+        if (prebookedMatch) {
+          prebookedCourts.push({
+            court: b.court,
+            player: prebookedMatch.player,
+            fullName: prebookedMatch.fullName
+          });
           seenPrebooked.add(b.court);
         }
       }
@@ -5309,17 +5422,12 @@ async function getPrebookedCourtsForPoll(pollState) {
 
       if (targetDateMDY && queryTime) {
         const bookingsRes = await scvcc.getCourtBookings({ when: targetDateMDY, time: queryTime, sport: "tennis" });
-        const knownFullNames = buildKnownFullNamesList();
         const seen = new Set();
         for (const b of bookingsRes?.bookings || []) {
           if (seen.has(b.court)) continue;
-          let matchedName = null;
-          for (const p of b.players) {
-            matchedName = matchPlayerWithFullNames(p, knownFullNames);
-            if (matchedName) break;
-          }
-          if (matchedName) {
-            courts.push({ court: b.court, player: matchedName });
+          const prebookedMatch = detectPrebookedCourt(b);
+          if (prebookedMatch) {
+            courts.push({ court: b.court, player: prebookedMatch.player });
             seen.add(b.court);
           }
         }
