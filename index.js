@@ -4466,6 +4466,8 @@ function matchPlayerWithFullNames(scvccPlayerName, knownFullNames) {
 
 // ---- Poll creation & vote handling ----
 
+const inFlightPollCreations = new Set();
+
 /**
  * Creates and sends a WhatsApp poll.
  * - If size is given (2 for singles, 4/8/12 for doubles), numbered slots are created
@@ -4474,7 +4476,7 @@ function matchPlayerWithFullNames(scvccPlayerName, knownFullNames) {
  *   "Yes" and "No". The bot then waits for a user prompt to generate matchups from Yes voters.
  * - If replacePollId or cancelExisting is specified, deletes the older poll from WhatsApp.
  */
-async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWord = null, timeWord = null, creatorName = null, creatorJid = null, includeCreator = true, replacePollId = null, cancelExisting = false, isCommand = false, noMatchups = false, noCourts = false, includePrebookedSpots = false, isRecurring = false) {
+async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWord = null, timeWord = null, creatorName = null, creatorJid = null, includeCreator = true, replacePollId = null, cancelExisting = false, isCommand = false, noMatchups = false, noCourts = false, includePrebookedSpots = false, isRecurring = false, scheduleId = null) {
   const isAuto = size === 'auto' || String(size).toLowerCase() === 'auto';
   const isOptIn = !size && !isAuto;
 
@@ -4511,6 +4513,31 @@ async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWor
       err: `The specified time (${specifiedStr}) has already passed. Please specify an upcoming day or time to create the poll.`
     };
   }
+
+  const flightKey = `${remoteJid}:${scheduleId || "manual"}:${playAt.toISOString()}`;
+  if (inFlightPollCreations.has(flightKey)) {
+    console.log(`[poll] Duplicate in-flight poll creation suppressed for ${flightKey}`);
+    return { err: "Poll creation already in progress" };
+  }
+
+  // Deduplicate against existing active recurring poll on same match date (unless replacing)
+  if (scheduleId && !cancelExisting && !replacePollId) {
+    const playDateStr = playAt.toDateString();
+    for (const [id, existingPoll] of activePolls.entries()) {
+      if (id !== replacePollId && existingPoll.remoteJid === remoteJid && (existingPoll.status === "active" || existingPoll.status === "filled")) {
+        if (existingPoll.scheduleId === scheduleId) {
+          const exDate = existingPoll.playAt ? new Date(existingPoll.playAt).toDateString() : null;
+          if (exDate && exDate === playDateStr) {
+            console.log(`[poll] Active poll already exists for schedule ${scheduleId} on ${playDateStr}`);
+            return { err: `Active poll already exists for schedule ${scheduleId} on ${playDateStr}` };
+          }
+        }
+      }
+    }
+  }
+
+  inFlightPollCreations.add(flightKey);
+  try {
 
   // If replacing an existing poll or user requested modifications, delete older poll from WhatsApp
   let replacedOldPoll = false;
@@ -4813,6 +4840,7 @@ async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWor
     isAuto: Boolean(isAuto),
     isRecurring: Boolean(isRecurring),
     isAutoCreated: Boolean(isAuto || isRecurring),
+    scheduleId: scheduleId || null,
     noMatchups: Boolean(noMatchups),
     prebookedCourts: (selectedPrebooked && selectedPrebooked.length > 0) ? selectedPrebooked.map(pb => ({ court: pb.court, player: pb.player })) : null,
     prebookedPlayers: hasPrebooked ? prebookedInfo : null,
@@ -4855,6 +4883,9 @@ async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWor
     reason: excludedReason,
     replacedOldPoll
   };
+  } finally {
+    inFlightPollCreations.delete(flightKey);
+  }
 }
 
 /**
