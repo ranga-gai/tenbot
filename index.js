@@ -3652,6 +3652,15 @@ async function getResponse(sock, rawText, chatId, sender, msg) {
   }
 
   // --- Recurring daily poll commands ---
+  if (lower.startsWith('!recurringpoll status') || lower.startsWith('!schedulepoll status') || lower.startsWith('!recurringpolls status') || lower.startsWith('!scheduledpolls status')) {
+    const parts = text.trim().split(/\s+/);
+    const targetId = parts.length > 2 ? parts.slice(2).join(' ').replace(/^["']|["']$/g, '').trim() : null;
+    if (targetId) {
+      return recurringPollsModule.getRecurringPollStatus({ recurringPolls, scheduleId: targetId, chatId });
+    }
+    return handleListRecurringPolls(chatId);
+  }
+
   if (lower === '!recurringpolls' || lower === '!scheduledpolls' || lower === '!dailypolls' || lower === '!recurringpoll list' || lower === '!schedulepoll list') {
     return handleListRecurringPolls(chatId);
   }
@@ -3696,6 +3705,12 @@ async function getResponse(sock, rawText, chatId, sender, msg) {
   if (/^!(?:recurringpoll|dailypoll|schedulepoll|everydaypoll|repeatingpoll|recurringoptinpoll|dailyoptinpoll|recurringyesnopoll|dailyyesnopoll)\b/i.test(text)) {
     const parsed = recurringPollsModule.parseRecurringPollText(text);
     if (parsed) {
+      if (parsed.action === 'status') {
+        if (parsed.scheduleId) {
+          return recurringPollsModule.getRecurringPollStatus({ recurringPolls, scheduleId: parsed.scheduleId, chatId });
+        }
+        return handleListRecurringPolls(chatId);
+      }
       if (parsed.action === 'list') {
         return handleListRecurringPolls(chatId);
       }
@@ -3828,7 +3843,21 @@ async function getResponse(sock, rawText, chatId, sender, msg) {
   }
 
   if (lower === '!pollstatus') {
-    return pollStatusText(chatId);
+    const effectiveChatId = chatId.endsWith('@g.us') ? chatId : (targetGroupJid || await getTargetGroupJid(sock) || chatId);
+    return pollStatusText(effectiveChatId);
+  }
+
+  if (lower.startsWith('!pollstatus ') || lower.startsWith('!pollstatus:')) {
+    const rawTarget = text.trim().slice('!pollstatus'.length).replace(/^[:\s]+/, '').trim();
+    const cleanTarget = rawTarget.replace(/^["']|["']$/g, '').replace(/^schedule\s+/i, '').trim();
+    const effectiveChatId = chatId.endsWith('@g.us') ? chatId : (targetGroupJid || await getTargetGroupJid(sock) || chatId);
+    if (cleanTarget) {
+      if (cleanTarget === 'recurring' || cleanTarget === '-r' || cleanTarget === 'scheduled' || cleanTarget === '-s') {
+        return pollStatusText(effectiveChatId, { recurringOnly: true });
+      }
+      return pollStatusText(effectiveChatId, { targetId: cleanTarget });
+    }
+    return pollStatusText(effectiveChatId);
   }
 
   // --- Check if message announces court cancellation due to lack of votes in poll ---
@@ -3891,6 +3920,12 @@ async function getResponse(sock, rawText, chatId, sender, msg) {
   // --- Direct Recurring Poll Request (handled directly without LLM) ---
   const directRecurringParsed = recurringPollsModule.parseRecurringPollText(promptText);
   if (directRecurringParsed) {
+    if (directRecurringParsed.action === 'status') {
+      if (directRecurringParsed.scheduleId) {
+        return recurringPollsModule.getRecurringPollStatus({ recurringPolls, scheduleId: directRecurringParsed.scheduleId, chatId });
+      }
+      return handleListRecurringPolls(chatId);
+    }
     if (directRecurringParsed.action === 'list') {
       return handleListRecurringPolls(chatId);
     }
@@ -5663,23 +5698,113 @@ function nameFor(jid) {
 }
 
 /**
+ * Resolves the recurring schedule ID for a poll instance, inferring it from
+ * recurringPolls if it was created before scheduleId was explicitly recorded.
+ */
+function getPollScheduleId(pollState) {
+  if (!pollState) return null;
+  if (pollState.scheduleId) return pollState.scheduleId;
+  if (!pollState.isRecurring) return null;
+  if (typeof recurringPolls !== 'undefined' && recurringPolls) {
+    for (const [key, sched] of recurringPolls.entries()) {
+      if (sched.remoteJid && pollState.remoteJid && sched.remoteJid === pollState.remoteJid) {
+        return sched.id || sched.scheduleId || key;
+      }
+    }
+    if (recurringPolls.size === 1) {
+      const s = [...recurringPolls.values()][0];
+      return s.id || s.scheduleId || [...recurringPolls.keys()][0];
+    }
+  }
+  return null;
+}
+
+/**
  * Debug helper: reports what the bot has actually recorded for the current
  * active poll(s), straight from the raw vote buffer (not the aggregated tally),
  * so you can tell whether votes are being received at all.
  */
 function pollStatusText(chatId = null, opts = {}) {
-  const isAll = !chatId;
+  const targetId = opts.targetId ? opts.targetId.trim() : null;
+  const isDM = Boolean(chatId && !chatId.endsWith('@g.us'));
+  let effectiveChatId = isDM ? (targetGroupJid || null) : chatId;
+  let isAll = (!effectiveChatId && !targetId) || (!chatId && !targetId);
   const upcomingOnly = opts.upcomingOnly === true;
   const activeOnly = opts.activeOnly === true;
+  const recurringOnly = opts.recurringOnly === true;
   const now = Date.now();
 
   let chatPolls = [...activePolls.entries()];
 
-  if (!isAll) {
-    chatPolls = chatPolls.filter(([, state]) => state.remoteJid === chatId);
+  let chatRecurring = [];
+  if (typeof recurringPolls !== 'undefined' && recurringPolls) {
+    if (effectiveChatId) {
+      chatRecurring = [...recurringPolls.values()].filter((s) => s.remoteJid === effectiveChatId);
+    }
+    if (chatRecurring.length === 0 && (isDM || !chatId)) {
+      chatRecurring = [...recurringPolls.values()];
+    }
   }
 
-  if (activeOnly) {
+  if (targetId) {
+    const targetLower = targetId.toLowerCase();
+    const matched = chatPolls.filter(([pollId, state]) => {
+      if (chatId && chatId.endsWith('@g.us') && state.remoteJid !== chatId) return false;
+      if (pollId.toLowerCase() === targetLower) return true;
+      const sId = getPollScheduleId(state);
+      if (sId && sId.toLowerCase() === targetLower) return true;
+      return false;
+    });
+
+    if (matched.length > 0) {
+      chatPolls = matched;
+    } else {
+      const globalMatched = [...activePolls.entries()].filter(([pollId, state]) => {
+        if (pollId.toLowerCase() === targetLower) return true;
+        const sId = getPollScheduleId(state);
+        if (sId && sId.toLowerCase() === targetLower) return true;
+        return false;
+      });
+      if (globalMatched.length > 0) {
+        chatPolls = globalMatched;
+      } else {
+        let targetSched = null;
+        if (typeof recurringPolls !== 'undefined' && recurringPolls) {
+          for (const [key, sched] of recurringPolls.entries()) {
+            const sid = sched.id || sched.scheduleId || key;
+            if (key.toLowerCase() === targetLower || sid.toLowerCase() === targetLower) {
+              targetSched = sched;
+              break;
+            }
+          }
+        }
+        if (targetSched) {
+          const sid = targetSched.id || targetSched.scheduleId || targetId;
+          const daysStr = targetSched.daysDisplay || targetSched.days || 'unspecified days';
+          const matchStr = targetSched.matchDisplay || targetSched.matchTime || 'unspecified time';
+          const postStr = targetSched.postDisplay || targetSched.postTime || 'unspecified post time';
+          const statusStr = targetSched.enabled === false ? 'PAUSED' : (targetSched.status ? targetSched.status.toUpperCase() : 'ACTIVE');
+          return `ℹ️ Recurring schedule \`${sid}\` (${statusStr}) is configured for ${daysStr} at ${matchStr} (posts at ${postStr}), but there is no active poll instance currently on record in active polls.\nUse "!recurringpolls" to inspect all schedules or wait for the next scheduled trigger.`;
+        }
+        return `⚠️ No active poll instance or recurring schedule found matching "${targetId}". Use "!pollstatus" to view current polls or "!recurringpolls" for schedule IDs.`;
+      }
+    }
+  } else if (!isAll) {
+    if (effectiveChatId) {
+      const filtered = chatPolls.filter(([, state]) => state.remoteJid === effectiveChatId);
+      if (filtered.length > 0) {
+        chatPolls = filtered;
+      } else if (isDM) {
+        isAll = true; // Fall back to showing all polls in DM so admin sees group polls
+      } else {
+        chatPolls = [];
+      }
+    }
+  }
+
+  if (recurringOnly) {
+    chatPolls = chatPolls.filter(([, state]) => Boolean(state.scheduleId || state.isRecurring));
+  } else if (activeOnly) {
     chatPolls = chatPolls.filter(([, state]) => state.status === 'active' || state.status === 'filled' || state.status === 'stopped');
   } else if (upcomingOnly) {
     chatPolls = chatPolls.filter(([, state]) => {
@@ -5690,12 +5815,40 @@ function pollStatusText(chatId = null, opts = {}) {
     });
   }
 
+  // Build recurring schedules & instances summary for the group
+  let recurringSummary = '';
+  if (chatRecurring.length > 0 && !targetId && !activeOnly && !upcomingOnly) {
+    const schedLines = chatRecurring.map((s) => {
+      const sid = s.id || s.scheduleId;
+      const daysStr = s.daysDisplay || s.days || 'everyday';
+      const matchStr = s.matchDisplay || s.matchTime || 'unspecified time';
+      const postStr = s.postDisplay || s.postTime || 'unspecified post time';
+      const statusStr = s.enabled === false ? 'PAUSED' : 'ACTIVE';
+      const linkedPolls = [...activePolls.entries()].filter(([, p]) => (p.scheduleId === sid || getPollScheduleId(p) === sid));
+      let instanceDesc = 'no active poll instance right now';
+      if (linkedPolls.length > 0) {
+        instanceDesc = linkedPolls.map(([id, p]) => `Poll \`${id}\` (${p.when || p.status}) — Status: ${p.status}`).join(', ');
+      }
+      return `• \`${sid}\` (${statusStr}): ${daysStr} at ${matchStr} (posts at ${postStr})\n  └ Current Instance: ${instanceDesc}`;
+    });
+    recurringSummary = `\n\n━━━━━━━━━━━━━━━━━━━━━\n🔁 *Recurring Poll Schedules & Created Instances:*\n${schedLines.join('\n')}`;
+  }
+
   if (chatPolls.length === 0) {
     if (activeOnly) {
       return '🎾 No active, filled, or stopped match polls on record.';
     }
     if (upcomingOnly) {
       return '📅 No upcoming match polls on record whose play time has not passed yet.';
+    }
+    if (recurringOnly) {
+      if (chatRecurring.length > 0) {
+        return `🔁 No poll instances created from recurring schedules found on record.${recurringSummary}`;
+      }
+      return '🔁 No recurring poll schedules or instances on record.';
+    }
+    if (chatRecurring.length > 0) {
+      return `No active ad-hoc match polls on record for this chat.${recurringSummary}`;
     }
     return isAll
       ? 'No polls on record in bot storage.'
@@ -5767,6 +5920,7 @@ function pollStatusText(chatId = null, opts = {}) {
 
       const lines = [
         `${groupHeader}Poll ${pollId}: User-Created Manual Match Poll "${pollState.name || 'Match Poll'}".`,
+        getPollScheduleId(pollState) ? `🔁 Recurring Schedule: \`${getPollScheduleId(pollState)}\` (created as per schedule)` : (pollState.isRecurring ? '🔁 Recurring Schedule: (created as per schedule)' : null),
         `Creator: ${creatorName}`,
         `Status: ${pollState.status} (Passively tracked)`,
         `Play time: ${playAtLocal} (when: "${pollState.when || 'unspecified'}")`,
@@ -5777,7 +5931,7 @@ function pollStatusText(chatId = null, opts = {}) {
         `Currently playing (${playingPlayers.length}): ${playingPlayers.join(', ')}${additionStr}`,
         'Matchups: Passively tracked -- will generate matchups only upon explicit user request (!matchups or "@tenbot generate matchups")'
       ];
-      return lines.join('\n');
+      return lines.filter(Boolean).join('\n');
     }
 
     if (pollState.type === 'opt_in' || pollState.size === null) {
@@ -5800,6 +5954,7 @@ function pollStatusText(chatId = null, opts = {}) {
 
       const lines = [
         `${groupHeader}Poll ${pollId}${pollState.when ? ` (${pollState.when})` : ''}: Opt-in (Yes/No).`,
+        getPollScheduleId(pollState) ? `🔁 Recurring Schedule: \`${getPollScheduleId(pollState)}\` (created as per schedule)` : (pollState.isRecurring ? '🔁 Recurring Schedule: (created as per schedule)' : null),
         `Status: ${pollState.status}`,
         `Play time: ${playAtLocal} (kept for 2 weeks after scheduled play time)`,
         remindersLine,
@@ -5807,7 +5962,7 @@ function pollStatusText(chatId = null, opts = {}) {
         `No votes (${noVoters.length}): ${noVoters.length ? noVoters.join(', ') : '(none yet)'}`,
         'Matchups: Waiting for user prompt (!matchups or "@tenbot generate matchups")'
       ];
-      return lines.join('\n');
+      return lines.filter(Boolean).join('\n');
     }
 
     const { aggregated } = getPollVoters(pollId, pollState, mePn);
@@ -5826,6 +5981,7 @@ function pollStatusText(chatId = null, opts = {}) {
 
     const lines = [
       `${groupHeader}Poll ${pollId}${pollState.when ? ` (${pollState.when})` : ''}: ${pollState.size} spots (${pollState.size === 2 ? 'Singles' : 'Doubles'}).`,
+      getPollScheduleId(pollState) ? `🔁 Recurring Schedule: \`${getPollScheduleId(pollState)}\` (created as per schedule)` : (pollState.isRecurring ? '🔁 Recurring Schedule: (created as per schedule)' : null),
       creatorDesc,
       `Status: ${pollState.status}`,
       `Play time: ${playAtLocal} (kept for 2 weeks after scheduled play time)`,
@@ -5833,10 +5989,10 @@ function pollStatusText(chatId = null, opts = {}) {
       `Slots filled: ${filledCount}/${totalSlotsCount}${prebookedNote}`,
       `Currently playing (${currentPlayers.length}): ${currentPlayers.join(', ')}`
     ];
-    return lines.join('\n');
+    return lines.filter(Boolean).join('\n');
   });
 
-  return sections.join('\n\n---\n\n');
+  return sections.join('\n\n---\n\n') + recurringSummary;
 }
 
 // ---- LLM Q&A ----
