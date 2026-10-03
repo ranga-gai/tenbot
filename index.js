@@ -113,6 +113,7 @@ const namesStore = require('./lib/names');
 const messageHistory = require('./lib/messageHistory');
 const recurringPollsModule = require('./lib/recurringPolls');
 const scvcc = require('./lib/scvcc');
+const anthropic = require('./lib/anthropic');
 const { helpText } = require('./lib/help');
 const { resolvePlayDateTime, getSanJoseNow, getSanJoseParts, parseTimeString } = require('./lib/pollTime');
 
@@ -912,7 +913,7 @@ async function interpretManualPollWithLLM(pollName, options, creatorName) {
     };
   };
 
-  if (!process.env.ANTHROPIC_API_KEY) {
+  if (!anthropic.isAnthropicConfigured()) {
     return fallback();
   }
 
@@ -956,29 +957,10 @@ Respond ONLY with a JSON object in this exact format, with no other text or mark
 }`;
 
   try {
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': process.env.ANTHROPIC_API_KEY,
-        'anthropic-version': '2023-06-01'
-      },
-      body: JSON.stringify({
-        model: 'claude-sonnet-4-6',
-        max_tokens: 300,
-        messages: [{ role: 'user', content: prompt }]
-      })
+    const parsed = await anthropic.callAnthropicJson({
+      prompt,
+      maxTokens: 300
     });
-
-    if (!response.ok) {
-      console.warn(`[poll-llm] Anthropic API returned ${response.status}, falling back to regex parser.`);
-      return fallback();
-    }
-
-    const data = await response.json();
-    const rawContent = data.content?.filter((b) => b.type === 'text').map((b) => b.text).join('').trim();
-    const cleanedJson = rawContent.replace(/^\`\`\`json\s*/i, '').replace(/\s*\`\`\`$/i, '').trim();
-    const parsed = JSON.parse(cleanedJson);
 
     let resolvedWhenStr = parsed.when || pollName;
     // If an explicit day name was parsed (e.g. Sunday, Saturday), ensure when retains the day name instead of relative "Tomorrow"
@@ -1814,7 +1796,7 @@ function handlePollDeleted(remoteJid, pollId) {
  * If so, returns { isCourtCancelledDueToLackOfVotes: true, pollId, reason }.
  */
 async function checkCourtCancellationWithLLM(text, sender, chatId) {
-  if (!process.env.ANTHROPIC_API_KEY) return null;
+  if (!anthropic.isAnthropicConfigured()) return null;
 
   const chatPolls = [...activePolls.entries()].filter(([, state]) =>
     state.remoteJid === chatId && state.status === 'active'
@@ -1841,31 +1823,10 @@ Respond ONLY with a JSON object in this exact format, with no extra text or mark
 }`;
 
   try {
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': process.env.ANTHROPIC_API_KEY,
-        'anthropic-version': '2023-06-01'
-      },
-      body: JSON.stringify({
-        model: 'claude-sonnet-4-6',
-        max_tokens: 250,
-        messages: [{ role: 'user', content: prompt }]
-      })
+    return await anthropic.callAnthropicJson({
+      prompt,
+      maxTokens: 250
     });
-
-    if (!response.ok) {
-      console.warn(`[court-cancel-llm] Anthropic API returned ${response.status}`);
-      return null;
-    }
-
-    const data = await response.json();
-    const rawContent = data.content?.filter((b) => b.type === 'text').map((b) => b.text).join('').trim();
-    const cleanedJson = rawContent.replace(/^\`\`\`json\s*/i, '').replace(/\s*\`\`\`$/i, '').trim();
-    const parsed = JSON.parse(cleanedJson);
-
-    return parsed;
   } catch (err) {
     console.error('[court-cancel-llm] Failed to check court cancellation with LLM:', err.message);
     return null;
@@ -1882,7 +1843,7 @@ Respond ONLY with a JSON object in this exact format, with no extra text or mark
  * (e.g. "@132388105547860 @278081952608440 @169384953794573 @78636841447513 - Court 6 7.00 pm").
  */
 async function parseLineupWithLLM(text, chatId) {
-  if (!process.env.ANTHROPIC_API_KEY) return null;
+  if (!anthropic.isAnthropicConfigured()) return null;
   console.log(`[lineup-llm] Invoking Claude to parse manual lineup in ${chatId}: "${text}"`);
 
   const playerEntries = namesStore.getAllEntries();
@@ -1946,29 +1907,10 @@ If isLineup is false, return:
 }`;
 
   try {
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': process.env.ANTHROPIC_API_KEY,
-        'anthropic-version': '2023-06-01'
-      },
-      body: JSON.stringify({
-        model: 'claude-sonnet-4-6',
-        max_tokens: 500,
-        messages: [{ role: 'user', content: prompt }]
-      })
+    const parsed = await anthropic.callAnthropicJson({
+      prompt,
+      maxTokens: 500
     });
-
-    if (!response.ok) {
-      console.warn(`[lineup-llm] Anthropic API returned ${response.status}`);
-      return null;
-    }
-
-    const data = await response.json();
-    const rawContent = data.content?.filter((b) => b.type === 'text').map((b) => b.text).join('').trim();
-    const cleanedJson = rawContent.replace(/^\`\`\`json\s*/i, '').replace(/\s*\`\`\`$/i, '').trim();
-    const parsed = JSON.parse(cleanedJson);
 
     if (!parsed || !parsed.isLineup || !Array.isArray(parsed.players) || parsed.players.length < 2 || !Array.isArray(parsed.sets) || parsed.sets.length === 0) {
       return null;
@@ -5962,7 +5904,7 @@ async function processPollVoteEvent(sock, pollMessageKey, rawPollUpdates) {
     const yesOption = aggregated.find((o) => /^yes$/i.test(o.name.trim()));
     const noOption = aggregated.find((o) => /^no$/i.test(o.name.trim()));
     const yesCount = yesOption ? yesOption.voters.length : 0;
-    const noCount = noOption ? noOpt.voters.length : 0;
+    const noCount = noOption ? noOption.voters.length : 0;
 
     if (pollState.slotLimit) {
       const yesVoters = yesOption ? yesOption.voters.map(nameFor) : [];
@@ -6879,28 +6821,12 @@ async function callClaude(sock, chatId, sender, promptText, msg) {
   const systemWithContext = `${SYSTEM_PROMPT}\n\n${buildContextBlurb(chatId)}`;
 
   const makeApiCall = async (msgs) => {
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': process.env.ANTHROPIC_API_KEY,
-        'anthropic-version': '2023-06-01'
-      },
-      body: JSON.stringify({
-        model: 'claude-sonnet-4-6',
-        max_tokens: 400,
-        system: systemWithContext,
-        tools: CLAUDE_TOOLS,
-        messages: msgs
-      })
+    return await anthropic.callAnthropicMessages({
+      messages: msgs,
+      system: systemWithContext,
+      tools: CLAUDE_TOOLS,
+      maxTokens: 400
     });
-
-    if (!response.ok) {
-      const errBody = await response.text();
-      throw new Error(`Anthropic API error ${response.status}: ${errBody}`);
-    }
-
-    return await response.json();
   };
 
   let data = await makeApiCall(messages);
@@ -6926,11 +6852,7 @@ async function callClaude(sock, chatId, sender, promptText, msg) {
     data = await makeApiCall(followUpMessages);
   }
 
-  const replyText = data.content
-    ?.filter((block) => block.type === 'text')
-    .map((block) => block.text)
-    .join('\n')
-    .trim();
+  const replyText = anthropic.extractTextFromResponse(data);
 
   const updatedHistory = [
     ...messages,
