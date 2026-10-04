@@ -150,7 +150,7 @@ const SYSTEM_PROMPT =
   'conversational (1-3 sentences) unless asked for more detail. You have ' +
   "access to tools to create match polls (fixed-spot polls for 2 singles or 4/8/12 doubles, " +
   "or Yes/No opt-in polls when no number of players is specified), generate matchups from poll votes, " +
-  "set/update player ratings, check weather, cancel/delete polls, schedule recurring match polls on specific days of the week or every day with customizable poll creation times per day of the week (schedule_recurring_poll), modify recurring schedules (modify_recurring_poll), list recurring schedules (list_recurring_polls), pause recurring schedules (pause_recurring_poll), resume recurring schedules (resume_recurring_poll), and access the group's availability list, win/loss leaderboard, " +
+  "set/update player ratings, check weather, cancel/delete polls, schedule recurring match polls on specific days of the week or every day with customizable poll creation times per day of the week (schedule_recurring_poll), modify recurring schedules (modify_recurring_poll), list recurring schedules (list_recurring_polls), pause recurring schedules (pause_recurring_poll), resume recurring schedules (resume_recurring_poll), skip a recurring poll instance (skip_recurring_poll_instance), restore a skipped instance (unskip_recurring_poll_instance), and access the group's availability list, win/loss leaderboard, " +
   'and active polls (given below). Multiple polls can be created for different times or by different users. ' +
   'The live local time in San Jose, CA is provided at the top of the context blurb below. ' +
   'Polls created manually by users for organizing tennis matches are passively tracked by the bot (marked as user-created / isManual). ' +
@@ -714,6 +714,40 @@ const CLAUDE_TOOLS = [
         scheduleId: {
           type: 'string',
           description: 'The schedule ID of the recurring poll to resume (e.g. "rec_1", "rec_mujmt71n") or "all" to resume all recurring schedules.'
+        }
+      }
+    }
+  },
+  {
+    name: 'skip_recurring_poll_instance',
+    description: 'Skips a specific instance (or the next upcoming instance) of a scheduled recurring match poll without pausing or disabling future recurring schedules. If the poll instance was already created as an active poll on WhatsApp, it is cancelled and deleted. If it has not been posted yet, it will not be created. Subsequent instances remain active.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        scheduleId: {
+          type: 'string',
+          description: 'The schedule ID of the recurring poll (e.g. "rec_1", "rec_mujmt71n"). If omitted and only one schedule exists, it will be automatically selected.'
+        },
+        targetDayOrDate: {
+          type: 'string',
+          description: 'Optional specific day of week (e.g. "wednesday", "tomorrow") or date (e.g. "2026-10-07", "10/7") of the instance to skip. If omitted, skips the next upcoming instance.'
+        }
+      }
+    }
+  },
+  {
+    name: 'unskip_recurring_poll_instance',
+    description: 'Restores a previously skipped instance for a scheduled recurring match poll so it will post automatically as scheduled.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        scheduleId: {
+          type: 'string',
+          description: 'The schedule ID of the recurring poll (e.g. "rec_1", "rec_mujmt71n"). If omitted and only one schedule exists, it will be automatically selected.'
+        },
+        targetDayOrDate: {
+          type: 'string',
+          description: 'Optional specific day or date to unskip.'
         }
       }
     }
@@ -2883,6 +2917,123 @@ async function handleResumeRecurringPoll(sock, chatId, sender, senderJid, schedu
   return await recurringPollsModule.resumeRecurringPoll({ recurringPolls, persistPolls, scheduleId: targetKey, chatId });
 }
 
+
+async function handleSkipRecurringPollInstance(sock, chatId, sender, senderJid, scheduleId, targetDayOrDate) {
+  const isAllChat = !chatId || !chatId.endsWith('@g.us');
+  const chatSchedules = [...recurringPolls.entries()].filter(([, s]) => isAllChat || s.remoteJid === chatId);
+
+  let cleanId = String(scheduleId || '').replace(/^[\"']|[\"']$/g, '').trim();
+
+  // If user passed targetDayOrDate as first param (e.g. !skipinstance wednesday) and there is only 1 schedule:
+  if (cleanId && chatSchedules.length === 1 && !recurringPolls.has(cleanId)) {
+    const isDayOrDate = recurringPollsModule.DAY_LOOKUP?.[cleanId.toLowerCase()] !== undefined ||
+      /^(?:today|tomorrow|next|\d{4}-\d{2}-\d{2}|\d{1,2}\/\d{1,2}(?:\/\d{2,4})?)$/i.test(cleanId);
+    if (isDayOrDate) {
+      targetDayOrDate = cleanId;
+      cleanId = chatSchedules[0][0];
+    }
+  }
+
+  let targetKey = null;
+  if (cleanId) {
+    for (const [key, sched] of recurringPolls.entries()) {
+      const sid = sched.id || sched.scheduleId || key;
+      if (key.toLowerCase() === cleanId.toLowerCase() || sid.toLowerCase() === cleanId.toLowerCase()) {
+        targetKey = key;
+        break;
+      }
+    }
+    if (!targetKey) {
+      return `⚠️ Schedule ID "\`${cleanId}\`" was not found. Use "!recurringpolls" to view active schedule IDs.`;
+    }
+  } else {
+    if (chatSchedules.length === 1) {
+      targetKey = chatSchedules[0][0];
+    } else if (chatSchedules.length === 0) {
+      return '📅 No scheduled recurring polls found for this chat. Use "!recurringpolls" to check schedules.';
+    } else {
+      const ids = chatSchedules.map(([id]) => `\`${id}\``).join(', ');
+      return `Please specify which schedule ID to skip (${ids}). Example: "!skipinstance ${chatSchedules[0][0]}"`;
+    }
+  }
+
+  const sched = recurringPolls.get(targetKey);
+  const isCreator = sched.creator ? isSameUser(sched.creator.jid, senderJid, sched.creator.name, sender) : false;
+  const isAdmin = await isUserAdmin(sock, chatId, senderJid);
+
+  if (!isCreator && !isAdmin) {
+    return '⚠️ Only the creator of this recurring poll or group admins can skip instances.';
+  }
+
+  return await recurringPollsModule.skipRecurringPollInstance({
+    recurringPolls,
+    activePolls,
+    persistPolls,
+    cancelOrDeletePoll,
+    sock,
+    scheduleId: targetKey,
+    targetDayOrDate,
+    chatId,
+    sender
+  });
+}
+
+async function handleUnskipRecurringPollInstance(sock, chatId, sender, senderJid, scheduleId, targetDayOrDate) {
+  const isAllChat = !chatId || !chatId.endsWith('@g.us');
+  const chatSchedules = [...recurringPolls.entries()].filter(([, s]) => isAllChat || s.remoteJid === chatId);
+
+  let cleanId = String(scheduleId || '').replace(/^[\"']|[\"']$/g, '').trim();
+
+  if (cleanId && chatSchedules.length === 1 && !recurringPolls.has(cleanId)) {
+    const isDayOrDate = recurringPollsModule.DAY_LOOKUP?.[cleanId.toLowerCase()] !== undefined ||
+      /^(?:today|tomorrow|next|\d{4}-\d{2}-\d{2}|\d{1,2}\/\d{1,2}(?:\/\d{2,4})?)$/i.test(cleanId);
+    if (isDayOrDate) {
+      targetDayOrDate = cleanId;
+      cleanId = chatSchedules[0][0];
+    }
+  }
+
+  let targetKey = null;
+  if (cleanId) {
+    for (const [key, sched] of recurringPolls.entries()) {
+      const sid = sched.id || sched.scheduleId || key;
+      if (key.toLowerCase() === cleanId.toLowerCase() || sid.toLowerCase() === cleanId.toLowerCase()) {
+        targetKey = key;
+        break;
+      }
+    }
+    if (!targetKey) {
+      return `⚠️ Schedule ID "\`${cleanId}\`" was not found. Use "!recurringpolls" to view active schedule IDs.`;
+    }
+  } else {
+    if (chatSchedules.length === 1) {
+      targetKey = chatSchedules[0][0];
+    } else if (chatSchedules.length === 0) {
+      return '📅 No scheduled recurring polls found for this chat. Use "!recurringpolls" to check schedules.';
+    } else {
+      const ids = chatSchedules.map(([id]) => `\`${id}\``).join(', ');
+      return `Please specify which schedule ID to unskip (${ids}). Example: "!unskipinstance ${chatSchedules[0][0]}"`;
+    }
+  }
+
+  const sched = recurringPolls.get(targetKey);
+  const isCreator = sched.creator ? isSameUser(sched.creator.jid, senderJid, sched.creator.name, sender) : false;
+  const isAdmin = await isUserAdmin(sock, chatId, senderJid);
+
+  if (!isCreator && !isAdmin) {
+    return '⚠️ Only the creator of this recurring poll or group admins can unskip instances.';
+  }
+
+  return await recurringPollsModule.unskipRecurringPollInstance({
+    recurringPolls,
+    persistPolls,
+    scheduleId: targetKey,
+    targetDayOrDate,
+    chatId,
+    sender
+  });
+}
+
 async function cancelOrDeletePoll(sock, remoteJid, pollId) {
   if (!pollId) return;
   handlePollDeleted(remoteJid, pollId);
@@ -3871,6 +4022,14 @@ async function executeTool(sock, chatId, sender, toolUse, msg) {
     }
     return await handleModifyRecurringPoll(sock, chatId, sender, senderJid, input.scheduleId, input);
   }
+  if (name === 'skip_recurring_poll_instance' || name === 'skip_poll_instance') {
+    const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
+    return await handleSkipRecurringPollInstance(sock, chatId, sender, senderJid, input.scheduleId || null, input.targetDayOrDate || input.dateOrDay || null);
+  }
+  if (name === 'unskip_recurring_poll_instance' || name === 'unskip_poll_instance') {
+    const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
+    return await handleUnskipRecurringPollInstance(sock, chatId, sender, senderJid, input.scheduleId || null, input.targetDayOrDate || input.dateOrDay || null);
+  }
   if (name === 'cancel_recurring_poll') {
     const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
     return await handleCancelRecurringPoll(sock, chatId, sender, senderJid, input.scheduleId);
@@ -4300,6 +4459,38 @@ async function getResponse(sock, rawText, chatId, sender, msg) {
     }
   }
 
+  if (lower.startsWith('!skipinstance') || lower.startsWith('!skiprecurringinstance') || lower.startsWith('!skiprecurringpoll') || lower.startsWith('!skiprecurring') || lower.startsWith('!skippoll')) {
+    const parts = text.trim().split(/\s+/);
+    const target = parts.length > 1 ? parts[1].trim() : null;
+    const targetDayOrDate = parts.length > 2 ? parts.slice(2).join(' ').trim() : null;
+    const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
+    return await handleSkipRecurringPollInstance(sock, chatId, sender, senderJid, target, targetDayOrDate);
+  }
+
+  if (lower.startsWith('!unskipinstance') || lower.startsWith('!unskiprecurringinstance') || lower.startsWith('!unskiprecurringpoll') || lower.startsWith('!unskiprecurring') || lower.startsWith('!resumeskip')) {
+    const parts = text.trim().split(/\s+/);
+    const target = parts.length > 1 ? parts[1].trim() : null;
+    const targetDayOrDate = parts.length > 2 ? parts.slice(2).join(' ').trim() : null;
+    const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
+    return await handleUnskipRecurringPollInstance(sock, chatId, sender, senderJid, target, targetDayOrDate);
+  }
+
+  if (lower.startsWith('!recurringpoll skip') || lower.startsWith('!recurringpolls skip') || lower.startsWith('!schedulepoll skip') || lower.startsWith('!scheduledpolls skip')) {
+    const parts = text.trim().split(/\s+/);
+    const target = parts.length > 2 ? parts[2].trim() : null;
+    const targetDayOrDate = parts.length > 3 ? parts.slice(3).join(' ').trim() : null;
+    const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
+    return await handleSkipRecurringPollInstance(sock, chatId, sender, senderJid, target, targetDayOrDate);
+  }
+
+  if (lower.startsWith('!recurringpoll unskip') || lower.startsWith('!recurringpolls unskip') || lower.startsWith('!schedulepoll unskip') || lower.startsWith('!scheduledpolls unskip')) {
+    const parts = text.trim().split(/\s+/);
+    const target = parts.length > 2 ? parts[2].trim() : null;
+    const targetDayOrDate = parts.length > 3 ? parts.slice(3).join(' ').trim() : null;
+    const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
+    return await handleUnskipRecurringPollInstance(sock, chatId, sender, senderJid, target, targetDayOrDate);
+  }
+
   if (lower.startsWith('!pauseallrecurring') || lower.startsWith('!stopallrecurring') || lower === '!pauserecurringpolls' || lower === '!stoprecurringpolls') {
     const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
     return await handlePauseRecurringPoll(sock, chatId, sender, senderJid, 'all');
@@ -4357,6 +4548,14 @@ async function getResponse(sock, rawText, chatId, sender, msg) {
       if (parsed.action === 'cancel') {
         const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
         return await handleCancelRecurringPoll(sock, chatId, sender, senderJid, parsed.scheduleId);
+      }
+      if (parsed.action === 'skip_instance') {
+        const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
+        return await handleSkipRecurringPollInstance(sock, chatId, sender, senderJid, parsed.scheduleId, parsed.targetDayOrDate);
+      }
+      if (parsed.action === 'unskip_instance') {
+        const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
+        return await handleUnskipRecurringPollInstance(sock, chatId, sender, senderJid, parsed.scheduleId, parsed.targetDayOrDate);
       }
       if (parsed.action === 'pause') {
         const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
@@ -4573,6 +4772,14 @@ async function getResponse(sock, rawText, chatId, sender, msg) {
       const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
       return await handleCancelRecurringPoll(sock, chatId, sender, senderJid, directRecurringParsed.scheduleId);
     }
+      if (directRecurringParsed.action === 'skip_instance') {
+        const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
+        return await handleSkipRecurringPollInstance(sock, chatId, sender, senderJid, directRecurringParsed.scheduleId, directRecurringParsed.targetDayOrDate);
+      }
+      if (directRecurringParsed.action === 'unskip_instance') {
+        const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
+        return await handleUnskipRecurringPollInstance(sock, chatId, sender, senderJid, directRecurringParsed.scheduleId, directRecurringParsed.targetDayOrDate);
+      }
     if (directRecurringParsed.action === 'pause') {
       const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
       return await handlePauseRecurringPoll(sock, chatId, sender, senderJid, directRecurringParsed.scheduleId);
