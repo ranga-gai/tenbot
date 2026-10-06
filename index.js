@@ -1921,6 +1921,7 @@ Respond ONLY with a JSON object in this exact format:
 {
   "isLineup": boolean,
   "type": "singles" | "doubles",
+  "time": string or null,
   "players": ["Player 1", "Player 2", ...],
   "sets": [
     {
@@ -1966,9 +1967,10 @@ If isLineup is false, return:
       }))
     }));
 
-    console.log(`[lineup-llm] Decoded lineup (${parsed.type || 'doubles'}): ${resolvedPlayers.length} player(s) [${resolvedPlayers.join(', ')}]`);
+    console.log(`[lineup-llm] Decoded lineup (${parsed.type || 'doubles'}${parsed.time ? ` at ${parsed.time}` : ''}): ${resolvedPlayers.length} player(s) [${resolvedPlayers.join(', ')}]`);
     return {
       type: parsed.type || (resolvedPlayers.length === 2 ? 'singles' : 'doubles'),
+      time: parsed.time ? String(parsed.time).trim() : null,
       players: resolvedPlayers,
       sets: resolvedSets
     };
@@ -4095,25 +4097,248 @@ async function executeTool(sock, chatId, sender, toolUse, msg) {
  */
 
 /**
- * Records a manually published lineup in the chat into the active poll state
- * and pair history so score reports and partner memory work seamlessly.
+ * Helper to check if two player names refer to the same player
+ * (handling case differences, registered aliases/LIDs, and first/full name prefixes).
  */
-async function handleManualLineup(sock, chatId, sender, lineup, msg) {
-  let targetPollId = null;
-  let targetPollState = null;
+function isSamePlayerName(name1, name2) {
+  if (!name1 || !name2) return false;
+  if (ratings.isPlaceholder(name1) || ratings.isPlaceholder(name2)) return false;
+  const k1 = ratings.keyFor(name1);
+  const k2 = ratings.keyFor(name2);
+  if (!k1 || !k2) return false;
+  if (k1 === k2) return true;
+  const m1 = namesStore.findIdByNameOrAlias(name1);
+  const m2 = namesStore.findIdByNameOrAlias(name2);
+  if (m1 && m2 && m1.id && m2.id && m1.id === m2.id) return true;
+  if (k1.length >= 3 && k2.length >= 3) {
+    if (k1.startsWith(k2 + ' ') || k2.startsWith(k1 + ' ')) return true;
+  }
+  return false;
+}
 
-  for (const [pollId, pollState] of [...activePolls.entries()].reverse()) {
+/**
+ * Extracts match time mentioned in a lineup message text or parsed lineup object.
+ */
+function extractTimeFromLineupMessage(text, lineup = null) {
+  if (lineup && lineup.time) {
+    const parsed = pollTime.parseTimeString(lineup.time);
+    if (parsed) return { hour: parsed.hour, minute: parsed.minute, display: parsed.display };
+  }
+  if (!text || typeof text !== 'string') return null;
+  const m1 = text.match(/\b(\d{1,2})(?:[:.](\d{2}))?\s*(am|pm)\b/i);
+  if (m1) {
+    const rawH = parseInt(m1[1], 10);
+    const minute = m1[2] ? parseInt(m1[2], 10) : 0;
+    const ampm = m1[3].toLowerCase();
+    let hour = rawH % 12;
+    if (ampm === 'pm') hour += 12;
+    return { hour, minute, display: `${m1[1]}${m1[2] ? ':' + m1[2] : ''}${ampm}` };
+  }
+  const m2 = text.match(/\b([01]?\d|2[0-3])[:.](\d{2})\b/);
+  if (m2) {
+    let hour = parseInt(m2[1], 10);
+    const minute = parseInt(m2[2], 10);
+    if (hour >= 1 && hour <= 6) hour += 12;
+    return { hour, minute, display: `${hour}:${String(minute).padStart(2, '0')}` };
+  }
+  return null;
+}
+
+/**
+ * Extracts wall-clock hour and minute in San Jose for a poll state.
+ */
+function getPollMatchTime(pollState) {
+  if (!pollState) return null;
+  if (pollState.playAt) {
+    const d = new Date(pollState.playAt);
+    if (!Number.isNaN(d.getTime())) {
+      const sj = pollTime.getSanJoseParts(d);
+      return { hour: sj.hour, minute: sj.minute };
+    }
+  }
+  if (pollState.when) {
+    const pt = pollTime.parseTimeString(pollState.when);
+    if (pt) return { hour: pt.hour, minute: pt.minute };
+  }
+  if (pollState.name) {
+    const pt = pollTime.parseTimeString(pollState.name);
+    if (pt) return { hour: pt.hour, minute: pt.minute };
+  }
+  return null;
+}
+
+/**
+ * Resolves all distinct voted / roster players for a poll.
+ */
+function getPollPlayerNames(pollId, pollState, mePn) {
+  const { interestedPlayers, aggregated } = getPollVoters(pollId, pollState, mePn);
+  const roster = resolveFixedPollRoster(pollState, aggregated);
+
+  const players = [];
+  const addPlayer = (name) => {
+    if (!name || ratings.isPlaceholder(name)) return;
+    if (!players.some((existing) => isSamePlayerName(existing, name))) {
+      players.push(name);
+    }
+  };
+
+  if (Array.isArray(roster.players)) {
+    for (const p of roster.players) addPlayer(p);
+  }
+  if (Array.isArray(interestedPlayers)) {
+    for (const p of interestedPlayers) addPlayer(p);
+  }
+  if (Array.isArray(pollState.lastPlayers)) {
+    for (const p of pollState.lastPlayers) addPlayer(p);
+  }
+
+  const cleanRosterCount = roster.players ? roster.players.filter((p) => !ratings.isPlaceholder(p)).length : 0;
+  return {
+    players,
+    rosterCount: cleanRosterCount,
+    filledCount: roster.filledCount || 0,
+    size: pollState.size || null
+  };
+}
+
+/**
+ * Attributes a deciphered lineup message to the appropriate poll when multiple active polls exist.
+ * First tries to find an exact match for players and time.
+ * If no exact match is found, gives preference to the poll with the most player name matches to votes.
+ */
+function findBestMatchingPollForLineup({ activePolls, chatId, lineup, messageText, mePn }) {
+  let candidatePolls = [];
+  for (const [pollId, pollState] of activePolls.entries()) {
     if (pollState.remoteJid === chatId && (pollState.status === 'active' || pollState.status === 'filled' || pollState.status === 'stopped')) {
-      targetPollId = pollId;
-      targetPollState = pollState;
-      break;
+      candidatePolls.push({ pollId, pollState });
     }
   }
 
-  if (!targetPollState) {
-    targetPollId = latestPollIdByChat.get(chatId);
-    targetPollState = targetPollId && activePolls.get(targetPollId);
+  if (candidatePolls.length === 0) {
+    for (const [pollId, pollState] of activePolls.entries()) {
+      if (pollState.remoteJid === chatId && pollState.status === 'resolved') {
+        candidatePolls.push({ pollId, pollState });
+      }
+    }
   }
+
+  if (candidatePolls.length === 0) {
+    const latestId = latestPollIdByChat.get(chatId);
+    const latestState = latestId ? activePolls.get(latestId) : null;
+    if (latestState) {
+      return { targetPollId: latestId, targetPollState: latestState, matchInfo: 'fallback_latest' };
+    }
+    return { targetPollId: null, targetPollState: null, matchInfo: 'none' };
+  }
+
+  const msgTime = extractTimeFromLineupMessage(messageText, lineup);
+  const lineupPlayers = (lineup?.players || []).filter((p) => !ratings.isPlaceholder(p));
+
+  const scored = candidatePolls.map(({ pollId, pollState }, index) => {
+    const pollTimeObj = getPollMatchTime(pollState);
+    const isExactTimeMatch = Boolean(
+      msgTime && pollTimeObj &&
+      msgTime.hour === pollTimeObj.hour &&
+      msgTime.minute === pollTimeObj.minute
+    );
+
+    const pollPlayerInfo = getPollPlayerNames(pollId, pollState, mePn);
+    const pollPlayers = pollPlayerInfo.players;
+
+    let matchCount = 0;
+    const matchedPollIndices = new Set();
+    const matchedNames = [];
+
+    for (const lp of lineupPlayers) {
+      for (let i = 0; i < pollPlayers.length; i++) {
+        if (!matchedPollIndices.has(i) && isSamePlayerName(lp, pollPlayers[i])) {
+          matchedPollIndices.add(i);
+          matchedNames.push(pollPlayers[i]);
+          matchCount++;
+          break;
+        }
+      }
+    }
+
+    const isExactPlayerMatch = Boolean(
+      lineupPlayers.length > 0 &&
+      matchCount === lineupPlayers.length &&
+      (
+        pollPlayers.length === lineupPlayers.length ||
+        (pollPlayerInfo.rosterCount > 0 && matchCount === pollPlayerInfo.rosterCount) ||
+        (pollPlayerInfo.size && matchCount === pollPlayerInfo.size)
+      )
+    );
+
+    const isExactBoth = Boolean(isExactPlayerMatch && isExactTimeMatch);
+
+    const matchRatio = pollPlayers.length > 0
+      ? matchCount / Math.max(lineupPlayers.length, pollPlayers.length)
+      : 0;
+
+    return {
+      pollId,
+      pollState,
+      index,
+      matchCount,
+      matchedNames,
+      matchRatio,
+      isExactPlayerMatch,
+      isExactTimeMatch,
+      isExactBoth,
+      statusWeight: pollState.status === 'filled' ? 2 : (pollState.status === 'active' ? 1 : 0)
+    };
+  });
+
+  // Tier 1: Exact match for BOTH players AND time
+  const exactBothMatches = scored.filter((s) => s.isExactBoth);
+  if (exactBothMatches.length > 0) {
+    exactBothMatches.sort((a, b) => b.index - a.index);
+    const best = exactBothMatches[0];
+    return {
+      targetPollId: best.pollId,
+      targetPollState: best.pollState,
+      matchInfo: `exact_players_and_time (${best.matchCount} players, time: ${msgTime?.display || ''})`
+    };
+  }
+
+  // Tier 2: Prefer poll with most player name matches to votes
+  scored.sort((a, b) => {
+    if (b.matchCount !== a.matchCount) return b.matchCount - a.matchCount;
+    if (b.isExactTimeMatch !== a.isExactTimeMatch) return (b.isExactTimeMatch ? 1 : 0) - (a.isExactTimeMatch ? 1 : 0);
+    if (b.matchRatio !== a.matchRatio) return b.matchRatio - a.matchRatio;
+    if (b.statusWeight !== a.statusWeight) return b.statusWeight - a.statusWeight;
+    return b.index - a.index;
+  });
+
+  const best = scored[0];
+  return {
+    targetPollId: best.pollId,
+    targetPollState: best.pollState,
+    matchInfo: best.matchCount > 0
+      ? `player_votes_preference (${best.matchCount} player match(es): ${best.matchedNames.join(', ')})`
+      : 'fallback_most_recent'
+  };
+}
+
+/**
+ * Records a manually published lineup in the chat into the active poll state
+ * and pair history so score reports and partner memory work seamlessly.
+ */
+async function handleManualLineup(sock, chatId, sender, lineup, msg, rawText = '') {
+  const messageText = rawText || msg?.message?.conversation || msg?.message?.extendedTextMessage?.text || '';
+  const mePn = botSock?.authState?.creds?.me?.id || null;
+
+  const matchResult = findBestMatchingPollForLineup({
+    activePolls,
+    chatId,
+    lineup,
+    messageText,
+    mePn
+  });
+
+  const targetPollId = matchResult?.targetPollId || null;
+  const targetPollState = matchResult?.targetPollState || null;
 
   if (targetPollState) {
     targetPollState.status = 'resolved';
@@ -4122,7 +4347,7 @@ async function handleManualLineup(sock, chatId, sender, lineup, msg) {
     pairHistory.recordDraw(targetPollId, lineup);
     await ratings.ensureRated(lineup.players);
     persistPolls();
-    console.log(`[lineup] Recorded manual lineup for poll ${targetPollId} in ${chatId} (${lineup.players.length} players: ${lineup.players.join(', ')})`);
+    console.log(`[lineup] Attributed manual lineup to poll ${targetPollId} in ${chatId} [${matchResult.matchInfo}] (${lineup.players.length} players: ${lineup.players.join(', ')})`);
   } else {
     pairHistory.recordDraw(`manual_${Date.now()}`, lineup);
     await ratings.ensureRated(lineup.players);
@@ -4382,7 +4607,7 @@ async function getResponse(sock, rawText, chatId, sender, msg) {
     }
 
     if (manualLineup) {
-      return await handleManualLineup(sock, chatId, sender, manualLineup, msg);
+      return await handleManualLineup(sock, chatId, sender, manualLineup, msg, text);
     }
   }
 
