@@ -5627,7 +5627,21 @@ function matchScvccPlayerToGroupMember(scvccPlayerName) {
     if (disp && clean === disp) return entry;
   }
 
-  // 2. First and last name match (e.g. "Chandra Sekhar Cheruku" vs "Chandra Cheruku")
+  // 2. Handle "Last, First" format from SCVCC (e.g. "Immaneni, Pramod")
+  if (clean.includes(',')) {
+    const [last, first] = clean.split(',').map((s) => s.trim());
+    if (first && last) {
+      const reordered = `${first} ${last}`.toLowerCase();
+      for (const entry of allEntries) {
+        const full = (entry.fullName || '').trim().toLowerCase();
+        if (full && reordered === full) return entry;
+        const disp = (entry.name || '').trim().toLowerCase();
+        if (disp && reordered === disp) return entry;
+      }
+    }
+  }
+
+  // 3. First and last name match (e.g. "First Middle Last" vs "First Last")
   if (scvccWords.length >= 2) {
     const scvccFirst = scvccWords[0];
     const scvccLast = scvccWords[scvccWords.length - 1];
