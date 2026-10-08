@@ -1090,6 +1090,19 @@ function resolveManualPollPlayers(targetPollState, currentPlayers) {
   const options = targetPollState.options || [];
   const firstSlotNum = getFirstSlotNumber(options);
 
+  // For Yes/No opt-in polls, only players who voted Yes are playing.
+  // Never add creator extra/virtual duplicates (creator 2, etc.) or pad to valid counts.
+  const isOptIn = targetPollState.type === 'opt_in' || targetPollState.size === null || options.some((o) => /^yes$/i.test(o.trim()));
+  if (isOptIn) {
+    const players = [];
+    for (const p of currentPlayers) {
+      if (!players.some((existing) => ratings.keyFor(existing) === ratings.keyFor(p))) {
+        players.push(p);
+      }
+    }
+    return { players, addedCreator: false, addedExtra: [], addedFromLabel: [], addedFromValidCount: [] };
+  }
+
   const players = [];
   const addedFromLabel = [];
   const addedFromValidCount = [];
@@ -1111,9 +1124,8 @@ function resolveManualPollPlayers(targetPollState, currentPlayers) {
   }
 
   // 3. ONLY if first vote label has index 1 AND all vote slots have been filled, apply valid total player count check
-  const isOptIn = targetPollState.type === 'opt_in' || options.some((o) => /^yes$/i.test(o));
-  const isFirstVoteLabelSlot1 = firstSlotNum === 1 || (firstSlotNum === null && isOptIn);
-  const allSlotsFilled = isOptIn || (options.length > 0 && currentPlayers.length >= options.length);
+  const isFirstVoteLabelSlot1 = firstSlotNum === 1;
+  const allSlotsFilled = options.length > 0 && currentPlayers.length >= options.length;
 
   if (isFirstVoteLabelSlot1 && allSlotsFilled && !isValidPlayerCount(players.length)) {
     const targetCount = getNextValidPlayerCount(players.length);
@@ -2142,18 +2154,15 @@ async function sendPollReminder(sock, pollId, pollState, isManualTrigger = false
 
     if (isOptIn) {
       yesCount = interestedPlayers.length;
+      players = [...interestedPlayers];
     } else {
       if (openSpots <= 0 && !isManualTrigger) return false;
+      const { players: resolvedPlayers } = resolveManualPollPlayers(pollState, interestedPlayers);
+      players = resolvedPlayers;
     }
-
-    const { players: resolvedPlayers } = resolveManualPollPlayers(pollState, interestedPlayers);
-    players = resolvedPlayers;
   } else if (isOptIn) {
     yesCount = interestedPlayers.length;
     players = [...interestedPlayers];
-    if (pollState.creator?.name && !players.includes(pollState.creator.name)) {
-      players.unshift(pollState.creator.name);
-    }
   } else {
     const { players: resolvedPlayers, filledCount, totalSlotsCount } = resolveFixedPollRoster(pollState, aggregated);
     totalSpots = totalSlotsCount;
@@ -6736,15 +6745,24 @@ async function generateMatchupsFromPoll(sock, chatId, specificPollId = null, spe
   // Extract players from votes or previous draw
   let players = [];
   const { interestedPlayers, yesOption } = getPollVoters(targetPollId, targetPollState, mePn);
+  const isOptIn = targetPollState.type === 'opt_in' || targetPollState.size === null || targetPollState.options?.some((o) => /^yes$/i.test(o.trim()));
   if (interestedPlayers && interestedPlayers.length > 0) {
     players = interestedPlayers;
-    if (targetPollState.isManual) {
+    if (isOptIn) {
+      const deduplicated = [];
+      for (const p of players) {
+        if (!deduplicated.some((existing) => ratings.keyFor(existing) === ratings.keyFor(p))) {
+          deduplicated.push(p);
+        }
+      }
+      players = deduplicated;
+    } else if (targetPollState.isManual) {
       const { players: adjustedPlayers, addedExtra } = resolveManualPollPlayers(targetPollState, players);
       if (addedExtra && addedExtra.length > 0) {
         console.log(`[poll] Adjusted manual poll players: added extra [${addedExtra.join(', ')}] -> total ${adjustedPlayers.length} player(s)`);
       }
       players = adjustedPlayers;
-    } else if (targetPollState.type !== 'opt_in') {
+    } else {
       const { aggregated } = getPollVoters(targetPollId, targetPollState, mePn);
       const { players: rosterPlayers } = resolveFixedPollRoster(targetPollState, aggregated);
       if (rosterPlayers.length > 0) {
@@ -7030,34 +7048,9 @@ function pollStatusText(chatId = null, opts = {}) {
       ? `Reminders: PAUSED (sent so far: [${remindersStr}] ${countStr})`
       : `Sent reminders: [${remindersStr}] ${countStr}`;
 
-    if (pollState.isManual) {
-      const { aggregated, interestedPlayers } = getPollVoters(pollId, pollState, mePn);
-      const optionSummaries = aggregated.map((opt) => `${opt.name} (${opt.voters.length}): ${opt.voters.map(nameFor).join(', ') || '(none)'}`);
-      const { players: playingPlayers, addedFromLabel, addedFromValidCount } = resolveManualPollPlayers(pollState, interestedPlayers);
-      const creatorName = pollState.creator?.name || 'Someone';
+    const isOptIn = pollState.type === 'opt_in' || pollState.size === null || pollState.options?.some((o) => /^yes$/i.test(o.trim()));
 
-      let additionNotes = [];
-      if (addedFromLabel.length > 0) additionNotes.push(`${addedFromLabel.join(', ')} from poll slot labels`);
-      if (addedFromValidCount.length > 0) additionNotes.push(`${addedFromValidCount.join(', ')} to reach valid player count`);
-      const additionStr = additionNotes.length > 0 ? ` (includes ${additionNotes.join(' and ')})` : '';
-
-      const lines = [
-        `${groupHeader}Poll ${pollId}: User-Created Manual Match Poll "${pollState.name || 'Match Poll'}".`,
-        getPollScheduleId(pollState) ? `🔁 Recurring Schedule: \`${getPollScheduleId(pollState)}\` (created as per schedule)` : (pollState.isRecurring ? '🔁 Recurring Schedule: (created as per schedule)' : null),
-        `Creator: ${creatorName}`,
-        `Status: ${pollState.status} (Passively tracked)`,
-        `Play time: ${playAtLocal} (when: "${pollState.when || 'unspecified'}")`,
-        remindersLine,
-        `Total votes buffered: ${pollState.voteBuffer.size}`,
-        `Options & Votes:\n  ${optionSummaries.length ? optionSummaries.join('\n  ') : '(none)'}`,
-        `Voted so far (${interestedPlayers.length}): ${interestedPlayers.length ? interestedPlayers.join(', ') : '(none yet)'}`,
-        `Currently playing (${playingPlayers.length}): ${playingPlayers.join(', ')}${additionStr}`,
-        'Matchups: Passively tracked -- will generate matchups only upon explicit user request (!matchups or "@tenbot generate matchups")'
-      ];
-      return lines.filter(Boolean).join('\n');
-    }
-
-    if (pollState.type === 'opt_in' || pollState.size === null) {
+    if (isOptIn) {
       let yesVoters = [];
       let noVoters = [];
       try {
@@ -7075,15 +7068,44 @@ function pollStatusText(chatId = null, opts = {}) {
         }
       } catch (e) { }
 
+      const manualDesc = pollState.isManual ? ' (Passively tracked)' : '';
       const lines = [
         `${groupHeader}Poll ${pollId}${pollState.when ? ` (${pollState.when})` : ''}: Opt-in (Yes/No).`,
-        getPollScheduleId(pollState) ? `🔁 Recurring Schedule: \`${getPollScheduleId(pollState)}\` (created as per schedule)` : (pollState.isRecurring ? '🔁 Recurring Schedule: (created as per schedule)' : null),
-        `Status: ${pollState.status}`,
+        getPollScheduleId(pollState) ? `🔄 Recurring Schedule: \`${getPollScheduleId(pollState)}\` (created as per schedule)` : (pollState.isRecurring ? '🔄 Recurring Schedule: (created as per schedule)' : null),
+        pollState.creator?.name ? `Creator: ${pollState.creator.name}` : null,
+        `Status: ${pollState.status}${manualDesc}`,
         `Play time: ${playAtLocal} (kept for 2 weeks after scheduled play time)`,
         remindersLine,
         `Yes votes (${yesVoters.length}): ${yesVoters.length ? yesVoters.join(', ') : '(none yet)'}`,
         `No votes (${noVoters.length}): ${noVoters.length ? noVoters.join(', ') : '(none yet)'}`,
         'Matchups: Waiting for user prompt (!matchups or "@tenbot generate matchups")'
+      ];
+      return lines.filter(Boolean).join('\n');
+    }
+
+    if (pollState.isManual) {
+      const { aggregated, interestedPlayers } = getPollVoters(pollId, pollState, mePn);
+      const optionSummaries = aggregated.map((opt) => `${opt.name} (${opt.voters.length}): ${opt.voters.map(nameFor).join(', ') || '(none)'}`);
+      const { players: playingPlayers, addedFromLabel, addedFromValidCount } = resolveManualPollPlayers(pollState, interestedPlayers);
+      const creatorName = pollState.creator?.name || 'Someone';
+
+      let additionNotes = [];
+      if (addedFromLabel.length > 0) additionNotes.push(`${addedFromLabel.join(', ')} from poll slot labels`);
+      if (addedFromValidCount.length > 0) additionNotes.push(`${addedFromValidCount.join(', ')} to reach valid player count`);
+      const additionStr = additionNotes.length > 0 ? ` (includes ${additionNotes.join(' and ')})` : '';
+
+      const lines = [
+        `${groupHeader}Poll ${pollId}: User-Created Manual Match Poll "${pollState.name || 'Match Poll'}".`,
+        getPollScheduleId(pollState) ? `🔄 Recurring Schedule: \`${getPollScheduleId(pollState)}\` (created as per schedule)` : (pollState.isRecurring ? '🔄 Recurring Schedule: (created as per schedule)' : null),
+        `Creator: ${creatorName}`,
+        `Status: ${pollState.status} (Passively tracked)`,
+        `Play time: ${playAtLocal} (when: "${pollState.when || 'unspecified'}")`,
+        remindersLine,
+        `Total votes buffered: ${pollState.voteBuffer.size}`,
+        `Options & Votes:\n  ${optionSummaries.length ? optionSummaries.join('\n  ') : '(none)'}`,
+        `Voted so far (${interestedPlayers.length}): ${interestedPlayers.length ? interestedPlayers.join(', ') : '(none yet)'}`,
+        `Currently playing (${playingPlayers.length}): ${playingPlayers.join(', ')}${additionStr}`,
+        'Matchups: Passively tracked -- will generate matchups only upon explicit user request (!matchups or "@tenbot generate matchups")'
       ];
       return lines.filter(Boolean).join('\n');
     }
@@ -7163,6 +7185,37 @@ function buildContextBlurb(chatId) {
     const pollDescriptions = chatPolls.map(([id, pollState]) => {
       const whenSuffix = pollState.when ? ` for ${pollState.when}` : '';
 
+      const isOptIn = pollState.type === 'opt_in' || pollState.size === null || pollState.options?.some((o) => /^yes$/i.test(o.trim()));
+
+      if (isOptIn) {
+        let yesCount = 0;
+        let noCount = 0;
+        let yesNames = [];
+        try {
+          const pollCreationMessage = messageStore.get(storeKey(pollState.remoteJid, id));
+          if (pollCreationMessage) {
+            const merged = [...pollState.voteBuffer.values()].map((u) => ({
+              ...u,
+              vote: normalizeVotePayload(u.vote)
+            }));
+            const aggregated = getAggregateVotesInPollMessage({ message: pollCreationMessage, pollUpdates: merged }, mePn);
+            const yesOpt = aggregated.find((o) => /^yes$/i.test(o.name.trim()));
+            const noOpt = aggregated.find((o) => /^no$/i.test(o.name.trim()));
+            yesCount = yesOpt ? yesOpt.voters.length : 0;
+            noCount = noOpt ? noOpt.voters.length : 0;
+            yesNames = yesOpt ? yesOpt.voters.map((v) => nameFor(v)) : [];
+          }
+        } catch (e) { }
+
+        if (pollState.status === 'cancelled') {
+          return `[Poll ${id}] a Yes/No opt-in poll${whenSuffix} was cancelled`;
+        } else {
+          const creatorDesc = pollState.creator?.name ? ` (created by ${pollState.creator.name})` : '';
+          const statusNote = pollState.status === 'resolved' ? 'status: resolved/drawn (can rematch)' : (pollState.status === 'stopped' ? 'status: stopped (voting stopped)' : (pollState.status === 'expired' ? 'status: expired (play time passed, can still generate matchups if requested)' : 'status: active'));
+          return `[Poll ${id}] a Yes/No opt-in poll${whenSuffix}${creatorDesc} is tracked with ${yesCount} "Yes" vote(s) (${yesNames.join(', ') || 'none yet'}) and ${noCount} "No" vote(s). (${statusNote})`;
+        }
+      }
+
       if (pollState.isManual) {
         const { aggregated, interestedPlayers } = getPollVoters(id, pollState, mePn);
         const optionDetails = [];
@@ -7186,34 +7239,6 @@ function buildContextBlurb(chatId) {
         } else {
           const statusNote = pollState.status === 'resolved' ? 'status: resolved/drawn (can generate matchups again / rematch)' : (pollState.status === 'filled' ? 'status: filled (all voting slots filled, waiting for matchup request)' : (pollState.status === 'stopped' ? 'status: stopped (voting stopped, call generate_matchups when ready)' : (pollState.status === 'expired' ? 'status: expired (play time passed, can still generate matchups if requested)' : 'status: active')));
           return `[Poll ${id}] a user-created manual match poll "${pollState.name || 'Match Poll'}" (created by ${creatorName}) is tracked with ${interestedPlayers.length} vote(s): [${optionDetails.join('; ') || 'no votes yet'}]. Players currently in/playing (${playingPlayers.length}): ${playingPlayers.join(', ')}${additionSuffix}. (${statusNote} -- when asked to generate matchups or draw, call generate_matchups)`;
-        }
-      }
-
-      if (pollState.type === 'opt_in' || pollState.size === null) {
-        let yesCount = 0;
-        let noCount = 0;
-        let yesNames = [];
-        try {
-          const pollCreationMessage = messageStore.get(storeKey(pollState.remoteJid, id));
-          if (pollCreationMessage) {
-            const merged = [...pollState.voteBuffer.values()].map((u) => ({
-              ...u,
-              vote: normalizeVotePayload(u.vote)
-            }));
-            const aggregated = getAggregateVotesInPollMessage({ message: pollCreationMessage, pollUpdates: merged }, mePn);
-            const yesOpt = aggregated.find((o) => /^yes$/i.test(o.name.trim()));
-            const noOpt = aggregated.find((o) => /^no$/i.test(o.name.trim()));
-            yesCount = yesOpt ? yesOpt.voters.length : 0;
-            noCount = noOpt ? noOpt.voters.length : 0;
-            yesNames = yesOpt ? yesOpt.voters.map((v) => nameFor(v)) : [];
-          }
-        } catch (e) { }
-
-        if (pollState.status === 'cancelled') {
-          return `[Poll ${id}] a Yes/No opt-in poll${whenSuffix} was cancelled`;
-        } else {
-          const statusNote = pollState.status === 'resolved' ? 'status: resolved/drawn (can rematch)' : (pollState.status === 'stopped' ? 'status: stopped (voting stopped)' : (pollState.status === 'expired' ? 'status: expired (play time passed, can still generate matchups if requested)' : 'status: active'));
-          return `[Poll ${id}] a Yes/No opt-in poll${whenSuffix} is tracked with ${yesCount} "Yes" vote(s) (${yesNames.join(', ') || 'none yet'}) and ${noCount} "No" vote(s). (${statusNote})`;
         }
       }
 
@@ -7360,5 +7385,6 @@ if (require.main === module) {
 module.exports = {
   createMatchPoll,
   handleDirectPollCreation,
-  handleMessage
+  handleMessage,
+  resolveManualPollPlayers
 };
