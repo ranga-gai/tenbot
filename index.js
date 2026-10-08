@@ -195,7 +195,7 @@ const SYSTEM_PROMPT =
 const CLAUDE_TOOLS = [
   {
     name: 'create_poll',
-    description: 'Creates and sends a WhatsApp poll for organizing a tennis match in the group. Always call this tool directly when asked to create a poll without asking for user confirmation beforehand, even if the creator already has other polls (especially when the start time is 90 minutes or more away or rolled over to the next day). If size is specified, creates numbered slot spots; if the given player count does not match a valid count (2 for singles, 4/8/12 for doubles), it assumes creator and virtual players and starts labels from Player <valid count - given count + 1>. If size is omitted or not specified, creates an opt-in poll with only two options (Yes and No) where players vote Yes to opt in. Note: users are in San Jose, CA (Pacific Time). If both day and time are given and in the past, poll creation is rejected. If only a start time is specified and the current time is greater than the start time, the poll is automatically created for the next day with that start time. If modifying/replacing an existing poll, set cancelExisting to true to delete the older poll from WhatsApp.',
+    description: 'Creates and sends a WhatsApp poll for organizing a tennis match in the group. Always call this tool directly when asked to create a poll without asking for user confirmation beforehand, even if the creator already has other polls (especially when the start time is 90 minutes or more away or rolled over to the next day). If size is specified, creates numbered slot spots; if the given player count does not match a valid count (2 for singles, 4/8/12 for doubles), it assumes creator and virtual players and starts labels from Player <valid count - given count + 1>. If size is omitted or not specified, creates an opt-in poll with only two options (Yes and No) where players vote Yes to opt in. Note: users are in San Jose, CA (Pacific Time). If both day and time are given and in the past, poll creation is rejected. If only a start time is specified and the current time is greater than the start time, the poll is automatically created for the next day with that start time. If modifying/replacing an existing poll, set cancelExisting to true to delete the older poll from WhatsApp. Note: for polls with court checks (default unless noCourts is true), if no live or prebooked courts are available at SCVCC for that time, the poll is not created and a notification is sent instead.',
     input_schema: {
       type: 'object',
       properties: {
@@ -1409,6 +1409,9 @@ async function handleDirectPollCreation(sock, chatId, sender, msg, parsed, opts 
   );
 
   if (res?.err) {
+    if (res.noCourtsAvailable) {
+      return null;
+    }
     return `Could not create poll: ${res.err}`;
   }
 
@@ -2577,6 +2580,9 @@ async function handleModifyPollInstance(sock, chatId, sender, senderJid, targetI
   );
 
   if (res?.err) {
+    if (res.noCourtsAvailable) {
+      return null;
+    }
     return `Could not modify poll instance: ${res.err}`;
   }
 
@@ -5802,21 +5808,6 @@ async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWor
   inFlightPollCreations.add(flightKey);
   try {
 
-  // If replacing an existing poll or user requested modifications, delete older poll from WhatsApp
-  let replacedOldPoll = false;
-  if (replacePollId && activePolls.has(replacePollId)) {
-    await cancelOrDeletePoll(sock, remoteJid, replacePollId);
-    replacedOldPoll = true;
-  } else if (cancelExisting) {
-    for (const [pollId, pollState] of [...activePolls.entries()].reverse()) {
-      if (pollState.remoteJid === remoteJid && pollState.status === 'active' && !pollState.isManual) {
-        await cancelOrDeletePoll(sock, remoteJid, pollId);
-        replacedOldPoll = true;
-        break;
-      }
-    }
-  }
-
   // If time rolled over to tomorrow and when doesn't mention tomorrow or day name, adjust when
   const playParts = getSanJoseParts(playAt);
   const nowParts = getSanJoseParts(sjNow);
@@ -5882,16 +5873,29 @@ async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWor
   const targetDateMDY = scvcc.resolveDateToMDY(effectiveDayWord || resolvedWhen || playAt);
   let selectedPrebooked = [];
 
-  if (isAuto) {
-    let prebookedCourts = [];
-    let freeCourts = [];
+  const hasCourtChecks = isAuto || (!noCourts && Boolean(queryTime));
+  let prebookedCourts = [];
+  let freeCourts = [];
+
+  if (hasCourtChecks) {
     const seenPrebooked = new Set();
+    let courtCheckPerformed = false;
 
     try {
       const [avail, bookingsRes] = await Promise.all([
-        scvcc.checkCourtAvailability({ when: targetDateMDY, time: queryTime, sport: 'tennis' }).catch(() => null),
-        scvcc.getCourtBookings({ when: targetDateMDY, time: queryTime, sport: 'tennis' }).catch(() => null)
+        scvcc.checkCourtAvailability({ when: targetDateMDY, time: queryTime, sport: 'tennis' }).catch((err) => {
+          console.warn('[poll] Error checking court availability:', err.message);
+          return null;
+        }),
+        scvcc.getCourtBookings({ when: targetDateMDY, time: queryTime, sport: 'tennis' }).catch((err) => {
+          console.warn('[poll] Error checking court bookings:', err.message);
+          return null;
+        })
       ]);
+
+      if (avail || bookingsRes) {
+        courtCheckPerformed = true;
+      }
 
       const bookings = bookingsRes?.bookings || [];
       for (const b of bookings) {
@@ -5911,10 +5915,17 @@ async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWor
       if (avail?.slots && avail.slots.length > 0) {
         const slot = avail.slots[0];
         for (const c of slot.courts) {
-          if (
+          if (isIgnoredCourt(c.court)) continue;
+          if (c.status === 'prebooked' && !seenPrebooked.has(c.court)) {
+            prebookedCourts.push({
+              court: c.court,
+              player: c.prebookedBy || 'Member',
+              fullName: c.prebookedFullName || c.prebookedBy || 'Member'
+            });
+            seenPrebooked.add(c.court);
+          } else if (
             c.status === 'available' &&
             (c.availableMinutes || 0) >= 90 &&
-            !isIgnoredCourt(c.court) &&
             !seenPrebooked.has(c.court)
           ) {
             freeCourts.push({ court: c.court });
@@ -5922,9 +5933,47 @@ async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWor
         }
       }
     } catch (err) {
-      console.warn('[poll] Error checking court availability/bookings for auto poll:', err.message);
+      console.warn('[poll] Error checking court availability/bookings for poll:', err.message);
     }
 
+    const totalCourtsCount = prebookedCourts.length + freeCourts.length;
+    if (courtCheckPerformed && totalCourtsCount === 0) {
+      const displayDate = scvcc.formatDisplayDate(targetDateMDY);
+      const timeLabel = resolvedWhen || `${displayDate} at ${queryTime}`;
+      const noCourtsMsg = `⚠️ Cannot create poll for *${timeLabel}*: No live or prebooked courts are available at SCVCC (all courts are reserved or blocked).`;
+      console.log(`[poll] Cancelling poll creation in ${remoteJid}: no live or prebooked courts for ${timeLabel}`);
+      if (sock && remoteJid) {
+        try {
+          messageHistory.recordMessage(remoteJid, 'tenbot', noCourtsMsg, Date.now(), true);
+          await sock.sendMessage(remoteJid, { text: noCourtsMsg });
+        } catch (sendErr) {
+          console.error('[poll] Error sending no courts message:', sendErr.message);
+        }
+      }
+      return {
+        err: noCourtsMsg,
+        noCourtsAvailable: true,
+        message: noCourtsMsg
+      };
+    }
+  }
+
+  // If replacing an existing poll or user requested modifications, delete older poll from WhatsApp
+  let replacedOldPoll = false;
+  if (replacePollId && activePolls.has(replacePollId)) {
+    await cancelOrDeletePoll(sock, remoteJid, replacePollId);
+    replacedOldPoll = true;
+  } else if (cancelExisting) {
+    for (const [pollId, pollState] of [...activePolls.entries()].reverse()) {
+      if (pollState.remoteJid === remoteJid && pollState.status === 'active' && !pollState.isManual) {
+        await cancelOrDeletePoll(sock, remoteJid, pollId);
+        replacedOldPoll = true;
+        break;
+      }
+    }
+  }
+
+  if (isAuto) {
     selectedPrebooked = prebookedCourts.slice(0, 3);
     const remainingNeeded = Math.min(freeCourts.length, Math.max(0, 3 - selectedPrebooked.length));
     const selectedFree = freeCourts.slice(0, remainingNeeded);
@@ -5989,78 +6038,34 @@ async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWor
       values = Array.from({ length: count }, (_, i) => `Player ${i + startIdx}`);
     }
 
-    // Obtain available courts from SCVCC (available for >= 90 mins, excluding Court 4) if not disabled
-    if (!noCourts && queryTime) {
-      try {
-        const avail = await scvcc.checkCourtAvailability({
-          when: targetDateMDY,
-          time: queryTime,
-          sport: 'tennis'
-        });
-        if (avail && avail.success) {
-          let openCourts = 0;
-          if (avail.slots && avail.slots.length > 0) {
-            const slot = avail.slots[0];
-            openCourts = slot.courts.filter(c => 
-              c.status === 'available' && 
-              (c.availableMinutes || 0) >= 90 && 
-              !isIgnoredCourt(c.court)
-            ).length;
-          } else if (typeof avail.totalAvailable === 'number') {
-            openCourts = avail.totalAvailable;
-          }
-          const courtWord = openCourts === 1 ? 'COURT' : 'COURTS';
-          const rawCourtText = `${openCourts} ${courtWord} AVAILABLE`;
-          const largeCourtText = rawCourtText.replace(/[A-Z0-9]/g, (ch) => {
-            const code = ch.charCodeAt(0);
-            if (code >= 48 && code <= 57) return String.fromCodePoint(0x1D7EC + (code - 48));
-            if (code >= 65 && code <= 90) return String.fromCodePoint(0x1D5D4 + (code - 65));
-            return ch;
-          });
-          courtLine = `\n\n_${largeCourtText}_\n`;
-        }
-      } catch (err) {
-        console.warn('[poll] Could not fetch SCVCC court availability for poll title:', err.message);
-      }
+    const totalCourtsCount = prebookedCourts.length + freeCourts.length;
+    if (!noCourts && totalCourtsCount > 0) {
+      const courtWord = totalCourtsCount === 1 ? 'COURT' : 'COURTS';
+      const rawCourtText = `${totalCourtsCount} ${courtWord} AVAILABLE`;
+      const largeCourtText = rawCourtText.replace(/[A-Z0-9]/g, (ch) => {
+        const code = ch.charCodeAt(0);
+        if (code >= 48 && code <= 57) return String.fromCodePoint(0x1D7EC + (code - 48));
+        if (code >= 65 && code <= 90) return String.fromCodePoint(0x1D5D4 + (code - 65));
+        return ch;
+      });
+      courtLine = `\n\n_${largeCourtText}_\n`;
     }
   } else {
     values = ['Yes', 'No'];
 
-    if (!noCourts && queryTime) {
-      try {
-        const avail = await scvcc.checkCourtAvailability({
-          when: targetDateMDY,
-          time: queryTime,
-          sport: 'tennis'
-        });
-        if (avail && avail.success) {
-          let openCourts = 0;
-          if (avail.slots && avail.slots.length > 0) {
-            const slot = avail.slots[0];
-            openCourts = slot.courts.filter(c => 
-              c.status === 'available' && 
-              (c.availableMinutes || 0) >= 90 && 
-              !isIgnoredCourt(c.court)
-            ).length;
-          } else if (typeof avail.totalAvailable === 'number') {
-            openCourts = avail.totalAvailable;
-          }
-          const courtWord = openCourts === 1 ? 'COURT' : 'COURTS';
-          const rawCourtText = `${openCourts} ${courtWord} AVAILABLE`;
-          const largeCourtText = rawCourtText.replace(/[A-Z0-9]/g, (ch) => {
-            const code = ch.charCodeAt(0);
-            if (code >= 48 && code <= 57) return String.fromCodePoint(0x1D7EC + (code - 48));
-            if (code >= 65 && code <= 90) return String.fromCodePoint(0x1D5D4 + (code - 65));
-            return ch;
-          });
-          courtLine = `\n\n_${largeCourtText}_\n`;
-        }
-      } catch (err) {
-        console.warn('[poll] Could not fetch SCVCC court availability for poll title:', err.message);
-      }
+    const totalCourtsCount = prebookedCourts.length + freeCourts.length;
+    if (!noCourts && totalCourtsCount > 0) {
+      const courtWord = totalCourtsCount === 1 ? 'COURT' : 'COURTS';
+      const rawCourtText = `${totalCourtsCount} ${courtWord} AVAILABLE`;
+      const largeCourtText = rawCourtText.replace(/[A-Z0-9]/g, (ch) => {
+        const code = ch.charCodeAt(0);
+        if (code >= 48 && code <= 57) return String.fromCodePoint(0x1D7EC + (code - 48));
+        if (code >= 65 && code <= 90) return String.fromCodePoint(0x1D5D4 + (code - 65));
+        return ch;
+      });
+      courtLine = `\n\n_${largeCourtText}_\n`;
     }
   }
-
   const timeLabel = resolvedWhen ? resolvedWhen : 'today';
 
   const hasPrebooked = Array.isArray(prebookedCourtPlayers) && prebookedCourtPlayers.length > 0 && includePrebookedSpots;
@@ -7351,3 +7356,9 @@ if (require.main === module) {
 
   launchBot();
 }
+
+module.exports = {
+  createMatchPoll,
+  handleDirectPollCreation,
+  handleMessage
+};
