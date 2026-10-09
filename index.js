@@ -113,6 +113,7 @@ const namesStore = require('./lib/names');
 const messageHistory = require('./lib/messageHistory');
 const recurringPollsModule = require('./lib/recurringPolls');
 const scvcc = require('./lib/scvcc');
+const groupsConfig = require('./lib/groupsConfig');
 const anthropic = require('./lib/anthropic');
 const { helpText } = require('./lib/help');
 const { resolvePlayDateTime, getSanJoseNow, getSanJoseParts, parseTimeString } = require('./lib/pollTime');
@@ -829,6 +830,14 @@ const CLAUDE_TOOLS = [
     }
   },
 
+  {
+    name: "list_groups",
+    description: "Lists all WhatsApp groups the bot is currently a participating member of, showing group names, WhatsApp JIDs, participant counts, and configuration status.",
+    input_schema: {
+      type: "object",
+      properties: {}
+    }
+  },
 ];
 
 // How many past messages (per chat) to keep for conversational context
@@ -841,17 +850,14 @@ if (!process.env.ANTHROPIC_API_KEY) {
   );
 }
 
-if (!process.env.TARGET_GROUP_NAME) {
-  console.error(
-    '❌  No TARGET_GROUP_NAME found in environment. Copy .env.example to .env');
-  throw new Error('No TARGET_GROUP_NAME found in environment.');
+if (groupsConfig.hasWhitelist()) {
+  const whitelisted = groupsConfig.getWhitelistedGroups();
+  console.log(`✅ Group whitelist active: [${whitelisted.join(", ")}]`);
+} else {
+  console.log("🌐 Multi-group mode (open): Bot is listening to all groups it is added to.");
 }
 
-
-// Set this to the exact group name (subject) you want the bot to listen to.
-// Leave as null to have the bot log every group name/ID it sees, so you can
-// find the right one.
-const TARGET_GROUP_NAME = process.env.TARGET_GROUP_NAME;
+const TARGET_GROUP_NAME = process.env.TARGET_GROUP_NAME || null;
 
 
 // In-memory conversation history per chat: chatId -> [{role, content}, ...]
@@ -891,8 +897,8 @@ const storeKey = (remoteJid, id) => `${remoteJid}:${id}`;
 namesStore.defaultMissingFullNames();
 ratings.syncRatingsWithNames();
 
-function persistPolls() {
-  pollStore.save({ messageStore, activePolls, latestPollIdByChat, recurringPolls });
+function persistPolls(chatId = null) {
+  pollStore.save({ messageStore, activePolls, latestPollIdByChat, recurringPolls }, chatId);
 }
 
 function escapeRegex(str) {
@@ -1511,21 +1517,133 @@ function recordName(jid, name, explicitPn = null) {
 /**
  * Retrieves the target group JID (caching if necessary).
  */
-async function getTargetGroupJid(sock) {
+async function getAdminGroupsForUser(sock, senderJid) {
+  if (!sock || !senderJid) return [];
+  const adminGroups = [];
+  try {
+    let groups = groupMetadataCache;
+    if (groups.size === 0) {
+      const fetched = await sock.groupFetchAllParticipating();
+      for (const [gId, gMeta] of Object.entries(fetched)) {
+        groupMetadataCache.set(gId, gMeta);
+      }
+      groups = groupMetadataCache;
+    }
+
+    const normUser = jidNormalizedUser(senderJid);
+    const pnUser = namesStore.getPnByLid(normUser) || (normUser?.endsWith("@s.whatsapp.net") ? normUser : null);
+    const lidUser = namesStore.resolveCanonicalId(normUser) || (normUser?.endsWith("@lid") ? normUser : null);
+
+    for (const [gId, gMeta] of groups.entries()) {
+      if (!groupsConfig.isGroupAllowed(gId, gMeta.subject)) continue;
+      if (!gMeta.participants) continue;
+
+      const participant = gMeta.participants.find((p) => {
+        const pPn = jidNormalizedUser(p.id || p.jid);
+        const pLid = jidNormalizedUser(p.lid);
+        return (
+          pPn === normUser ||
+          pLid === normUser ||
+          (pnUser && (pPn === pnUser || pLid === pnUser)) ||
+          (lidUser && (pPn === lidUser || pLid === lidUser))
+        );
+      });
+
+      if (participant && (participant.admin === "admin" || participant.admin === "superadmin")) {
+        adminGroups.push({ id: gId, name: gMeta.subject || gId });
+      }
+    }
+  } catch (err) {
+    console.error("Failed to get admin groups for user:", err.message);
+  }
+  return adminGroups;
+}
+
+async function getTargetGroupJid(sock, senderJid = null) {
+  if (senderJid) {
+    const adminGroups = await getAdminGroupsForUser(sock, senderJid);
+    if (adminGroups.length > 0) return adminGroups[0].id;
+  }
   if (targetGroupJid) return targetGroupJid;
   try {
     const groups = await sock.groupFetchAllParticipating();
     for (const [gId, gMeta] of Object.entries(groups)) {
       groupMetadataCache.set(gId, gMeta);
-      if (gMeta.subject === process.env.TARGET_GROUP_NAME) {
+      if (groupsConfig.isGroupAllowed(gId, gMeta.subject)) {
         targetGroupJid = gId;
         return gId;
       }
     }
   } catch (err) {
-    console.error('Failed to fetch participating groups:', err.message);
+    console.error("Failed to fetch participating groups:", err.message);
   }
   return null;
+}
+
+/**
+ * Lists all WhatsApp groups the bot is currently a participating member of,
+ * displaying their group names (subjects), JIDs / LIDs, participant counts, and config status.
+ */
+async function handleListGroups(sock) {
+  const activeSock = sock || botSock;
+  let groups = {};
+
+  if (activeSock && typeof activeSock.groupFetchAllParticipating === "function") {
+    try {
+      groups = await activeSock.groupFetchAllParticipating();
+      if (groups && typeof groups === "object") {
+        for (const [gId, gMeta] of Object.entries(groups)) {
+          groupMetadataCache.set(gId, gMeta);
+        }
+      }
+    } catch (err) {
+      console.warn("[groups] Failed to fetch participating groups via socket, falling back to cache:", err.message);
+    }
+  }
+
+  // Fallback to cached group metadata if socket fetch returned empty or failed
+  if ((!groups || Object.keys(groups).length === 0) && groupMetadataCache.size > 0) {
+    groups = {};
+    for (const [gId, gMeta] of groupMetadataCache.entries()) {
+      groups[gId] = gMeta;
+    }
+  }
+
+  const groupEntries = Object.entries(groups || {});
+  if (groupEntries.length === 0) {
+    return "The bot is not currently a member of any WhatsApp groups.";
+  }
+
+  // Sort alphabetically by group subject
+  groupEntries.sort((a, b) => (a[1]?.subject || "").localeCompare(b[1]?.subject || ""));
+
+  const lines = [`👥 *WhatsApp Groups the bot is a member of* (${groupEntries.length}):\n`];
+
+  for (let i = 0; i < groupEntries.length; i++) {
+    const [gId, gMeta] = groupEntries[i];
+    const subject = gMeta?.subject || "Unnamed Group";
+    const count = Array.isArray(gMeta?.participants) ? gMeta.participants.length : (gMeta?.size || "Unknown");
+    const isAllowed = groupsConfig.isGroupAllowed(gId, subject);
+    const groupCfg = groupsConfig.getGroupConfig(gId, subject);
+
+    let statusNote = "";
+    if (!isAllowed) {
+      statusNote = " ⛔ [Not in whitelist]";
+    } else if (groupCfg?.alias || (groupCfg?.name && groupCfg.name !== gId)) {
+      statusNote = " ⚙️ [Configured in groups.json]";
+    }
+
+    lines.push(`${i + 1}. *${subject}*${statusNote}`);
+    lines.push(`   • JID: \`${gId}\``);
+    lines.push(`   • Members: ${count}`);
+    if (groupCfg?.alias) {
+      lines.push(`   • Alias: ${groupCfg.alias}`);
+    }
+    lines.push("");
+  }
+
+  lines.push("💡 _Use the group JID as the key in groups.json for group-specific configuration._");
+  return lines.join("\n").trim();
 }
 
 async function isUserAdmin(sock, remoteJid, senderJid) {
@@ -1698,9 +1816,10 @@ async function getGroupMetadata(sock, remoteJid) {
     }
   }
 
-  // Only record participant name and LID mappings for the target group
-  const isTarget = (targetGroupJid && remoteJid === targetGroupJid) || (metadata?.subject === TARGET_GROUP_NAME);
-  if (isTarget && metadata?.participants) {
+  // Record participant name, LID mappings, and group membership for allowed groups
+  const isAllowed = groupsConfig.isGroupAllowed(remoteJid, metadata?.subject);
+  if (isAllowed && metadata?.participants) {
+    namesStore.setGroupMembers(remoteJid, metadata.participants);
     for (const p of metadata.participants) {
       const rawPn = p.id || p.jid;
       const rawLid = p.lid;
@@ -2775,11 +2894,11 @@ async function handleSetPollSlots(sock, chatId, sender, senderJid, targetId, cou
       try {
         await ratings.ensureRated(players);
         const prebookedCourts = await getPrebookedCourtsForPoll(matchedPollState);
-        const schedule = generateMatchups(players, { prebookedCourts });
+        const schedule = generateMatchups(players, { prebookedCourts, chatId: matchedPollState.remoteJid });
         const whenHeader = formatMatchHeaderTime(matchedPollState);
         const header = whenHeader ? `📅 ${whenHeader}\n\n` : '';
         await sock.sendMessage(matchedPollState.remoteJid, { text: header + formatMatchups(schedule) });
-        pairHistory.recordDraw(matchedPollId, schedule);
+        pairHistory.recordDraw(matchedPollId, schedule, Date.now(), matchedPollState.remoteJid);
         matchedPollState.lastSchedule = summarizeSchedule(schedule);
         persistPolls();
       } catch (err) {
@@ -3565,19 +3684,21 @@ async function startBot() {
       // Pre-warm group metadata cache so the very first message is recognized instantly
       try {
         const groups = await sock.groupFetchAllParticipating();
+        let allowedCount = 0;
         for (const [gId, gMeta] of Object.entries(groups)) {
           groupMetadataCache.set(gId, gMeta);
-          if (gMeta.subject === TARGET_GROUP_NAME) {
-            targetGroupJid = gId;
-            console.log(`[target-group] Pre-cached target group "${gMeta.subject}" (id: ${gId})`);
+          if (groupsConfig.isGroupAllowed(gId, gMeta.subject)) {
+            allowedCount++;
+            if (!targetGroupJid) targetGroupJid = gId;
+            namesStore.setGroupMembers(gId, gMeta.participants);
+            console.log(`[groups] Pre-cached allowed group "${gMeta.subject}" (id: ${gId})`);
 
-            // Only map participants for the TARGET_GROUP_NAME
             if (gMeta.participants) {
               for (const p of gMeta.participants) {
                 const rawPn = p.id || p.jid;
                 const rawLid = p.lid;
-                const pn = rawPn && rawPn.endsWith('@s.whatsapp.net') ? jidNormalizedUser(rawPn) : null;
-                const lid = rawLid && rawLid.endsWith('@lid') ? jidNormalizedUser(rawLid) : (rawPn && rawPn.endsWith('@lid') ? jidNormalizedUser(rawPn) : null);
+                const pn = rawPn && rawPn.endsWith("@s.whatsapp.net") ? jidNormalizedUser(rawPn) : null;
+                const lid = rawLid && rawLid.endsWith("@lid") ? jidNormalizedUser(rawLid) : (rawPn && rawPn.endsWith("@lid") ? jidNormalizedUser(rawPn) : null);
                 const name = p.name || p.notify || p.verifiedName;
                 if (pn && lid && pn !== lid) {
                   namesStore.setMapping(lid, pn, name);
@@ -3589,11 +3710,10 @@ async function startBot() {
             }
           }
         }
+        console.log(`✅ Tennis group bot is ready and listening for ${allowedCount} group(s).`);
       } catch (err) {
-        console.error('[groups] Failed to pre-fetch groups on connection open:', err.message);
+        console.error("[groups] Failed to pre-fetch groups on connection open:", err.message);
       }
-
-      console.log(`✅ Tennis group bot is ready and listening for group ${TARGET_GROUP_NAME}.`);
 
       checkAndSendPollReminders(sock);
       recurringPollsModule.checkAndPostRecurringPolls({
@@ -3603,6 +3723,32 @@ async function startBot() {
         createMatchPoll,
         getTargetGroupJid
       });
+    }
+  });
+
+  // Track dynamic group participant joins and leaves
+  sock.ev.on("group-participants.update", async ({ id, participants, action }) => {
+    if (!id || !participants) return;
+    try {
+      const metadata = await getGroupMetadata(sock, id);
+      if (metadata && metadata.participants) {
+        namesStore.setGroupMembers(id, metadata.participants);
+        for (const p of metadata.participants) {
+          const rawPn = p.id || p.jid;
+          const rawLid = p.lid;
+          const pn = rawPn && rawPn.endsWith("@s.whatsapp.net") ? jidNormalizedUser(rawPn) : null;
+          const lid = rawLid && rawLid.endsWith("@lid") ? jidNormalizedUser(rawLid) : (rawPn && rawPn.endsWith("@lid") ? jidNormalizedUser(rawPn) : null);
+          const name = p.name || p.notify || p.verifiedName;
+          if (pn && lid && pn !== lid) {
+            namesStore.setMapping(lid, pn, name);
+          } else if (name) {
+            if (pn) recordName(pn, name);
+            if (lid) recordName(lid, name);
+          }
+        }
+      }
+    } catch (e) {
+      console.error("[group-participants] Error updating group participants:", e.message);
     }
   });
 
@@ -3616,31 +3762,30 @@ async function startBot() {
 
       if (!isGroup && !isDirect) continue;
 
-      let groupName = 'Direct Message';
-      let isTargetGroup = false;
+      let groupName = "Direct Message";
+      let isAllowedGroup = false;
 
       if (isGroup) {
         const metadata = await getGroupMetadata(sock, remoteJid);
         groupName = metadata?.subject || remoteJid;
-        isTargetGroup = (targetGroupJid && remoteJid === targetGroupJid) || (groupName === TARGET_GROUP_NAME);
+        isAllowedGroup = groupsConfig.isGroupAllowed(remoteJid, groupName);
 
-        if (!TARGET_GROUP_NAME) {
-          console.log(`[Group seen] "${groupName}" (id: ${remoteJid})`);
-          continue;
+        if (!isAllowedGroup) {
+          continue; // Ignore messages not meant for allowed groups
         }
 
-        if (!isTargetGroup) {
-          continue; // Ignore messages not meant for TARGET_GROUP_NAME
+        // Ensure group members are tracked in namesStore
+        if (metadata?.participants && !namesStore.getGroupMembers(remoteJid)) {
+          namesStore.setGroupMembers(remoteJid, metadata.participants);
         }
       } else if (isDirect) {
-        // Direct message: only allowed if sender is an admin of TARGET_GROUP_NAME
-        const targetJid = await getTargetGroupJid(sock);
-        const isAdmin = await isUserAdmin(sock, targetJid, remoteJid);
-        if (!isAdmin) {
+        // Direct message: only allowed if sender is an admin of at least ONE allowed group
+        const adminGroups = await getAdminGroupsForUser(sock, remoteJid);
+        if (adminGroups.length === 0) {
           console.log(`[DM] Ignored direct message from non-admin user ${remoteJid}`);
           continue;
         }
-        console.log(`[DM] Authorized admin direct message received from ${remoteJid} (${msg.pushName || 'Admin'})`);
+        console.log(`[DM] Authorized admin direct message received from ${remoteJid} (${msg.pushName || "Admin"}), admin of ${adminGroups.length} group(s)`);
       }
 
       // Check for message revocation (deleted for everyone in WhatsApp)
@@ -3780,11 +3925,9 @@ async function startBot() {
       for (const { key, update } of updates) {
         const remoteJid = key?.remoteJid || update.key?.remoteJid;
         if (!remoteJid || !remoteJid.endsWith('@g.us')) continue;
-        if (TARGET_GROUP_NAME) {
-          const metadata = await getGroupMetadata(sock, remoteJid);
-          const groupName = metadata?.subject || remoteJid;
-          if (groupName !== TARGET_GROUP_NAME) continue;
-        }
+        const metadata = await getGroupMetadata(sock, remoteJid);
+        const groupName = metadata?.subject || remoteJid;
+        if (!groupsConfig.isGroupAllowed(remoteJid, groupName)) continue;
 
         // Check if a tracked poll message was revoked/deleted (message set to null)
         if (update && update.message === null) {
@@ -3813,10 +3956,10 @@ async function startBot() {
   sock.ev.on('messages.delete', async (item) => {
     try {
       const jid = item.jid || (Array.isArray(item.keys) && item.keys[0]?.remoteJid);
-      if (jid && jid.endsWith('@g.us') && TARGET_GROUP_NAME) {
+      if (jid && jid.endsWith("@g.us")) {
         const metadata = await getGroupMetadata(sock, jid);
         const groupName = metadata?.subject || jid;
-        if (groupName !== TARGET_GROUP_NAME) return;
+        if (!groupsConfig.isGroupAllowed(jid, groupName)) return;
       }
 
       if (item.all && item.jid) {
@@ -3937,7 +4080,7 @@ async function executeTool(sock, chatId, sender, toolUse, msg) {
     if (!canManage) {
       return '⚠️ Only group admins can add aliases for other players. You can add aliases for yourself.';
     }
-    const res = namesStore.addAliasForPlayer(player, alias);
+    const res = namesStore.addAliasForPlayer(player, alias, null, chatId);
     if (res) {
       return `Added alias "${alias}" for player "${res.name}". Current aliases: [${res.aliases.join(', ')}].`;
     }
@@ -3952,7 +4095,7 @@ async function executeTool(sock, chatId, sender, toolUse, msg) {
     const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
     let resolvedPlayer = targetPlayer;
     if (!resolvedPlayer) {
-      const match = namesStore.findIdByNameOrAlias(targetAlias);
+      const match = namesStore.findIdByNameOrAlias(targetAlias, chatId);
       if (match) resolvedPlayer = match.entry?.name;
     }
 
@@ -3961,7 +4104,7 @@ async function executeTool(sock, chatId, sender, toolUse, msg) {
       return '⚠️ Only group admins can delete aliases for other players. You can delete aliases for yourself.';
     }
 
-    const res = namesStore.removeAliasForPlayer(targetPlayer, targetAlias);
+    const res = namesStore.removeAliasForPlayer(targetPlayer, targetAlias, chatId);
     if (res) {
       return `Removed alias "${res.removed}" from player "${res.name}". Current aliases: [${res.aliases.join(', ')}].`;
     }
@@ -4051,16 +4194,22 @@ async function executeTool(sock, chatId, sender, toolUse, msg) {
     const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
     return await handleCancelRecurringPoll(sock, chatId, sender, senderJid, input.scheduleId);
   }
-    if (name === 'get_court_bookings' || name === 'get_court_reservations') {
-    const res = await scvcc.getCourtBookings(input);
+    if (name === "list_groups" || name === "get_groups") {
+    if (chatId && chatId.endsWith("@g.us")) {
+      return "⚠️ The !groups command can only be called via Direct Message (DM) with the bot.";
+    }
+    return await handleListGroups(sock);
+  }
+  if (name === 'get_court_bookings' || name === 'get_court_reservations') {
+    const res = await scvcc.getCourtBookings({ ...input, chatId });
     return res?.message || 'Retrieved court bookings.';
   }
   if (name === 'check_court_availability') {
-    const res = await scvcc.checkCourtAvailability(input);
+    const res = await scvcc.checkCourtAvailability({ ...input, chatId });
     return res?.message || 'Checked court availability.';
   }
   if (name === 'book_court') {
-    const res = await scvcc.bookCourt({ ...input, requester: input.requester || sender });
+    const res = await scvcc.bookCourt({ ...input, requester: input.requester || sender, chatId });
     return res?.message || 'Court booked.';
   }
   if (name === 'get_my_court_bookings') {
@@ -4359,12 +4508,12 @@ async function handleManualLineup(sock, chatId, sender, lineup, msg, rawText = '
     targetPollState.status = 'resolved';
     targetPollState.lastPlayers = lineup.players;
     targetPollState.lastSchedule = lineup;
-    pairHistory.recordDraw(targetPollId, lineup);
+    pairHistory.recordDraw(targetPollId, lineup, Date.now(), chatId);
     await ratings.ensureRated(lineup.players);
     persistPolls();
     console.log(`[lineup] Attributed manual lineup to poll ${targetPollId} in ${chatId} [${matchResult.matchInfo}] (${lineup.players.length} players: ${lineup.players.join(', ')})`);
   } else {
-    pairHistory.recordDraw(`manual_${Date.now()}`, lineup);
+    pairHistory.recordDraw(`manual_${Date.now()}`, lineup, Date.now(), chatId);
     await ratings.ensureRated(lineup.players);
     console.log(`[lineup] Recorded standalone manual lineup in ${chatId} (${lineup.players.length} players: ${lineup.players.join(', ')})`);
   }
@@ -4401,6 +4550,21 @@ async function getResponse(sock, rawText, chatId, sender, msg) {
     return helpText(specificCmd || null);
   }
 
+  if (
+    lower === "!groups" || lower.startsWith("!groups ") ||
+    lower === "!listgroups" || lower.startsWith("!listgroups ") ||
+    lower === "!mygroups" ||
+    lower === "!getgroups" ||
+    lower === "!allgroups" ||
+    lower === "!groupids" ||
+    lower === "!grouplids"
+  ) {
+    if (chatId && chatId.endsWith("@g.us")) {
+      return "⚠️ The `!groups` command can only be called via Direct Message (DM) with the bot.";
+    }
+    return await handleListGroups(sock);
+  }
+
   if (lower === '!reset') {
     const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
     const isAdmin = await isUserAdmin(sock, chatId, senderJid);
@@ -4419,13 +4583,13 @@ async function getResponse(sock, rawText, chatId, sender, msg) {
       lower === '!reservations' || lower.startsWith('!reservations ') ||
       lower === '!courtschedule' || lower.startsWith('!courtschedule ')) {
     const parsed = scvcc.parseBookingsCommand(text);
-    const res = await scvcc.getCourtBookings(parsed);
+    const res = await scvcc.getCourtBookings({ ...parsed, chatId });
     return res?.message || 'Could not retrieve court bookings.';
   }
 
   if (lower === '!courts' || lower.startsWith('!courts ') || lower === '!courtstatus' || lower.startsWith('!courtstatus ') || lower === '!courtavailability' || lower.startsWith('!courtavailability ')) {
     const parsed = scvcc.parseCourtsCommand(text);
-    const res = await scvcc.checkCourtAvailability(parsed);
+    const res = await scvcc.checkCourtAvailability({ ...parsed, chatId });
     return res?.message || 'Could not retrieve court status.';
   }
 
@@ -4476,7 +4640,7 @@ async function getResponse(sock, rawText, chatId, sender, msg) {
     if (!canManage) {
       return '⚠️ Only group admins can add aliases for other players. You can add aliases for yourself (e.g. "!alias <your alias>").';
     }
-    const res = namesStore.addAliasForPlayer(parsed.name, parsed.alias, senderJid);
+    const res = namesStore.addAliasForPlayer(parsed.name, parsed.alias, senderJid, chatId);
     if (res) {
       return `✅ Added alias "${parsed.alias}" for player "${res.name}". Current aliases: [${res.aliases.join(', ')}].`;
     } else {
@@ -4495,7 +4659,7 @@ async function getResponse(sock, rawText, chatId, sender, msg) {
     const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
     let resolvedPlayer = targetPlayer;
     if (!resolvedPlayer) {
-      const match = namesStore.findIdByNameOrAlias(targetAlias);
+      const match = namesStore.findIdByNameOrAlias(targetAlias, chatId);
       if (match) resolvedPlayer = match.entry?.name;
     }
 
@@ -4504,7 +4668,7 @@ async function getResponse(sock, rawText, chatId, sender, msg) {
       return '⚠️ Only group admins can delete aliases for other players. You can delete aliases for yourself (e.g. "!deletealias <your alias>").';
     }
 
-    const res = namesStore.removeAliasForPlayer(targetPlayer, targetAlias);
+    const res = namesStore.removeAliasForPlayer(targetPlayer, targetAlias, chatId);
     if (res) {
       return `✅ Removed alias "${res.removed}" from player "${res.name}". Current aliases: [${res.aliases.join(', ')}].`;
     } else {
@@ -4549,7 +4713,7 @@ async function getResponse(sock, rawText, chatId, sender, msg) {
   }
 
   if (lower === '!ratings') {
-    return formatRatings();
+    return formatRatings(chatId);
   }
 
   // --- TennisRecord Certificate Check Management ---
@@ -5089,7 +5253,7 @@ async function handleSetRating(sock, chatId, senderJid, senderName, playerName, 
     targetJid = senderJid || null;
     resolvedPlayerName = senderName !== 'Someone' ? senderName : (senderJid ? nameFor(senderJid) : 'Player');
   } else {
-    const match = namesStore.findIdByNameOrAlias(targetPlayer);
+    const match = namesStore.findIdByNameOrAlias(targetPlayer, chatId);
     if (match) {
       targetJid = match.id || null;
       resolvedPlayerName = match.entry?.name || targetPlayer;
@@ -5118,7 +5282,7 @@ async function handleResetRating(sock, chatId, senderJid, senderName, playerName
     targetJid = senderJid || null;
     resolvedPlayerName = senderName !== 'Someone' ? senderName : (senderJid ? nameFor(senderJid) : 'Player');
   } else {
-    const match = namesStore.findIdByNameOrAlias(targetPlayer);
+    const match = namesStore.findIdByNameOrAlias(targetPlayer, chatId);
     if (match) {
       targetJid = match.id || null;
       resolvedPlayerName = match.entry?.name || targetPlayer;
@@ -5179,7 +5343,7 @@ async function canUserManagePlayerAlias(sock, chatId, senderJid, senderName, tar
     const senderCanonical = nameFor(senderJid);
     if (senderCanonical && ratings.keyFor(senderCanonical) === tKey) return true;
 
-    const match = namesStore.findIdByNameOrAlias(targetPlayer);
+    const match = namesStore.findIdByNameOrAlias(targetPlayer, chatId);
     if (match) {
       const normSender = jidNormalizedUser(senderJid);
       const pn = namesStore.getPnByLid(normSender) || (normSender?.endsWith('@s.whatsapp.net') ? normSender : null);
@@ -5205,7 +5369,7 @@ async function handleSetFullName(sock, chatId, senderJid, senderName, playerName
   }
 
   let targetId = null;
-  const match = namesStore.findIdByNameOrAlias(targetPlayer);
+  const match = namesStore.findIdByNameOrAlias(targetPlayer, chatId);
   if (match) {
     targetId = match.id;
   } else if (senderJid) {
@@ -5522,12 +5686,34 @@ function handleFreeformScore(candidates, chatId, sender) {
 }
 
 /** Lists current player ratings, strongest first. */
-function formatRatings() {
+function formatRatings(chatId = null) {
   const board = ratings.getAllRatings();
   if (board.length === 0) {
     return `Nobody's rated yet -- everyone starts from their TennisRecord rating (or ${ratings.formatRating(ratings.INITIAL_RATING)}) once they play a poll or set their rating.`;
   }
-  const lines = board.map((p, i) => `${i + 1}. ${p.name} — ${ratings.formatRating(p.rating)}`);
+  const groupMembers = chatId ? namesStore.getGroupMembers(chatId) : null;
+  const filteredBoard = groupMembers
+    ? board.filter((p) => {
+        const idNorm = (p.id || "").toLowerCase();
+        const numOnly = idNorm.split("@")[0];
+        const pnNorm = (p.pn || "").toLowerCase();
+        const pnNum = pnNorm.split("@")[0];
+        const nameKey = ratings.keyFor(p.name);
+        return (
+          groupMembers.has(idNorm) ||
+          (numOnly && groupMembers.has(numOnly)) ||
+          (pnNorm && groupMembers.has(pnNorm)) ||
+          (pnNum && groupMembers.has(pnNum)) ||
+          groupMembers.has(nameKey)
+        );
+      })
+    : board;
+
+  if (filteredBoard.length === 0) {
+    return `Nobody in this group has a recorded rating yet -- players start from their TennisRecord rating (or ${ratings.formatRating(ratings.INITIAL_RATING)}) once they vote in a match poll or set their rating.`;
+  }
+
+  const lines = filteredBoard.map((p, i) => `${i + 1}. ${p.name} — ${ratings.formatRating(p.rating)}`);
   return `📊 Player ratings (${ratings.formatRating(ratings.MIN_RATING)}–${ratings.MAX_RATING}):\n${lines.join('\n')}`;
 }
 
@@ -5892,11 +6078,11 @@ async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWor
 
     try {
       const [avail, bookingsRes] = await Promise.all([
-        scvcc.checkCourtAvailability({ when: targetDateMDY, time: queryTime, sport: 'tennis' }).catch((err) => {
+        scvcc.checkCourtAvailability({ when: targetDateMDY, time: queryTime, sport: 'tennis', chatId }).catch((err) => {
           console.warn('[poll] Error checking court availability:', err.message);
           return null;
         }),
-        scvcc.getCourtBookings({ when: targetDateMDY, time: queryTime, sport: 'tennis' }).catch((err) => {
+        scvcc.getCourtBookings({ when: targetDateMDY, time: queryTime, sport: 'tennis', chatId }).catch((err) => {
           console.warn('[poll] Error checking court bookings:', err.message);
           return null;
         })
@@ -6471,11 +6657,11 @@ async function processPollVoteEvent(sock, pollMessageKey, rawPollUpdates) {
 
     await ratings.ensureRated(players);
     const prebookedCourts = await getPrebookedCourtsForPoll(pollState);
-    const schedule = generateMatchups(players, { prebookedCourts });
+    const schedule = generateMatchups(players, { prebookedCourts, chatId: pollState.remoteJid });
     const whenHeader = formatMatchHeaderTime(pollState);
     const header = whenHeader ? `📅 ${whenHeader}\n\n` : '';
     await sock.sendMessage(pollState.remoteJid, { text: header + formatMatchups(schedule) });
-    pairHistory.recordDraw(pollId, schedule);
+    pairHistory.recordDraw(pollId, schedule, Date.now(), pollState.remoteJid);
 
     // Kept so "we won" reports can work out who the opponents were.
     pollState.lastSchedule = summarizeSchedule(schedule);
@@ -6621,7 +6807,7 @@ async function getPrebookedCourtsForPoll(pollState) {
       }
 
       if (targetDateMDY && queryTime) {
-        const bookingsRes = await scvcc.getCourtBookings({ when: targetDateMDY, time: queryTime, sport: "tennis" });
+        const bookingsRes = await scvcc.getCourtBookings({ when: targetDateMDY, time: queryTime, sport: "tennis", chatId });
         const seen = new Set();
         for (const b of bookingsRes?.bookings || []) {
           if (isIgnoredCourt(b.court)) continue;
@@ -6797,11 +6983,11 @@ async function generateMatchupsFromPoll(sock, chatId, specificPollId = null, spe
   const prebookedCourts = (options && Array.isArray(options.prebookedCourts) && options.prebookedCourts.length > 0)
     ? options.prebookedCourts
     : await getPrebookedCourtsForPoll(targetPollState);
-  const schedule = generateMatchups(players, { ...options, prebookedCourts });
+  const schedule = generateMatchups(players, { ...options, prebookedCourts, chatId });
   const whenHeader = formatMatchHeaderTime(targetPollState);
   const header = whenHeader ? `📅 ${whenHeader}\n\n` : '';
   await sock.sendMessage(chatId, { text: header + formatMatchups(schedule) });
-  pairHistory.recordDraw(targetPollId, schedule);
+  pairHistory.recordDraw(targetPollId, schedule, Date.now(), chatId);
   targetPollState.lastSchedule = summarizeSchedule(schedule);
   persistPolls();
   return null;
