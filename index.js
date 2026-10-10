@@ -116,7 +116,7 @@ const scvcc = require('./lib/scvcc');
 const groupsConfig = require('./lib/groupsConfig');
 const anthropic = require('./lib/anthropic');
 const { helpText } = require('./lib/help');
-const { resolvePlayDateTime, getSanJoseNow, getSanJoseParts, parseTimeString } = require('./lib/pollTime');
+const { resolvePlayDateTime, getSanJoseNow, getSanJoseParts, parseTimeString, WORD_TO_NUMBER, NUMBER_WORDS_PATTERN } = require('./lib/pollTime');
 
 // ---- CONFIG ----
 
@@ -201,7 +201,11 @@ const CLAUDE_TOOLS = [
       type: 'object',
       properties: {
         size: {
-          description: 'Total number of players for the match (2 for singles, 4/8/12/16 for doubles) or "auto" to automatically calculate spots (4, 8, or 12) based on SCVCC pre-booked and free courts. If omitted or not specified, a Yes/No opt-in poll is created.'
+          description: 'Total number of players for the match (2 for singles, 4/8/12/16 for doubles) or "auto" to automatically calculate spots (4, 8, or 12) based on SCVCC pre-booked and free courts. Words for numbers (e.g. "four", "two", "eight") map to their numeric values (4, 2, 8). Do not confuse court numbers (e.g. "court 2") with size. If omitted or not specified, a Yes/No opt-in poll is created.'
+        },
+        court: {
+          type: 'string',
+          description: 'Optional specific court for the match (e.g. "Court 2", "Court 3", "Pickleball 1").'
         },
         when: {
           type: 'string',
@@ -1287,7 +1291,7 @@ function parsePollCreationText(text) {
   if (!text) return null;
 
   const isPollCreationCommand = /^!(?:createpoll|poll|makepoll|newpoll|optinpoll|yesnopoll|createoptinpoll|createyesnopoll)\b/i.test(text);
-  const isPollCreationPhrase = /\b(?:create|make|post|start|set\s*up|setup|open)\s+(?:a\s+)?(?:match\s+)?(?:singles\s+|doubles\s+|yes\/no\s+|yesno\s+|opt-?in\s+)?poll\b|\bnew\s+(?:match\s+)?(?:singles\s+|doubles\s+|yes\/no\s+|yesno\s+|opt-?in\s+)?poll\b|\b(?:opt-?in|yes\s*\/\s*no|yesno)\s+poll\b|\bpoll\s+for\b/i.test(text);
+  const isPollCreationPhrase = /\b(?:create|make|post|start|set\s*up|setup|open|put|put\s*up|add|send|run|do)\s+(?:a\s+)?(?:match\s+)?(?:singles\s+|doubles\s+|yes\/no\s+|yesno\s+|opt-?in\s+)?poll\b|\bnew\s+(?:match\s+)?(?:singles\s+|doubles\s+|yes\/no\s+|yesno\s+|opt-?in\s+)?poll\b|\b(?:opt-?in|yes\s*\/\s*no|yesno)\s+poll\b|\bpoll\s+for\b/i.test(text);
 
   if (!isPollCreationCommand && !isPollCreationPhrase) {
     return null;
@@ -1323,6 +1327,25 @@ function parsePollCreationText(text) {
     when = dayWord.charAt(0).toUpperCase() + dayWord.slice(1).toLowerCase();
   }
 
+  // Extract court mention if any (e.g. "court 2", "Court 2", "ct 2", "pickleball 1")
+  let court = null;
+  const courtMatch = text.match(/\b(?:on\s+|at\s+|for\s+)?(?:the\s+)?(court\s*#?\s*\d+|pickleball\s*#?\s*\d+|pb\s*#?\s*\d+)\b/i);
+  if (courtMatch) {
+    const rawCourt = courtMatch[1].replace(/#/g, '').replace(/\s+/g, ' ').trim();
+    if (/^court\s*\d+$/i.test(rawCourt)) {
+      const num = rawCourt.match(/\d+/)[0];
+      court = `Court ${num}`;
+    } else if (/^pickleball\s*\d+$/i.test(rawCourt)) {
+      const num = rawCourt.match(/\d+/)[0];
+      court = `Pickleball ${num}`;
+    } else if (/^pb\s*\d+$/i.test(rawCourt)) {
+      const num = rawCourt.match(/\d+/)[0];
+      court = `PB ${num}`;
+    } else {
+      court = rawCourt;
+    }
+  }
+
   // Remove time patterns from text before parsing size so that times like "10:30am" or "10am" don't match as size 10
   let textWithoutTime = text;
   if (timeMatch) {
@@ -1330,26 +1353,46 @@ function parsePollCreationText(text) {
   }
   textWithoutTime = textWithoutTime.replace(/\b\d{1,2}(?:[:.]\d{2})?\s*(?:am|pm)\b/ig, ' ').replace(/\b\d{1,2}[:.]\d{2}\b/g, ' ');
 
+  // Remove specific court mentions before parsing size so that "court 2" doesn't match as size 2
+  let textCleanedForSize = textWithoutTime.replace(/\b(?:on\s+|at\s+|for\s+)?(?:the\s+)?(?:courts?|pickleball|pb)\s*#?\s*\d+\b/gi, ' ');
+
   // Determine size
   const isExplicitOptIn = /\b(?:opt-?in|yes\s*\/\s*no|yesno|open)\b/i.test(text) ||
     /^!(?:optinpoll|yesnopoll|createoptinpoll|createyesnopoll)\b/i.test(text);
   let size = null;
   if (!isExplicitOptIn) {
-    if (/\bauto\b/i.test(textWithoutTime) || /\bauto[-_\s]*(?:spots?|players?|courts?|size)\b/i.test(textWithoutTime)) {
+    if (/\bauto\b/i.test(textCleanedForSize) || /\bauto[-_\s]*(?:spots?|players?|courts?|size)\b/i.test(textCleanedForSize)) {
       size = 'auto';
     } else {
-      const sizeMatch = textWithoutTime.match(/\b(?:for|size|spots?|players?)\s*[:=]?\s*(\d+)\b/i) ||
-        textWithoutTime.match(/\b(\d+)\s*(?:spots?|players?|people|courts?)\b/i) ||
-        textWithoutTime.match(/\bpoll\s+for\s+(\d+)\b/i) ||
-        textWithoutTime.match(/^!(?:createpoll|poll|makepoll|newpoll)\s+(\d+)\b/i) ||
-        textWithoutTime.match(/\bcreate\s+(?:a\s+)?(?:match\s+)?poll\s+(\d+)\b/i) ||
-        textWithoutTime.match(/\b([248]|12|16)\s*(?:players?|spots?)?\b/i);
-      if (sizeMatch) {
-        size = parseInt(sizeMatch[1], 10);
-      } else if (/\bsingles\b/i.test(textWithoutTime)) {
-        size = 2;
-      } else if (/\bdoubles\b/i.test(textWithoutTime)) {
-        size = 4;
+      // 1 court -> 4 players, 2 courts -> 8 players, 3 courts -> 12 players
+      const courtCountMatch = textCleanedForSize.match(new RegExp(`\\b(\\d+|${NUMBER_WORDS_PATTERN})\\s+courts?\\b`, 'i'));
+      if (courtCountMatch) {
+        const raw = courtCountMatch[1].toLowerCase();
+        const count = WORD_TO_NUMBER[raw] || parseInt(raw, 10);
+        if (count > 0 && count <= 4) size = count * 4;
+      }
+
+      if (!size) {
+        const explicitMatch = textCleanedForSize.match(new RegExp(`\\b(?:for|size|spots?|players?)\\s*[:=]?\\s*(\\d+|${NUMBER_WORDS_PATTERN})\\b`, 'i')) ||
+          textCleanedForSize.match(new RegExp(`\\b(\\d+|${NUMBER_WORDS_PATTERN})\\s*(?:spots?|players?|people)\\b`, 'i')) ||
+          textCleanedForSize.match(new RegExp(`\\bpoll\\s+for\\s+(\\d+|${NUMBER_WORDS_PATTERN})\\b`, 'i')) ||
+          textCleanedForSize.match(new RegExp(`^!(?:createpoll|poll|makepoll|newpoll)\\s+(\\d+|${NUMBER_WORDS_PATTERN})\\b`, 'i')) ||
+          textCleanedForSize.match(new RegExp(`\\b(?:create|make|post|start|open|put)\\s+(?:a\\s+)?(?:match\\s+)?poll\\s+(\\d+|${NUMBER_WORDS_PATTERN})\\b`, 'i'));
+
+        if (explicitMatch) {
+          const raw = explicitMatch[1].toLowerCase();
+          size = WORD_TO_NUMBER[raw] || parseInt(raw, 10);
+        } else if (/\bsingles\b/i.test(textCleanedForSize)) {
+          size = 2;
+        } else if (/\bdoubles\b/i.test(textCleanedForSize)) {
+          size = 4;
+        } else {
+          const fallbackMatch = textCleanedForSize.match(new RegExp(`\\b([248]|12|16|two|four|eight|twelve|sixteen)\\s*(?:players?|spots?)?\\b`, 'i'));
+          if (fallbackMatch) {
+            const raw = fallbackMatch[1].toLowerCase();
+            size = WORD_TO_NUMBER[raw] || parseInt(raw, 10);
+          }
+        }
       }
     }
   }
@@ -1385,6 +1428,7 @@ function parsePollCreationText(text) {
     when,
     dayWord,
     timeWord,
+    court,
     includeCreator,
     cancelExisting,
     noMatchups,
@@ -1399,7 +1443,7 @@ function parsePollCreationText(text) {
  * Handles direct poll creation from parsed message parameters without calling the LLM.
  */
 async function handleDirectPollCreation(sock, chatId, sender, msg, parsed, opts = {}) {
-  const { size, when, dayWord, timeWord, includeCreator, cancelExisting, noMatchups, noCourts } = parsed;
+  const { size, when, dayWord, timeWord, court, includeCreator, cancelExisting, noMatchups, noCourts } = parsed;
   const includePrebookedSpots = parsed?.['prebooked-spots'] !== undefined
     ? parsed['prebooked-spots']
     : (parsed?.prebookedSpots !== undefined ? parsed.prebookedSpots : parsed?.includePrebookedSpots);
@@ -1423,7 +1467,10 @@ async function handleDirectPollCreation(sock, chatId, sender, msg, parsed, opts 
     isCommand,
     noMatchups || false,
     noCourts || false,
-    includePrebookedSpots || false
+    includePrebookedSpots || false,
+    false,
+    null,
+    court
   );
 
   if (res?.err) {
@@ -2507,17 +2554,35 @@ function parseModifyInstanceCommand(rawText) {
   }
 
   const updates = {};
+  let remForSize = rem;
+  const courtM = rem.match(/\b(?:on\s+|at\s+|for\s+)?(?:the\s+)?(court\s*#?\s*\d+|pickleball\s*#?\s*\d+|pb\s*#?\s*\d+)\b/i);
+  if (courtM) {
+    remForSize = remForSize.replace(courtM[0], ' ');
+    const rawCourt = courtM[1].replace(/#/g, '').replace(/\s+/g, ' ').trim();
+    if (/^court\s*\d+$/i.test(rawCourt)) {
+      updates.court = `Court ${rawCourt.match(/\d+/)[0]}`;
+    } else {
+      updates.court = rawCourt;
+    }
+  }
+  remForSize = remForSize.replace(/\b(?:on\s+|at\s+|for\s+)?(?:the\s+)?(?:courts?|pickleball|pb)\s*#?\s*\d+\b/gi, ' ');
+
   if (/\b(?:opt-?in|yes\s*\/\s*no|yesno|open)\b/i.test(rem)) {
     updates.type = 'opt_in';
     updates.size = null;
   } else if (/\bauto\b/i.test(rem)) {
     updates.size = 'auto';
   } else {
-    const sizeM = rem.match(/\b(?:for|size|spots?|players?)\s*[:=]?\s*(\d+)\b/i) ||
-                  rem.match(/\b(\d+)\s*(?:spots?|players?|people|courts?)\b/i) ||
-                  rem.match(/\b([248]|12|16)\b/);
+    const sizeM = remForSize.match(new RegExp(`\\b(?:for|size|spots?|players?)\\s*[:=]?\\s*(\\d+|${NUMBER_WORDS_PATTERN})\\b`, 'i')) ||
+                  remForSize.match(new RegExp(`\\b(\\d+|${NUMBER_WORDS_PATTERN})\\s*(?:spots?|players?|people)\\b`, 'i')) ||
+                  remForSize.match(new RegExp(`\\b([248]|12|16|two|four|eight|twelve|sixteen)\\b`, 'i'));
     if (sizeM) {
-      updates.size = parseInt(sizeM[1], 10);
+      const raw = sizeM[1].toLowerCase();
+      updates.size = WORD_TO_NUMBER[raw] || parseInt(raw, 10);
+    } else if (/\bsingles\b/i.test(remForSize)) {
+      updates.size = 2;
+    } else if (/\bdoubles\b/i.test(remForSize)) {
+      updates.size = 4;
     }
   }
 
@@ -2687,6 +2752,8 @@ async function handleModifyPollInstance(sock, chatId, sender, senderJid, targetI
 
   const targetRemoteJid = matchedPollState.remoteJid || effectiveChatId;
 
+  const newCourt = updates.court !== undefined ? updates.court : (matchedPollState.court || null);
+
   const res = await createMatchPoll(
     sock,
     targetRemoteJid,
@@ -2704,7 +2771,8 @@ async function handleModifyPollInstance(sock, chatId, sender, senderJid, targetI
     noCourts,
     includePrebookedSpots,
     isRecurring,
-    schedId
+    schedId,
+    newCourt
   );
 
   if (res?.err) {
@@ -4044,6 +4112,7 @@ async function executeTool(sock, chatId, sender, toolUse, msg) {
     const when = input.when || null;
     const dayWord = input.dayWord || null;
     const timeWord = input.timeWord || null;
+    const court = input.court || null;
     const includeCreator = input.includeCreator !== false;
     const cancelExisting = input.cancelExisting === true;
     const replacePollId = input.replacePollId || null;
@@ -4054,7 +4123,7 @@ async function executeTool(sock, chatId, sender, toolUse, msg) {
     const noMatchups = input.noMatchups === true || input.autoMatchups === false;
     const noCourts = input.noCourts === true || input.includeCourts === false;
     const includePrebookedSpots = input['prebooked-spots'] === true || input.prebookedSpots === true || input.includePrebookedSpots === true;
-    const res = await createMatchPoll(sock, targetChatId, size, when, dayWord, timeWord, creatorName, creatorJid, includeCreator, replacePollId, cancelExisting, false, noMatchups, noCourts, includePrebookedSpots);
+    const res = await createMatchPoll(sock, targetChatId, size, when, dayWord, timeWord, creatorName, creatorJid, includeCreator, replacePollId, cancelExisting, false, noMatchups, noCourts, includePrebookedSpots, false, null, court);
     if (res?.err) {
       return `Could not create poll: ${res.err}`;
     }
@@ -5940,7 +6009,7 @@ const inFlightPollCreations = new Set();
  *   "Yes" and "No". The bot then waits for a user prompt to generate matchups from Yes voters.
  * - If replacePollId or cancelExisting is specified, deletes the older poll from WhatsApp.
  */
-async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWord = null, timeWord = null, creatorName = null, creatorJid = null, includeCreator = true, replacePollId = null, cancelExisting = false, isCommand = false, noMatchups = false, noCourts = false, includePrebookedSpots = false, isRecurring = false, scheduleId = null) {
+async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWord = null, timeWord = null, creatorName = null, creatorJid = null, includeCreator = true, replacePollId = null, cancelExisting = false, isCommand = false, noMatchups = false, noCourts = false, includePrebookedSpots = false, isRecurring = false, scheduleId = null, targetCourt = null) {
   const isAuto = size === 'auto' || String(size).toLowerCase() === 'auto';
   const isOptIn = !size && !isAuto;
 
@@ -6131,6 +6200,15 @@ async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWor
       console.warn('[poll] Error checking court availability/bookings for poll:', err.message);
     }
 
+    if (targetCourt && !seenPrebooked.has(targetCourt)) {
+      prebookedCourts.push({
+        court: targetCourt,
+        player: creatorName || 'Member',
+        fullName: creatorName || 'Member'
+      });
+      seenPrebooked.add(targetCourt);
+    }
+
     const totalCourtsCount = prebookedCourts.length + freeCourts.length;
     if (courtCheckPerformed && totalCourtsCount === 0) {
       const displayDate = scvcc.formatDisplayDate(targetDateMDY);
@@ -6234,31 +6312,63 @@ async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWor
     }
 
     const totalCourtsCount = prebookedCourts.length + freeCourts.length;
-    if (!noCourts && totalCourtsCount > 0) {
-      const courtWord = totalCourtsCount === 1 ? 'COURT' : 'COURTS';
-      const rawCourtText = `${totalCourtsCount} ${courtWord} AVAILABLE`;
-      const largeCourtText = rawCourtText.replace(/[A-Z0-9]/g, (ch) => {
-        const code = ch.charCodeAt(0);
-        if (code >= 48 && code <= 57) return String.fromCodePoint(0x1D7EC + (code - 48));
-        if (code >= 65 && code <= 90) return String.fromCodePoint(0x1D5D4 + (code - 65));
-        return ch;
-      });
-      courtLine = `\n\n_${largeCourtText}_\n`;
+    if (!noCourts) {
+      if (targetCourt) {
+        const pbMatch = prebookedCourts.find(pb => pb.court.toLowerCase() === targetCourt.toLowerCase());
+        if (pbMatch && pbMatch.player && pbMatch.player !== 'Member') {
+          courtLine = `\n\n${targetCourt} - ${pbMatch.player}'s Booking\n`;
+        } else {
+          const rawCourtText = `${targetCourt.toUpperCase()} AVAILABLE`;
+          const largeCourtText = rawCourtText.replace(/[A-Z0-9]/g, (ch) => {
+            const code = ch.charCodeAt(0);
+            if (code >= 48 && code <= 57) return String.fromCodePoint(0x1D7EC + (code - 48));
+            if (code >= 65 && code <= 90) return String.fromCodePoint(0x1D5D4 + (code - 65));
+            return ch;
+          });
+          courtLine = `\n\n_${largeCourtText}_\n`;
+        }
+      } else if (totalCourtsCount > 0) {
+        const courtWord = totalCourtsCount === 1 ? 'COURT' : 'COURTS';
+        const rawCourtText = `${totalCourtsCount} ${courtWord} AVAILABLE`;
+        const largeCourtText = rawCourtText.replace(/[A-Z0-9]/g, (ch) => {
+          const code = ch.charCodeAt(0);
+          if (code >= 48 && code <= 57) return String.fromCodePoint(0x1D7EC + (code - 48));
+          if (code >= 65 && code <= 90) return String.fromCodePoint(0x1D5D4 + (code - 65));
+          return ch;
+        });
+        courtLine = `\n\n_${largeCourtText}_\n`;
+      }
     }
   } else {
     values = ['Yes', 'No'];
 
     const totalCourtsCount = prebookedCourts.length + freeCourts.length;
-    if (!noCourts && totalCourtsCount > 0) {
-      const courtWord = totalCourtsCount === 1 ? 'COURT' : 'COURTS';
-      const rawCourtText = `${totalCourtsCount} ${courtWord} AVAILABLE`;
-      const largeCourtText = rawCourtText.replace(/[A-Z0-9]/g, (ch) => {
-        const code = ch.charCodeAt(0);
-        if (code >= 48 && code <= 57) return String.fromCodePoint(0x1D7EC + (code - 48));
-        if (code >= 65 && code <= 90) return String.fromCodePoint(0x1D5D4 + (code - 65));
-        return ch;
-      });
-      courtLine = `\n\n_${largeCourtText}_\n`;
+    if (!noCourts) {
+      if (targetCourt) {
+        const pbMatch = prebookedCourts.find(pb => pb.court.toLowerCase() === targetCourt.toLowerCase());
+        if (pbMatch && pbMatch.player && pbMatch.player !== 'Member') {
+          courtLine = `\n\n${targetCourt} - ${pbMatch.player}'s Booking\n`;
+        } else {
+          const rawCourtText = `${targetCourt.toUpperCase()} AVAILABLE`;
+          const largeCourtText = rawCourtText.replace(/[A-Z0-9]/g, (ch) => {
+            const code = ch.charCodeAt(0);
+            if (code >= 48 && code <= 57) return String.fromCodePoint(0x1D7EC + (code - 48));
+            if (code >= 65 && code <= 90) return String.fromCodePoint(0x1D5D4 + (code - 65));
+            return ch;
+          });
+          courtLine = `\n\n_${largeCourtText}_\n`;
+        }
+      } else if (totalCourtsCount > 0) {
+        const courtWord = totalCourtsCount === 1 ? 'COURT' : 'COURTS';
+        const rawCourtText = `${totalCourtsCount} ${courtWord} AVAILABLE`;
+        const largeCourtText = rawCourtText.replace(/[A-Z0-9]/g, (ch) => {
+          const code = ch.charCodeAt(0);
+          if (code >= 48 && code <= 57) return String.fromCodePoint(0x1D7EC + (code - 48));
+          if (code >= 65 && code <= 90) return String.fromCodePoint(0x1D5D4 + (code - 65));
+          return ch;
+        });
+        courtLine = `\n\n_${largeCourtText}_\n`;
+      }
     }
   }
   const timeLabel = resolvedWhen ? resolvedWhen : 'today';
@@ -6305,7 +6415,10 @@ async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWor
     isAutoCreated: Boolean(isAuto || isRecurring),
     scheduleId: scheduleId || null,
     noMatchups: Boolean(noMatchups),
-    prebookedCourts: (selectedPrebooked && selectedPrebooked.length > 0) ? selectedPrebooked.map(pb => ({ court: pb.court, player: pb.player })) : null,
+    court: targetCourt || null,
+    prebookedCourts: (selectedPrebooked && selectedPrebooked.length > 0)
+      ? selectedPrebooked.map(pb => ({ court: pb.court, player: pb.player }))
+      : (targetCourt ? [{ court: targetCourt, player: creatorName || 'Member' }] : null),
     prebookedPlayers: hasPrebooked ? prebookedInfo : null,
     creator: (!isAuto && !hasPrebooked && (shouldIncludeCreator || leadingVirtualCount > 0)) ? { name: (creatorName || 'Player 1'), jid: creatorJid || null } : null,
     lastConflictSignature: null,
@@ -6765,6 +6878,13 @@ async function getPrebookedCourtsForPoll(pollState) {
       if (courtName && !isIgnoredCourt(courtName)) {
         courts.push(typeof c === "string" ? { court: c } : c);
       }
+    }
+  }
+
+  // 1b. From pollState.court
+  if (pollState.court && !isIgnoredCourt(pollState.court)) {
+    if (!courts.some(c => (c.court || c).toLowerCase() === pollState.court.toLowerCase())) {
+      courts.push({ court: pollState.court, player: pollState.createdBy || pollState.creator?.name || 'Member' });
     }
   }
 
