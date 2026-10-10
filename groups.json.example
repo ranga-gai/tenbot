@@ -1,0 +1,13 @@
+{
+  "defaults": {
+    "sport": "tennis",
+    "courtBookingEnabled": true,
+    "venue": "SCVCC",
+    "autoMatchups": true
+  },
+  "groups": {
+    "xxxxxxxx@g.us": {
+      "name": "xxxxxxxx",
+    }
+  }
+}
