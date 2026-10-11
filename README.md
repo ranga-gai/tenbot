@@ -26,10 +26,10 @@ Authors:
    - Edit `DEFAULT_LOCATION` in `index.js` (defaults to `"San Jose, CA"`).
    - Time resolution is anchored to San Jose, CA (`America/Los_Angeles` / Pacific Time).
 
-4. **Confirm your target group name**
-   - `TARGET_GROUP_NAME` in `index.js` is set to your group name — the bot only listens in a group with that exact name.
+4. **Configure your target groups in `groups.json`**
+   - Group configurations and whitelist are automatically loaded from `groups.json`.
    - Scan the QR code that appears in your terminal (WhatsApp app → Settings → Linked Devices → Link a Device).
-   - If you rename the group or want to point at a different one, set `TARGET_GROUP_NAME` to `null`, restart, and send any message in the group you want — its name prints to the console — then copy that exact name back into `index.js`.
+   - Superadmins can also manage groups directly via WhatsApp DM using `!addgroup <name/jid>`, `!removegroup <name/jid>`, and `!groupconfig`.
 
 5. **Run it**
    ```bash

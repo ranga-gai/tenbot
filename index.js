@@ -863,17 +863,17 @@ const CLAUDE_TOOLS = [
   },
   {
     name: "add_group",
-    description: "Adds a WhatsApp group to the bot configuration (groups.json) and whitelist. Superadmin only via DM.",
+    description: "Adds a WhatsApp group to the bot configuration (groups.json) and whitelist. Accepts group name or JID. Superadmin only via DM.",
     input_schema: {
       type: "object",
       properties: {
-        jid: {
-          type: "string",
-          description: "WhatsApp group JID (e.g. 120363403838804497@g.us)."
-        },
         name: {
           type: "string",
-          description: "Display name for the group."
+          description: "WhatsApp group name/subject (or display name). If JID is not provided, the bot will search participating WhatsApp groups matching this name."
+        },
+        jid: {
+          type: "string",
+          description: "WhatsApp group JID (e.g. 120363403838804497@g.us). Optional if name is provided."
         },
         sport: {
           type: "string",
@@ -893,8 +893,7 @@ const CLAUDE_TOOLS = [
           items: { type: "string" },
           description: "Member WhatsApp LIDs authorized for direct court booking."
         }
-      },
-      required: ["jid"]
+      }
     }
   },
   {
@@ -983,12 +982,10 @@ if (!process.env.ANTHROPIC_API_KEY) {
 
 if (groupsConfig.hasWhitelist()) {
   const whitelisted = groupsConfig.getWhitelistedGroups();
-  console.log(`✅ Group whitelist active: [${whitelisted.join(", ")}]`);
+  console.log(`✅ Configured groups active from groups.json: [${whitelisted.join(", ")}]`);
 } else {
-  console.log("🌐 Multi-group mode (open): Bot is listening to all groups it is added to.");
+  console.log("🌐 Multi-group mode (open): No groups configured in groups.json; bot will respond in all groups.");
 }
-
-const TARGET_GROUP_NAME = process.env.TARGET_GROUP_NAME || null;
 
 
 // In-memory conversation history per chat: chatId -> [{role, content}, ...]
@@ -1770,13 +1767,9 @@ async function getTargetGroupJid(sock, senderJid = null) {
 }
 
 /**
- * Lists all WhatsApp groups the bot is currently a participating member of,
- * displaying their group names (subjects), JIDs / LIDs, participant counts, and config status.
+ * Fetches all participating WhatsApp groups using Baileys socket or falls back to cache.
  */
-async function handleListGroups(sock, senderJid = null) {
-  if (senderJid && !groupsConfig.isSuperAdmin(senderJid)) {
-    return "⚠️ Only the bot superadmin can view information of all WhatsApp groups.";
-  }
+async function fetchParticipatingGroups(sock) {
   const activeSock = sock || botSock;
   let groups = {};
 
@@ -1800,6 +1793,68 @@ async function handleListGroups(sock, senderJid = null) {
       groups[gId] = gMeta;
     }
   }
+
+  return groups;
+}
+
+/**
+ * Searches participating WhatsApp groups for a match by JID or group name.
+ * Returns { id, metadata, subject } or { multiple: true, matches } or null.
+ */
+async function resolveParticipatingGroup(sock, query) {
+  if (!query) return null;
+  const rawQuery = String(query).replace(/^["']|["']$/g, '').trim();
+  if (!rawQuery) return null;
+
+  const groups = await fetchParticipatingGroups(sock);
+  const entries = Object.entries(groups || {});
+  const lowerQuery = rawQuery.toLowerCase();
+
+  // 1. Direct match by JID
+  for (const [gId, gMeta] of entries) {
+    if (gId.toLowerCase() === lowerQuery) {
+      return { id: gId, metadata: gMeta, subject: gMeta?.subject || gId };
+    }
+  }
+
+  // 2. Exact match by group subject/name
+  const exactMatches = entries.filter(([gId, gMeta]) => (gMeta?.subject || '').trim().toLowerCase() === lowerQuery);
+  if (exactMatches.length === 1) {
+    const [gId, gMeta] = exactMatches[0];
+    return { id: gId, metadata: gMeta, subject: gMeta?.subject || gId };
+  }
+  if (exactMatches.length > 1) {
+    return {
+      multiple: true,
+      matches: exactMatches.map(([gId, gMeta]) => ({ id: gId, subject: gMeta?.subject || gId }))
+    };
+  }
+
+  // 3. Substring match by group subject/name
+  const partialMatches = entries.filter(([gId, gMeta]) => (gMeta?.subject || '').toLowerCase().includes(lowerQuery));
+  if (partialMatches.length === 1) {
+    const [gId, gMeta] = partialMatches[0];
+    return { id: gId, metadata: gMeta, subject: gMeta?.subject || gId };
+  }
+  if (partialMatches.length > 1) {
+    return {
+      multiple: true,
+      matches: partialMatches.map(([gId, gMeta]) => ({ id: gId, subject: gMeta?.subject || gId }))
+    };
+  }
+
+  return null;
+}
+
+/**
+ * Lists all WhatsApp groups the bot is currently a participating member of,
+ * displaying their group names (subjects), JIDs / LIDs, participant counts, and config status.
+ */
+async function handleListGroups(sock, senderJid = null) {
+  if (senderJid && !groupsConfig.isSuperAdmin(senderJid)) {
+    return "⚠️ Only the bot superadmin can view information of all WhatsApp groups.";
+  }
+  const groups = await fetchParticipatingGroups(sock);
 
   const groupEntries = Object.entries(groups || {});
   if (groupEntries.length === 0) {
@@ -1837,7 +1892,7 @@ async function handleListGroups(sock, senderJid = null) {
   if (groupsConfig.isSuperAdmin(senderJid)) {
     lines.push("");
     lines.push("👑 *Superadmin Group Management (DM only):*");
-    lines.push("• `!addgroup <jid> [name]` — Add a group to groups.json & whitelist");
+    lines.push("• `!addgroup <jid/name> [displayName]` — Add a group to groups.json & whitelist");
     lines.push("• `!removegroup <jid/name>` — Remove a group from groups.json & whitelist");
     lines.push("• `!setgroupconfig <jid/name> key=value ...` — Update group settings");
     lines.push("• `!groupconfig [jid/name]` — View detailed configuration");
@@ -2003,7 +2058,7 @@ async function getGroupMetadata(sock, remoteJid) {
         metadata = await sock.groupMetadata(remoteJid);
         if (metadata) {
           groupMetadataCache.set(remoteJid, metadata);
-          if (metadata.subject === TARGET_GROUP_NAME) {
+          if (groupsConfig.isGroupAllowed(remoteJid, metadata?.subject) && !targetGroupJid) {
             targetGroupJid = remoteJid;
           }
           break;
@@ -4528,9 +4583,36 @@ async function executeTool(sock, chatId, sender, toolUse, msg) {
       return "⚠️ Only the bot superadmin can add groups to the configuration.";
     }
     const { jid, name: gName, ...rest } = input;
-    if (!jid) return "Please provide the group JID (e.g. 120363403838804497@g.us).";
-    const res = groupsConfig.addGroup(jid, { name: gName, ...rest });
-    return `✅ Added group "${res.name}" (\`${res.jid}\`) to groups.json configuration.`;
+    const target = (jid || gName || input.groupName || input.jidOrName || "").trim();
+    if (!target) return "Please provide the group name or JID (e.g. 'Bot-testing' or '120363403838804497@g.us').";
+
+    let finalJid = jid ? String(jid).trim() : null;
+    let displayName = gName ? String(gName).trim() : null;
+    let note = "";
+
+    if (!finalJid || !finalJid.includes('@')) {
+      const resolved = await resolveParticipatingGroup(sock, target);
+      if (resolved?.multiple) {
+        const list = resolved.matches.map((m, idx) => `${idx + 1}. *${m.subject}* (\`${m.id}\`)`).join('\n');
+        return `⚠️ Multiple participating WhatsApp groups matched "${target}":\n\n${list}\n\nPlease specify the exact group name or JID.`;
+      }
+      if (resolved && resolved.id) {
+        finalJid = resolved.id;
+        displayName = displayName || resolved.subject;
+      } else {
+        finalJid = target;
+        displayName = displayName || target;
+        note = `\nℹ️ _Note: Bot is not currently in a participating WhatsApp group matching "${target}". When added to the group, the bot will recognize it by name._`;
+      }
+    } else if (!displayName) {
+      const resolved = await resolveParticipatingGroup(sock, finalJid);
+      if (resolved && resolved.subject) {
+        displayName = resolved.subject;
+      }
+    }
+
+    const res = groupsConfig.addGroup(finalJid, { name: displayName, ...rest });
+    return `✅ Added group "${res.name}" (\`${res.jid}\`) to groups.json configuration.${note}`;
   }
   if (name === "remove_group") {
     if (chatId && chatId.endsWith("@g.us")) {
@@ -4951,14 +5033,65 @@ async function getResponse(sock, rawText, chatId, sender, msg) {
       return '⚠️ Only the bot superadmin can add groups.';
     }
     const raw = text.replace(/^!addgroup\s*/i, '').trim();
-    const parts = raw.split(/\s+/);
-    const jid = parts[0];
-    const gName = parts.slice(1).join(' ').trim() || jid;
-    if (!jid || !jid.includes('@')) {
-      return 'Usage: !addgroup <groupJid> [name]\nExample: !addgroup 120363403838804497@g.us Bot-testing';
+    if (!raw) {
+      return 'Usage: !addgroup <groupName or groupJid> [displayName] [key=value...]\nExample: !addgroup Bot-testing\nExample: !addgroup 120363403838804497@g.us Bot-testing';
     }
-    const res = groupsConfig.addGroup(jid, { name: gName });
-    return `✅ Added group "${res.name}" (\`${res.jid}\`) to groups.json configuration.`;
+
+    const kvUpdates = parseConfigKeyValueArgs(raw);
+    const nonKv = raw.replace(/\b\w+\s*=\s*(?:["'][^"']+["']|[^\s]+)/g, '').trim();
+
+    let target = '';
+    let customName = null;
+
+    const quoteMatch = nonKv.match(/^["']([^"']+)["'](?:\s+(.*))?$/);
+    if (quoteMatch) {
+      target = quoteMatch[1].trim();
+      customName = quoteMatch[2]?.replace(/^["']|["']$/g, '').trim() || null;
+    } else {
+      const tokens = nonKv.split(/\s+/);
+      if (tokens[0] && tokens[0].includes('@')) {
+        target = tokens[0].trim();
+        customName = tokens.slice(1).join(' ').trim() || null;
+      } else {
+        target = nonKv.trim();
+        customName = null;
+      }
+    }
+
+    if (!target) {
+      return 'Usage: !addgroup <groupName or groupJid> [displayName] [key=value...]\nExample: !addgroup Bot-testing\nExample: !addgroup 120363403838804497@g.us Bot-testing';
+    }
+
+    let finalJid = null;
+    let displayName = customName;
+    let note = '';
+
+    if (target.includes('@')) {
+      finalJid = target;
+      if (!displayName) {
+        const resolved = await resolveParticipatingGroup(sock, target);
+        if (resolved && resolved.subject) {
+          displayName = resolved.subject;
+        }
+      }
+    } else {
+      const resolved = await resolveParticipatingGroup(sock, target);
+      if (resolved?.multiple) {
+        const list = resolved.matches.map((m, idx) => `${idx + 1}. *${m.subject}* (\`${m.id}\`)`).join('\n');
+        return `⚠️ Multiple participating WhatsApp groups matched "${target}":\n\n${list}\n\nPlease specify the exact group name or JID:\nExample: \`!addgroup ${resolved.matches[0].id}\``;
+      }
+      if (resolved && resolved.id) {
+        finalJid = resolved.id;
+        displayName = displayName || resolved.subject;
+      } else {
+        finalJid = target;
+        displayName = displayName || target;
+        note = `\nℹ️ _Note: Bot is not currently in a participating WhatsApp group matching "${target}". When added to the group, the bot will recognize it by name._`;
+      }
+    }
+
+    const res = groupsConfig.addGroup(finalJid, { name: displayName, ...kvUpdates });
+    return `✅ Added group "${res.name}" (\`${res.jid}\`) to groups.json configuration.${note}`;
   }
 
   if (lower.startsWith('!removegroup') || lower.startsWith('!deletegroup') || lower.startsWith('!rmgroup')) {
