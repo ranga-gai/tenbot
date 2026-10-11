@@ -128,7 +128,8 @@ const groupsConfig = require('./lib/groupsConfig');
 const courtsConfig = require('./lib/courtsConfig');
 const anthropic = require('./lib/anthropic');
 const { helpText } = require('./lib/help');
-const { resolvePlayDateTime, getSanJoseNow, getSanJoseParts, parseTimeString, WORD_TO_NUMBER, NUMBER_WORDS_PATTERN } = require('./lib/pollTime');
+const pollTime = require('./lib/pollTime');
+const { resolvePlayDateTime, getSanJoseNow, getSanJoseParts, parseTimeString, WORD_TO_NUMBER, NUMBER_WORDS_PATTERN } = pollTime;
 
 // ---- CONFIG ----
 
@@ -883,7 +884,11 @@ const CLAUDE_TOOLS = [
         },
         courtBookingEnabled: {
           type: "boolean",
-          description: "Whether SCVCC court booking is enabled."
+          description: "Whether court booking is enabled."
+        },
+        courtConfig: {
+          type: "string",
+          description: "Court configuration name from courts.json (e.g. 'SCVCC') if court functionality is available for the group."
         },
         autoMatchups: {
           type: "boolean",
@@ -938,6 +943,10 @@ const CLAUDE_TOOLS = [
           type: "boolean",
           description: "Whether court booking is enabled."
         },
+        courtConfig: {
+          type: "string",
+          description: "Court configuration name from courts.json (e.g. 'SCVCC') if court functionality is available for the group."
+        },
         autoMatchups: {
           type: "boolean",
           description: "Whether automatic player matchups are enabled."
@@ -987,6 +996,8 @@ if (groupsConfig.hasWhitelist()) {
 } else {
   console.log("🌐 Multi-group mode (open): No groups configured in groups.json; bot will respond in all groups.");
 }
+
+courtsConfig.logCourtConfigs();
 
 
 // In-memory conversation history per chat: chatId -> [{role, content}, ...]
@@ -6631,11 +6642,11 @@ async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWor
 
     try {
       const [avail, bookingsRes] = await Promise.all([
-        scvcc.checkCourtAvailability({ when: targetDateMDY, time: queryTime, sport: 'tennis', chatId }).catch((err) => {
+        scvcc.checkCourtAvailability({ when: targetDateMDY, time: queryTime, sport: 'tennis', chatId: remoteJid }).catch((err) => {
           console.warn('[poll] Error checking court availability:', err.message);
           return null;
         }),
-        scvcc.getCourtBookings({ when: targetDateMDY, time: queryTime, sport: 'tennis', chatId }).catch((err) => {
+        scvcc.getCourtBookings({ when: targetDateMDY, time: queryTime, sport: 'tennis', chatId: remoteJid }).catch((err) => {
           console.warn('[poll] Error checking court bookings:', err.message);
           return null;
         })
@@ -7360,7 +7371,7 @@ function formatMatchHeaderTime(pollState) {
   return `${weekdayName} ${timeFormatted}`;
 }
 
-async function getPrebookedCourtsForPoll(pollState) {
+async function getPrebookedCourtsForPoll(pollState, chatId = null) {
   if (!pollState) return [];
   const courts = [];
 
@@ -7420,12 +7431,13 @@ async function getPrebookedCourtsForPoll(pollState) {
       }
 
       if (targetDateMDY && queryTime) {
-        const bookingsRes = await scvcc.getCourtBookings({ when: targetDateMDY, time: queryTime, sport: "tennis", chatId });
+        const effectiveChatId = chatId || pollState?.remoteJid || null;
+        const bookingsRes = await scvcc.getCourtBookings({ when: targetDateMDY, time: queryTime, sport: "tennis", chatId: effectiveChatId });
         const seen = new Set();
         for (const b of bookingsRes?.bookings || []) {
           if (isIgnoredCourt(b.court)) continue;
           if (seen.has(b.court)) continue;
-          const prebookedMatch = detectPrebookedCourt(b, pollState?.remoteJid || chatId);
+          const prebookedMatch = detectPrebookedCourt(b, effectiveChatId);
           if (prebookedMatch) {
             courts.push({ court: b.court, player: prebookedMatch.player });
             seen.add(b.court);
