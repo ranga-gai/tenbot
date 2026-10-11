@@ -2382,27 +2382,66 @@ async function sendPollReminder(sock, pollId, pollState, isManualTrigger = false
 }
 
 /**
+ * Helper to resolve a specific poll across active polls (by poll ID, schedule ID, or time/name).
+ */
+function findSpecificPoll(target) {
+  if (!target) return null;
+  const clean = String(target).replace(/^["']|["']$/g, '').trim().toLowerCase();
+
+  // 1. Poll ID match
+  for (const [id, state] of activePolls.entries()) {
+    if (id.toLowerCase() === clean) return { pollId: id, pollState: state };
+  }
+
+  // 2. Schedule ID match (e.g. rec_mujmt71n)
+  for (const [id, state] of activePolls.entries()) {
+    const sid = getPollScheduleId(state);
+    if ((sid && sid.toLowerCase() === clean) || (state.scheduleId && state.scheduleId.toLowerCase() === clean)) {
+      return { pollId: id, pollState: state };
+    }
+  }
+
+  // 3. Name or when match (e.g. "7pm", "wednesday")
+  for (const [id, state] of activePolls.entries()) {
+    const pName = (state.name || '').toLowerCase();
+    const pWhen = (state.when || '').toLowerCase();
+    if (pName.includes(clean) || pWhen.includes(clean) || clean.includes(pWhen)) {
+      return { pollId: id, pollState: state };
+    }
+  }
+
+  return null;
+}
+
+/**
  * Manually sends a reminder for a specific poll or all active polls in the chat.
  */
 async function handleTriggerReminder(sock, chatId, sender, specificPollId = null) {
-  const targetPolls = [];
+  let targetPolls = [];
+
   if (specificPollId) {
-    if (activePolls.has(specificPollId)) {
-      const p = activePolls.get(specificPollId);
-      if (p.remoteJid === chatId && p.status === 'active') {
-        targetPolls.push([specificPollId, p]);
-      }
+    const found = findSpecificPoll(specificPollId);
+    if (!found) {
+      return `⚠️ No match poll found matching "${specificPollId}". Use "!activepolls" or "!pollstatus" to check active poll IDs.`;
+    }
+    const { pollId, pollState } = found;
+    if (pollState.status === 'active') {
+      targetPolls.push([pollId, pollState]);
+    } else {
+      return `⚠️ Poll "${pollState.name || pollState.when || pollId}" has status "${pollState.status}" (reminders can only be triggered for active polls).`;
     }
   } else {
+    const isDM = Boolean(chatId && !chatId.endsWith('@g.us'));
+    const effectiveChatId = isDM ? (targetGroupJid || null) : chatId;
     for (const [id, state] of activePolls.entries()) {
-      if (state.remoteJid === chatId && state.status === 'active') {
+      if ((isDM || state.remoteJid === effectiveChatId) && state.status === 'active') {
         targetPolls.push([id, state]);
       }
     }
   }
 
   if (targetPolls.length === 0) {
-    return 'No active match polls found in this chat to send reminders for.';
+    return 'No active match polls found to send reminders for.';
   }
 
   let sentCount = 0;
@@ -2420,24 +2459,47 @@ async function handleTriggerReminder(sock, chatId, sender, specificPollId = null
 }
 
 async function handlePauseReminders(sock, chatId, sender, specificPollId = null) {
-  const targetPolls = [];
   if (specificPollId) {
-    if (activePolls.has(specificPollId)) {
-      const p = activePolls.get(specificPollId);
-      if (p.remoteJid === chatId && p.status === 'active') {
-        targetPolls.push([specificPollId, p]);
-      }
+    const found = findSpecificPoll(specificPollId);
+    if (!found) {
+      return `⚠️ No match poll found matching "${specificPollId}". Use "!activepolls" or "!pollstatus" to check active poll IDs.`;
     }
-  } else {
-    for (const [id, state] of activePolls.entries()) {
-      if (state.remoteJid === chatId && state.status === 'active') {
-        targetPolls.push([id, state]);
-      }
+
+    const { pollId, pollState } = found;
+    const pollName = pollState.name || pollState.when || pollId;
+
+    if (pollState.status === 'resolved') {
+      return `ℹ️ Poll "${pollName}" has already been resolved and drawn (reminders are not active).`;
+    }
+    if (pollState.status === 'expired') {
+      return `ℹ️ Poll "${pollName}" has expired (scheduled match play time has passed).`;
+    }
+    if (pollState.status === 'cancelled') {
+      return `ℹ️ Poll "${pollName}" was cancelled.`;
+    }
+    if (pollState.remindersPaused) {
+      return `⏸️ Reminders for "${pollName}" are already paused. Use "!resumereminders" to resume them anytime.`;
+    }
+
+    pollState.remindersPaused = true;
+    persistPolls();
+    console.log(`[reminders] Reminders paused for poll ${pollId} ("${pollName}") by ${sender}`);
+    return `⏸️ Reminders have been paused for "${pollName}". Use "!resumereminders ${pollId}" to resume them anytime.`;
+  }
+
+  // Without specificPollId: pause all active / filled polls in this chat (or all administered groups if DM)
+  const isDM = Boolean(chatId && !chatId.endsWith('@g.us'));
+  const effectiveChatId = isDM ? (targetGroupJid || null) : chatId;
+  const targetPolls = [];
+
+  for (const [id, state] of activePolls.entries()) {
+    if ((isDM || state.remoteJid === effectiveChatId) && (state.status === 'active' || state.status === 'filled')) {
+      targetPolls.push([id, state]);
     }
   }
 
   if (targetPolls.length === 0) {
-    return 'No active match polls found in this chat to pause reminders for.';
+    return 'No active match polls found to pause reminders for.';
   }
 
   const names = [];
@@ -2456,24 +2518,46 @@ async function handlePauseReminders(sock, chatId, sender, specificPollId = null)
  * Any group member can run this command.
  */
 async function handleResumeReminders(sock, chatId, sender, specificPollId = null) {
-  const targetPolls = [];
   if (specificPollId) {
-    if (activePolls.has(specificPollId)) {
-      const p = activePolls.get(specificPollId);
-      if (p.remoteJid === chatId && p.status === 'active') {
-        targetPolls.push([specificPollId, p]);
-      }
+    const found = findSpecificPoll(specificPollId);
+    if (!found) {
+      return `⚠️ No match poll found matching "${specificPollId}". Use "!activepolls" or "!pollstatus" to check active poll IDs.`;
     }
-  } else {
-    for (const [id, state] of activePolls.entries()) {
-      if (state.remoteJid === chatId && state.status === 'active') {
-        targetPolls.push([id, state]);
-      }
+
+    const { pollId, pollState } = found;
+    const pollName = pollState.name || pollState.when || pollId;
+
+    if (pollState.status === 'resolved') {
+      return `ℹ️ Poll "${pollName}" has already been resolved and drawn.`;
+    }
+    if (pollState.status === 'expired') {
+      return `ℹ️ Poll "${pollName}" has expired (scheduled match play time has passed).`;
+    }
+    if (pollState.status === 'cancelled') {
+      return `ℹ️ Poll "${pollName}" was cancelled.`;
+    }
+    if (!pollState.remindersPaused) {
+      return `▶️ Reminders for "${pollName}" are already active.`;
+    }
+
+    pollState.remindersPaused = false;
+    persistPolls();
+    console.log(`[reminders] Reminders resumed for poll ${pollId} ("${pollName}") by ${sender}`);
+    return `▶️ Reminders have been resumed for "${pollName}".`;
+  }
+
+  const isDM = Boolean(chatId && !chatId.endsWith('@g.us'));
+  const effectiveChatId = isDM ? (targetGroupJid || null) : chatId;
+  const targetPolls = [];
+
+  for (const [id, state] of activePolls.entries()) {
+    if ((isDM || state.remoteJid === effectiveChatId) && (state.status === 'active' || state.status === 'filled')) {
+      targetPolls.push([id, state]);
     }
   }
 
   if (targetPolls.length === 0) {
-    return 'No active match polls found in this chat to resume reminders for.';
+    return 'No active match polls found to resume reminders for.';
   }
 
   const names = [];
