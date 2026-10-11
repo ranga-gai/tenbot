@@ -106,7 +106,7 @@ const { Boom } = require('@hapi/boom');
 const qrcode = require('qrcode-terminal');
 const pino = require('pino');
 
-const storage = require('./lib/storage');
+const stats = require('./lib/stats');
 const weather = require('./lib/weather');
 const {
   generateMatchups,
@@ -1022,7 +1022,7 @@ const FREEFORM_DUPLICATE_WINDOW_MS = 10 * 60 * 1000;
 let botSock = null;
 let targetGroupJid = null;
 
-// Poll-related state and voter display name mappings are persisted per group in poll-states/
+// Poll-related state and voter display name mappings are persisted per group in data/poll-states/
 // so voter identities survive a bot restart.
 const {
   messageStore,   // `${remoteJid}:${id}` -> stored WAMessage content, needed for getMessage() and vote decoding
@@ -1033,7 +1033,7 @@ const {
 
 const storeKey = (remoteJid, id) => `${remoteJid}:${id}`;
 
-// Ensure all players in names.json have full names defaulted and ratings on startup
+// Ensure all players in data/names.json have full names defaulted and ratings on startup
 namesStore.defaultMissingFullNames();
 ratings.syncRatingsWithNames();
 
@@ -5207,12 +5207,12 @@ async function getResponse(sock, rawText, chatId, sender, msg) {
   if (lower.startsWith('!free')) {
     const when = text.slice('!free'.length).trim();
     if (!when) return formatAvailability();
-    storage.setAvailable(sender, when);
+    stats.setAvailable(sender, when);
     return `Got it, ${sender} is free ${when}. Send "!free" to see the full list.`;
   }
 
   if (lower === '!notfree') {
-    storage.removeAvailable(sender);
+    stats.removeAvailable(sender);
     return `Removed ${sender} from the availability list.`;
   }
 
@@ -5222,7 +5222,7 @@ async function getResponse(sock, rawText, chatId, sender, msg) {
     if (!isAdmin) {
       return '⚠️ Only group admins can use !clearfree.';
     }
-    storage.clearAvailability();
+    stats.clearAvailability();
     return 'Availability list cleared for everyone.';
   }
 
@@ -6066,7 +6066,7 @@ function formatAliases() {
 }
 
 function formatAvailability() {
-  const list = storage.getAvailability();
+  const list = stats.getAvailability();
   if (list.length === 0) {
     return 'No one has marked themselves free yet. Use "!free <when>" to add yourself.';
   }
@@ -6075,7 +6075,7 @@ function formatAvailability() {
 }
 
 function formatLeaderboard() {
-  const board = storage.getLeaderboard();
+  const board = stats.getLeaderboard();
   if (board.length === 0) {
     return 'No matches recorded yet. Use "!score <winner> def <loser> <score>" to log one.';
   }
@@ -6106,7 +6106,7 @@ function applyScoreReport({ winners, losers, sets, assumedScore = false, inferre
   const loserText = formatSide(losers);
   const scoreText = formatSets(sets);
 
-  storage.recordMatch(winnerText, loserText, scoreText);
+  stats.recordMatch(winnerText, loserText, scoreText);
   const { sets: rated, changes } = ratings.applyResult(winners, losers, sets);
 
   const lines = [`Recorded: ${winnerText} def ${loserText} (${scoreText}).`];
@@ -6184,8 +6184,8 @@ function knownPlayers(chatId) {
     }
   }
   for (const p of ratings.getAllRatings()) add(p.name, p.name);
-  for (const p of storage.getLeaderboard()) add(p.name, p.name);
-  for (const a of storage.getAvailability()) add(a.player, a.player);
+  for (const p of stats.getLeaderboard()) add(p.name, p.name);
+  for (const a of stats.getAvailability()) add(a.player, a.player);
 
   for (const [, pollState] of activePolls.entries()) {
     if (pollState.remoteJid === chatId) {
@@ -7973,9 +7973,9 @@ function buildContextBlurb(chatId) {
     hour12: true
   }).format(new Date());
 
-  const availability = storage.getAvailability();
-  const board = storage.getLeaderboard();
-  const recent = storage.getRecentMatches(5);
+  const availability = stats.getAvailability();
+  const board = stats.getLeaderboard();
+  const recent = stats.getRecentMatches(5);
 
   const availabilityText = availability.length
     ? availability.map((a) => `${a.player} (${a.when})`).join(', ')

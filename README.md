@@ -26,8 +26,8 @@ Authors:
    - Edit `DEFAULT_LOCATION` in `index.js` (defaults to `"San Jose, CA"`).
    - Time resolution is anchored to San Jose, CA (`America/Los_Angeles` / Pacific Time).
 
-4. **Configure your target groups in `groups.json`**
-   - Group configurations and whitelist are automatically loaded from `groups.json`.
+4. **Configure your target groups in `config/groups.json`**
+   - Group configurations and whitelist are automatically loaded from `config/groups.json`.
    - Scan the QR code that appears in your terminal (WhatsApp app → Settings → Linked Devices → Link a Device).
    - Superadmins can also manage groups directly via WhatsApp DM using `!addgroup <name/jid>`, `!removegroup <name/jid>`, and `!groupconfig`.
 
@@ -121,7 +121,7 @@ Set 2:
 
 - **Courts**: Players are split 4 to a court (8 players = 2 courts, 12 players = 3 courts, etc.).
 - **Rotations**: Lowest-repeat draws ensure players partner with different teammates each set and face different opponents.
-- **Freshness across weeks**: Past partnerships from the last 3 weeks are remembered in `pair-history.json` and weighted to avoid repeat pairings across sessions.
+- **Freshness across weeks**: Past partnerships from the last 3 weeks are remembered in `data/pair-history.json` and weighted to avoid repeat pairings across sessions.
 - **Even courts**: The draw balances pairings so court rating sums are within **0.49** of each other.
 - **Slot Conflicts**: In bot fixed-spot polls, if multiple voters pick the same number, the bot alerts the group to switch slots before generating matchups.
 
@@ -137,7 +137,7 @@ Every player carries a rating between **2.50 and 4.50**, formatted to two decima
 - **Rating Movement**: Ratings adjust dynamically after match scores are reported:
   - Higher-rated pairing wins: `0.01 × game margin`
   - Underdog wins (upset): `gap × (game margin / 12)`
-- Ratings are saved in `ratings.json` and viewed with `!ratings`.
+- Ratings are saved in `data/ratings.json` and viewed with `!ratings`.
 
 ---
 
