@@ -1,0 +1,12 @@
+{
+  "scvcc": {
+    "host": "https://www.scvcc.com",
+    "configs": [
+      {
+        "name": "SCVCC",
+        "ignoredCourts": [
+        ]
+      }
+    ]
+  }
+}

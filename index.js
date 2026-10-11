@@ -125,6 +125,7 @@ const messageHistory = require('./lib/messageHistory');
 const recurringPollsModule = require('./lib/recurringPolls');
 const scvcc = require('./lib/scvcc');
 const groupsConfig = require('./lib/groupsConfig');
+const courtsConfig = require('./lib/courtsConfig');
 const anthropic = require('./lib/anthropic');
 const { helpText } = require('./lib/help');
 const { resolvePlayDateTime, getSanJoseNow, getSanJoseParts, parseTimeString, WORD_TO_NUMBER, NUMBER_WORDS_PATTERN } = require('./lib/pollTime');
@@ -6315,34 +6316,10 @@ function getDirectCourtBookingAccounts(chatId = null) {
 }
 
 /**
- * Checks if a court is configured to be ignored in .env (e.g. IGNORED_COURTS=Court 4).
+ * Checks if a court is configured to be ignored in config/courts.json (or .env fallback).
  */
 function isIgnoredCourt(courtName) {
-  if (!courtName) return false;
-  const envVal = process.env.IGNORED_COURTS || process.env.IGNORED_COURT || '';
-  if (!envVal || !envVal.trim()) return false;
-
-  const cleanCourt = String(courtName).trim().toLowerCase();
-  const ignoredList = envVal.split(/[,;]+/).map((s) => s.trim().toLowerCase()).filter(Boolean);
-
-  for (const item of ignoredList) {
-    if (cleanCourt === item) return true;
-
-    // Check by number: e.g. item "4" matches "Court 4", "Ct 4", "4"
-    const itemNumMatch = item.match(/\b(\d+)\b/);
-    const courtNumMatch = cleanCourt.match(/\b(?:court|ct)?\s*(\d+)\b/i);
-    if (itemNumMatch && courtNumMatch && itemNumMatch[1] === courtNumMatch[1]) {
-      return true;
-    }
-
-    // Regex boundary check: e.g. item "court 4" matches "court 4 (90m)"
-    const itemEscaped = item.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    if (new RegExp(`\\b${itemEscaped}\\b`, 'i').test(cleanCourt)) {
-      return true;
-    }
-  }
-
-  return false;
+  return courtsConfig.isIgnoredCourt(courtName);
 }
 
 /**
