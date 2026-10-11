@@ -1,3 +1,14 @@
+function parseConfigKeyValueArgs(argsStr) {
+  const updates = {};
+  const regex = /(\w+)\s*=\s*(?:["']([^"']+)["']|([^\s]+))/g;
+  let match;
+  while ((match = regex.exec(argsStr)) !== null) {
+    const key = match[1];
+    const val = match[2] !== undefined ? match[2] : match[3];
+    updates[key] = val;
+  }
+  return updates;
+}
 /**
  * Tennis Group Bot (Baileys edition)
  * ----------------------------------
@@ -844,10 +855,118 @@ const CLAUDE_TOOLS = [
 
   {
     name: "list_groups",
-    description: "Lists all WhatsApp groups the bot is currently a participating member of, showing group names, WhatsApp JIDs, participant counts, and configuration status.",
+    description: "Lists all WhatsApp groups the bot is currently a participating member of, showing group names, WhatsApp JIDs, participant counts, and configuration status. Superadmin only via DM.",
     input_schema: {
       type: "object",
       properties: {}
+    }
+  },
+  {
+    name: "add_group",
+    description: "Adds a WhatsApp group to the bot configuration (groups.json) and whitelist. Superadmin only via DM.",
+    input_schema: {
+      type: "object",
+      properties: {
+        jid: {
+          type: "string",
+          description: "WhatsApp group JID (e.g. 120363403838804497@g.us)."
+        },
+        name: {
+          type: "string",
+          description: "Display name for the group."
+        },
+        sport: {
+          type: "string",
+          enum: ["tennis", "pickleball"],
+          description: "Default sport for the group."
+        },
+        courtBookingEnabled: {
+          type: "boolean",
+          description: "Whether SCVCC court booking is enabled."
+        },
+        autoMatchups: {
+          type: "boolean",
+          description: "Whether automatic player matchups are enabled."
+        },
+        directCourtBookingAccounts: {
+          type: "array",
+          items: { type: "string" },
+          description: "Member WhatsApp LIDs authorized for direct court booking."
+        }
+      },
+      required: ["jid"]
+    }
+  },
+  {
+    name: "remove_group",
+    description: "Removes a WhatsApp group from the bot configuration (groups.json) and whitelist. Superadmin only via DM.",
+    input_schema: {
+      type: "object",
+      properties: {
+        jidOrName: {
+          type: "string",
+          description: "WhatsApp group JID or group name to remove."
+        }
+      },
+      required: ["jidOrName"]
+    }
+  },
+  {
+    name: "update_group_config",
+    description: "Updates configuration settings for a WhatsApp group in groups.json. Superadmin only via DM.",
+    input_schema: {
+      type: "object",
+      properties: {
+        jidOrName: {
+          type: "string",
+          description: "WhatsApp group JID or group name to update."
+        },
+        name: {
+          type: "string",
+          description: "New display name."
+        },
+        alias: {
+          type: "string",
+          description: "Short alias for the group."
+        },
+        sport: {
+          type: "string",
+          enum: ["tennis", "pickleball"],
+          description: "Sport for the group."
+        },
+        courtBookingEnabled: {
+          type: "boolean",
+          description: "Whether court booking is enabled."
+        },
+        autoMatchups: {
+          type: "boolean",
+          description: "Whether automatic player matchups are enabled."
+        },
+        directCourtBookingAccounts: {
+          type: "array",
+          items: { type: "string" },
+          description: "Authorized member LIDs for direct court booking."
+        },
+        ignoredCourts: {
+          type: "array",
+          items: { type: "string" },
+          description: "Courts to ignore."
+        }
+      },
+      required: ["jidOrName"]
+    }
+  },
+  {
+    name: "get_group_config",
+    description: "Retrieves configuration details for one or all groups from groups.json. Superadmin only via DM.",
+    input_schema: {
+      type: "object",
+      properties: {
+        jidOrName: {
+          type: "string",
+          description: "Optional group JID or name. If omitted, returns all configured groups."
+        }
+      }
     }
   },
 ];
@@ -1595,6 +1714,15 @@ async function getAdminGroupsForUser(sock, senderJid) {
     const pnUser = namesStore.getPnByLid(normUser) || (normUser?.endsWith("@s.whatsapp.net") ? normUser : null);
     const lidUser = namesStore.resolveCanonicalId(normUser) || (normUser?.endsWith("@lid") ? normUser : null);
 
+    const isSuper = groupsConfig.isSuperAdmin(senderJid);
+    if (isSuper) {
+      for (const [gId, gMeta] of groups.entries()) {
+        if (!groupsConfig.isGroupAllowed(gId, gMeta.subject)) continue;
+        adminGroups.push({ id: gId, name: gMeta.subject || gId });
+      }
+      return adminGroups;
+    }
+
     for (const [gId, gMeta] of groups.entries()) {
       if (!groupsConfig.isGroupAllowed(gId, gMeta.subject)) continue;
       if (!gMeta.participants) continue;
@@ -1645,7 +1773,10 @@ async function getTargetGroupJid(sock, senderJid = null) {
  * Lists all WhatsApp groups the bot is currently a participating member of,
  * displaying their group names (subjects), JIDs / LIDs, participant counts, and config status.
  */
-async function handleListGroups(sock) {
+async function handleListGroups(sock, senderJid = null) {
+  if (senderJid && !groupsConfig.isSuperAdmin(senderJid)) {
+    return "⚠️ Only the bot superadmin can view information of all WhatsApp groups.";
+  }
   const activeSock = sock || botSock;
   let groups = {};
 
@@ -1703,12 +1834,22 @@ async function handleListGroups(sock) {
     lines.push("");
   }
 
-  lines.push("💡 _Use the group JID as the key in groups.json for group-specific configuration._");
+  if (groupsConfig.isSuperAdmin(senderJid)) {
+    lines.push("");
+    lines.push("👑 *Superadmin Group Management (DM only):*");
+    lines.push("• `!addgroup <jid> [name]` — Add a group to groups.json & whitelist");
+    lines.push("• `!removegroup <jid/name>` — Remove a group from groups.json & whitelist");
+    lines.push("• `!setgroupconfig <jid/name> key=value ...` — Update group settings");
+    lines.push("• `!groupconfig [jid/name]` — View detailed configuration");
+  } else {
+    lines.push("💡 _Use the group JID as the key in groups.json for group-specific configuration._");
+  }
   return lines.join("\n").trim();
 }
 
 async function isUserAdmin(sock, remoteJid, senderJid) {
   if (!sock || !senderJid) return false;
+  if (groupsConfig.isSuperAdmin(senderJid)) return true;
   const targetJid = (remoteJid && remoteJid.endsWith('@g.us')) ? remoteJid : (await getTargetGroupJid(sock));
   if (!targetJid) return false;
   try {
@@ -3947,13 +4088,18 @@ async function startBot() {
           namesStore.setGroupMembers(remoteJid, metadata.participants);
         }
       } else if (isDirect) {
-        // Direct message: only allowed if sender is an admin of at least ONE allowed group
+        // Direct message: allowed if sender is a superadmin OR an admin of at least ONE allowed group
+        const isSuper = groupsConfig.isSuperAdmin(remoteJid);
         const adminGroups = await getAdminGroupsForUser(sock, remoteJid);
-        if (adminGroups.length === 0) {
+        if (!isSuper && adminGroups.length === 0) {
           console.log(`[DM] Ignored direct message from non-admin user ${remoteJid}`);
           continue;
         }
-        console.log(`[DM] Authorized admin direct message received from ${remoteJid} (${msg.pushName || "Admin"}), admin of ${adminGroups.length} group(s)`);
+        if (isSuper) {
+          console.log(`[DM] Authorized SUPERADMIN direct message received from ${remoteJid} (${msg.pushName || "Superadmin"})`);
+        } else {
+          console.log(`[DM] Authorized admin direct message received from ${remoteJid} (${msg.pushName || "Admin"}), admin of ${adminGroups.length} group(s)`);
+        }
       }
 
       // Check for message revocation (deleted for everyone in WhatsApp)
@@ -4367,7 +4513,62 @@ async function executeTool(sock, chatId, sender, toolUse, msg) {
     if (chatId && chatId.endsWith("@g.us")) {
       return "⚠️ The !groups command can only be called via Direct Message (DM) with the bot.";
     }
-    return await handleListGroups(sock);
+    const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
+    if (!groupsConfig.isSuperAdmin(senderJid)) {
+      return "⚠️ Only the bot superadmin can view information of all WhatsApp groups.";
+    }
+    return await handleListGroups(sock, senderJid);
+  }
+  if (name === "add_group") {
+    if (chatId && chatId.endsWith("@g.us")) {
+      return "⚠️ Group configuration commands can only be called via Direct Message (DM) with the bot.";
+    }
+    const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
+    if (!groupsConfig.isSuperAdmin(senderJid)) {
+      return "⚠️ Only the bot superadmin can add groups to the configuration.";
+    }
+    const { jid, name: gName, ...rest } = input;
+    if (!jid) return "Please provide the group JID (e.g. 120363403838804497@g.us).";
+    const res = groupsConfig.addGroup(jid, { name: gName, ...rest });
+    return `✅ Added group "${res.name}" (\`${res.jid}\`) to groups.json configuration.`;
+  }
+  if (name === "remove_group") {
+    if (chatId && chatId.endsWith("@g.us")) {
+      return "⚠️ Group configuration commands can only be called via Direct Message (DM) with the bot.";
+    }
+    const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
+    if (!groupsConfig.isSuperAdmin(senderJid)) {
+      return "⚠️ Only the bot superadmin can remove groups from the configuration.";
+    }
+    const { jidOrName } = input;
+    if (!jidOrName) return "Please provide the group JID or name to remove.";
+    const res = groupsConfig.removeGroup(jidOrName);
+    if (!res) return `⚠️ Group "${jidOrName}" was not found in groups.json.`;
+    return `🗑️ Removed group "${res.name || res.jid}" (\`${res.jid}\`) from groups.json configuration.`;
+  }
+  if (name === "update_group_config" || name === "set_group_config") {
+    if (chatId && chatId.endsWith("@g.us")) {
+      return "⚠️ Group configuration commands can only be called via Direct Message (DM) with the bot.";
+    }
+    const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
+    if (!groupsConfig.isSuperAdmin(senderJid)) {
+      return "⚠️ Only the bot superadmin can modify group configurations.";
+    }
+    const { jidOrName, ...updates } = input;
+    if (!jidOrName) return "Please provide the group JID or name to update.";
+    const res = groupsConfig.updateGroupConfig(jidOrName, updates);
+    if (!res) return `⚠️ Group "${jidOrName}" was not found in groups.json.`;
+    return `✅ Updated configuration for "${res.name || res.jid}":\n${groupsConfig.formatGroupConfig(res.jid)}`;
+  }
+  if (name === "get_group_config") {
+    if (chatId && chatId.endsWith("@g.us")) {
+      return "⚠️ Group configuration commands can only be called via Direct Message (DM) with the bot.";
+    }
+    const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
+    if (!groupsConfig.isSuperAdmin(senderJid)) {
+      return "⚠️ Only the bot superadmin can view group configurations.";
+    }
+    return groupsConfig.formatGroupConfig(input?.jidOrName || null);
   }
   if (name === 'get_court_bookings' || name === 'get_court_reservations') {
     const res = await scvcc.getCourtBookings({ ...input, chatId });
@@ -4716,7 +4917,9 @@ async function getResponse(sock, rawText, chatId, sender, msg) {
 
   if (lower === '!help' || lower.startsWith('!help ')) {
     const specificCmd = text.slice('!help'.length).trim().replace(/^!/, '').toLowerCase();
-    return helpText(specificCmd || null);
+    const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
+    const isSuper = groupsConfig.isSuperAdmin(senderJid);
+    return helpText(specificCmd || null, isSuper);
   }
 
   if (
@@ -4731,8 +4934,93 @@ async function getResponse(sock, rawText, chatId, sender, msg) {
     if (chatId && chatId.endsWith("@g.us")) {
       return "⚠️ The `!groups` command can only be called via Direct Message (DM) with the bot.";
     }
-    return await handleListGroups(sock);
+    const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
+    if (!groupsConfig.isSuperAdmin(senderJid)) {
+      return "⚠️ Only the bot superadmin can use `!groups` to view group details.";
+    }
+    return await handleListGroups(sock, senderJid);
   }
+
+  // --- Superadmin Group Management Commands ---
+  if (lower.startsWith('!addgroup')) {
+    if (chatId && chatId.endsWith('@g.us')) {
+      return '⚠️ The `!addgroup` command can only be called via Direct Message (DM) with the bot.';
+    }
+    const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
+    if (!groupsConfig.isSuperAdmin(senderJid)) {
+      return '⚠️ Only the bot superadmin can add groups.';
+    }
+    const raw = text.replace(/^!addgroup\s*/i, '').trim();
+    const parts = raw.split(/\s+/);
+    const jid = parts[0];
+    const gName = parts.slice(1).join(' ').trim() || jid;
+    if (!jid || !jid.includes('@')) {
+      return 'Usage: !addgroup <groupJid> [name]\nExample: !addgroup 120363403838804497@g.us Bot-testing';
+    }
+    const res = groupsConfig.addGroup(jid, { name: gName });
+    return `✅ Added group "${res.name}" (\`${res.jid}\`) to groups.json configuration.`;
+  }
+
+  if (lower.startsWith('!removegroup') || lower.startsWith('!deletegroup') || lower.startsWith('!rmgroup')) {
+    if (chatId && chatId.endsWith('@g.us')) {
+      return '⚠️ The `!removegroup` command can only be called via Direct Message (DM) with the bot.';
+    }
+    const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
+    if (!groupsConfig.isSuperAdmin(senderJid)) {
+      return '⚠️ Only the bot superadmin can remove groups.';
+    }
+    const target = text.replace(/^!(?:removegroup|deletegroup|rmgroup)\s*/i, '').trim();
+    if (!target) {
+      return 'Usage: !removegroup <groupJid/name>\nExample: !removegroup Bot-testing';
+    }
+    const res = groupsConfig.removeGroup(target);
+    if (!res) {
+      return `⚠️ Group "${target}" was not found in groups.json.`;
+    }
+    return `🗑️ Removed group "${res.name || res.jid}" (\`${res.jid}\`) from groups.json configuration.`;
+  }
+
+  if (lower.startsWith('!setgroupconfig') || lower.startsWith('!updategroupconfig')) {
+    if (chatId && chatId.endsWith('@g.us')) {
+      return '⚠️ The `!setgroupconfig` command can only be called via Direct Message (DM) with the bot.';
+    }
+    const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
+    if (!groupsConfig.isSuperAdmin(senderJid)) {
+      return '⚠️ Only the bot superadmin can change group configurations.';
+    }
+    const raw = text.replace(/^!(?:setgroupconfig|updategroupconfig)\s*/i, '').trim();
+    if (!raw) {
+      return 'Usage: !setgroupconfig <groupJid/name> <key>=<value> ...\nExample: !setgroupconfig Bot-testing courtBookingEnabled=true sport=tennis directCourtBookingAccounts=165777365799110@lid';
+    }
+    const firstSpace = raw.search(/\s/);
+    if (firstSpace === -1) {
+      return 'Please specify at least one key=value configuration setting.\nExample: !setgroupconfig Bot-testing courtBookingEnabled=true';
+    }
+    const target = raw.slice(0, firstSpace).trim();
+    const rest = raw.slice(firstSpace).trim();
+    const updates = parseConfigKeyValueArgs(rest);
+    if (Object.keys(updates).length === 0) {
+      return 'Please specify settings in key=value format (e.g. courtBookingEnabled=true sport=tennis).';
+    }
+    const res = groupsConfig.updateGroupConfig(target, updates);
+    if (!res) {
+      return `⚠️ Group "${target}" was not found in groups.json.`;
+    }
+    return `✅ Updated configuration for "${res.name || res.jid}":\n${groupsConfig.formatGroupConfig(res.jid)}`;
+  }
+
+  if (lower.startsWith('!groupconfig') || lower.startsWith('!getgroupconfig')) {
+    if (chatId && chatId.endsWith('@g.us')) {
+      return '⚠️ The `!groupconfig` command can only be called via Direct Message (DM) with the bot.';
+    }
+    const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
+    if (!groupsConfig.isSuperAdmin(senderJid)) {
+      return '⚠️ Only the bot superadmin can view group configurations.';
+    }
+    const target = text.replace(/^!(?:groupconfig|getgroupconfig)\s*/i, '').trim();
+    return groupsConfig.formatGroupConfig(target || null);
+  }
+
 
   if (lower === '!reset') {
     const senderJid = msg?.key?.participant || msg?.key?.remoteJid;
