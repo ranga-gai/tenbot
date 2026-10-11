@@ -5887,27 +5887,10 @@ function formatRatings(chatId = null) {
 }
 
 /**
- * Retrieves the set of direct court booking user LIDs configured in .env.
+ * Retrieves the set of direct court booking accounts configured in groups.json.
  */
-function getDirectCourtBookingLids() {
-  const envVal = process.env.DIRECT_COURT_BOOKING_USER_LIDS ||
-    process.env.DIRECT_COURT_BOOKING_LIDS ||
-    process.env.DIRECT_BOOKING_USER_LIDS ||
-    process.env.DIRECT_BOOKING_LIDS || '';
-  if (!envVal || !envVal.trim()) return new Set();
-
-  const lids = new Set();
-  const tokens = envVal.split(/[,;\s]+/).map((t) => t.trim()).filter(Boolean);
-  for (const token of tokens) {
-    const raw = token.replace(/['"]/g, '');
-    lids.add(raw.toLowerCase());
-    if (!raw.endsWith('@lid')) {
-      lids.add(`${raw}@lid`.toLowerCase());
-    } else {
-      lids.add(raw.replace(/@lid$/i, '').toLowerCase());
-    }
-  }
-  return lids;
+function getDirectCourtBookingAccounts(chatId = null) {
+  return groupsConfig.getDirectCourtBookingAccounts(chatId);
 }
 
 /**
@@ -5944,17 +5927,17 @@ function isIgnoredCourt(courtName) {
 /**
  * Checks if a group member's LID (or phone number) matches any of the direct booking user LIDs.
  */
-function isDirectBookingUser(member) {
+function isDirectBookingUser(member, chatId = null) {
   if (!member) return false;
-  const directLids = getDirectCourtBookingLids();
-  if (directLids.size === 0) return false;
+  const directAccounts = getDirectCourtBookingAccounts(chatId);
+  if (directAccounts.size === 0) return false;
 
   const id = (member.id || '').toLowerCase();
   const idNum = id.split('@')[0];
   const pn = (member.pn || '').toLowerCase();
   const pnNum = pn.split('@')[0];
 
-  return directLids.has(id) || directLids.has(idNum) || (pn && (directLids.has(pn) || directLids.has(pnNum)));
+  return directAccounts.has(id) || directAccounts.has(idNum) || (pn && (directAccounts.has(pn) || directAccounts.has(pnNum)));
 }
 
 /**
@@ -6046,7 +6029,7 @@ function matchScvccPlayerToGroupMember(scvccPlayerName) {
  * 2. Otherwise:
  *    ALL the players in the court booking must be members of this group.
  */
-function detectPrebookedCourt(booking) {
+function detectPrebookedCourt(booking, chatId = null) {
   if (!booking || !Array.isArray(booking.players)) return null;
   if (isIgnoredCourt(booking.court)) return null;
 
@@ -6062,7 +6045,7 @@ function detectPrebookedCourt(booking) {
     const member = matchScvccPlayerToGroupMember(p);
     if (member) {
       matchedMembers.push(member);
-      if (isDirectBookingUser(member)) {
+      if (isDirectBookingUser(member, chatId)) {
         if (!directBookingMember) directBookingMember = member;
       }
     } else {
@@ -6268,7 +6251,7 @@ async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWor
       for (const b of bookings) {
         if (isIgnoredCourt(b.court)) continue;
         if (seenPrebooked.has(b.court)) continue;
-        const prebookedMatch = detectPrebookedCourt(b);
+        const prebookedMatch = detectPrebookedCourt(b, remoteJid);
         if (prebookedMatch) {
           prebookedCourts.push({
             court: b.court,
@@ -7044,7 +7027,7 @@ async function getPrebookedCourtsForPoll(pollState) {
         for (const b of bookingsRes?.bookings || []) {
           if (isIgnoredCourt(b.court)) continue;
           if (seen.has(b.court)) continue;
-          const prebookedMatch = detectPrebookedCourt(b);
+          const prebookedMatch = detectPrebookedCourt(b, pollState?.remoteJid || chatId);
           if (prebookedMatch) {
             courts.push({ court: b.court, player: prebookedMatch.player });
             seen.add(b.court);
