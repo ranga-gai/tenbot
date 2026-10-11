@@ -2,15 +2,16 @@
   "defaults": {
     "sport": "tennis",
     "courtBookingEnabled": true,
-    "courtConfig": "SCVCC",
-    "venue": "SCVCC",
     "autoMatchups": true
   },
   "groups": {
     "xxxxxxxx@g.us": {
       "name": "xxxxxxxx",
       "courtBookingEnabled": true,
-      "courtConfig": "SCVCC"
+      "courtConfig": "SCVCC",
+      "defaultBookingPlayers": [
+        ["Player 1", "Player 2", "Player 3", "Player 4"]
+      ]
     }
   }
 }
