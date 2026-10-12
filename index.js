@@ -6920,8 +6920,7 @@ async function preBookCourtsForMatch({
           availableDirectAccounts = availableDirectAccounts.filter(p => p.toLowerCase().trim() !== p1.toLowerCase().trim());
 
           if (sock && remoteJid && bookRes.message) {
-            messageHistory.recordMessage(remoteJid, 'tenbot', bookRes.message, Date.now(), true);
-            await sock.sendMessage(remoteJid, { text: bookRes.message });
+            // Booking confirmation notifications are sent only to designated notification contacts (via DM), never to the group
             await sendBookingNotifications(sock, remoteJid, bookRes.message);
           }
 
