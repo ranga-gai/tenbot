@@ -11,14 +11,20 @@
       "courtBookingEnabled": true,
       "courtConfig": "SCVCC",
       "defaultBookingPlayers": [
-        [
-          "Player 1",
-          "Player 2",
-          "Player 3",
-          "Player 4"
-        ]
+        "Player 2",
+        "Player 3",
+        "Player 4"
       ],
-      "preBookCourts": 1
+      "preBookCourts": 1,
+      "directCourtBookingAccounts": [
+        "Player 1"
+      ],
+      "bookingNotifications": [
+        "xxxxxxxx@lid"
+      ],
+      "bookingCourtPreference": [
+        2, 3, 1
+      ]
     }
   }
 }

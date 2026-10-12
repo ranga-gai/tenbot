@@ -904,6 +904,20 @@ const CLAUDE_TOOLS = [
   },
 
   {
+    name: "cancel_court_reservation",
+    description: "Cancels a tennis or pickleball court reservation at Silver Creek Valley Country Club (SCVCC) by reservation ID.",
+    input_schema: {
+      type: "object",
+      properties: {
+        reservationId: {
+          type: "string",
+          description: "The reservation ID to cancel (e.g. \"194192\", \"194147\")."
+        }
+      },
+      required: ["reservationId"]
+    }
+  },
+  {
     name: "list_groups",
     description: "Lists all WhatsApp groups the bot is currently a participating member of, showing group names, WhatsApp JIDs, participant counts, and configuration status. Superadmin only via DM.",
     input_schema: {
@@ -945,7 +959,7 @@ const CLAUDE_TOOLS = [
         directCourtBookingAccounts: {
           type: "array",
           items: { type: "string" },
-          description: "Member WhatsApp LIDs authorized for direct court booking."
+          description: "Member full names authorized for direct court booking."
         },
         preBookCourts: {
           type: "integer",
@@ -953,6 +967,16 @@ const CLAUDE_TOOLS = [
         },
         defaultBookingPlayers: {
           description: "Default list of player names for pre-booking courts. Can be an array of player names (e.g. ['P1', 'P2']) or array of arrays for booking multiple courts (e.g. [['P1', 'P2'], ['P3', 'P4']])."
+        },
+        bookingNotifications: {
+          type: "array",
+          items: { type: "string" },
+          description: "WhatsApp LIDs authorized to receive court booking confirmations and cancellation messages for this group."
+        },
+        bookingCourtPreference: {
+          type: "array",
+          items: { type: "integer" },
+          description: "Preferred order of courts to book if available (e.g. [2, 3, 1, 5, 6])."
         }
       }
     }
@@ -1009,7 +1033,7 @@ const CLAUDE_TOOLS = [
         directCourtBookingAccounts: {
           type: "array",
           items: { type: "string" },
-          description: "Authorized member LIDs for direct court booking."
+          description: "Authorized member full names for direct court booking."
         },
         ignoredCourts: {
           type: "array",
@@ -1022,6 +1046,16 @@ const CLAUDE_TOOLS = [
         },
         defaultBookingPlayers: {
           description: "Default list of player names for pre-booking courts. Can be an array of player names (e.g. ['P1', 'P2']) or array of arrays for multiple courts (e.g. [['P1', 'P2'], ['P3', 'P4']])."
+        },
+        bookingNotifications: {
+          type: "array",
+          items: { type: "string" },
+          description: "WhatsApp LIDs authorized to receive court booking confirmations and cancellation messages for this group."
+        },
+        bookingCourtPreference: {
+          type: "array",
+          items: { type: "integer" },
+          description: "Preferred order of courts to book if available (e.g. [2, 3, 1, 5, 6])."
         }
       },
       required: ["jidOrName"]
@@ -2259,6 +2293,33 @@ function safeDecryptPollVote(votePayload, pollMsgId, pollEncKey, pollCreatorCand
   }
 
   throw lastError || new Error('Failed to decrypt poll vote: no matching JID combination authenticated');
+}
+
+/**
+ * Sends court booking confirmations and cancellation messages to LIDs specified
+ * in bookingNotifications configuration for the group.
+ */
+async function sendBookingNotifications(sock, chatId, message) {
+  const activeSock = sock || botSock;
+  if (!activeSock || !chatId || !message) return;
+  try {
+    const recipients = groupsConfig.getBookingNotifications(chatId);
+    if (!recipients || recipients.length === 0) return;
+
+    for (const recipient of recipients) {
+      if (chatId.toLowerCase() === recipient.toLowerCase()) continue;
+
+      try {
+        messageHistory.recordMessage(recipient, "tenbot", message, Date.now(), true);
+        await activeSock.sendMessage(recipient, { text: message });
+        console.log(`[notifications] Sent booking notification to ${recipient} for group ${chatId}`);
+      } catch (err) {
+        console.error(`[notifications] Failed to send booking notification to ${recipient}:`, err.message);
+      }
+    }
+  } catch (err) {
+    console.error("[notifications] Error in sendBookingNotifications:", err.message);
+  }
 }
 
 /**
@@ -4840,7 +4901,18 @@ async function executeTool(sock, chatId, sender, toolUse, msg) {
   }
   if (name === 'book_court') {
     const res = await scvcc.bookCourt({ ...input, requester: input.requester || sender, chatId });
+    if (res && res.success && res.message) {
+      await sendBookingNotifications(sock, chatId, res.message);
+    }
     return res?.message || 'Court booked.';
+  }
+  if (name === 'cancel_court' || name === 'cancel_court_reservation' || name === 'cancel_court_booking') {
+    const resId = input.reservationId || input.resId || input.id;
+    const res = await scvcc.cancelCourtReservation(resId, chatId);
+    if (res && res.success && res.message) {
+      await sendBookingNotifications(sock, chatId, res.message);
+    }
+    return res?.message || 'Could not cancel reservation.';
   }
   if (name === 'get_my_court_bookings') {
     const res = await scvcc.getMyReservations();
@@ -5301,7 +5373,7 @@ async function getResponse(sock, rawText, chatId, sender, msg) {
     }
     const raw = text.replace(/^!(?:setgroupconfig|updategroupconfig)\s*/i, '').trim();
     if (!raw) {
-      return 'Usage: !setgroupconfig <groupJid/name> <key>=<value> ...\nExample: !setgroupconfig Bot-testing courtBookingEnabled=true sport=tennis directCourtBookingAccounts=165777365799110@lid';
+      return 'Usage: !setgroupconfig <groupJid/name> <key>=<value> ...\nExample: !setgroupconfig Bot-testing courtBookingEnabled=true sport=tennis directCourtBookingAccounts="Pramod Immaneni, Conrad Rodricks"';
     }
     const firstSpace = raw.search(/\s/);
     if (firstSpace === -1) {
@@ -5367,15 +5439,18 @@ async function getResponse(sock, rawText, chatId, sender, msg) {
       return '⚠️ Please provide date, time, and optional court for booking, e.g. `!bookcourt Court 2 9am tomorrow`.';
     }
     const res = await scvcc.bookCourt({ ...parsed, requester: sender, chatId });
+    if (res && res.success && res.message) {
+      await sendBookingNotifications(sock, chatId, res.message);
+    }
     return res?.message || 'Could not complete court booking.';
   }
 
-  if (lower.startsWith('!cancelcourt') || lower.startsWith('!cancelreservation')) {
-    const resIdMatch = text.match(/!(?:cancelcourt|cancelreservation)\s+([A-Za-z0-9_]+)/i);
-    if (!resIdMatch) {
-      return '⚠️ Please specify the reservation ID to cancel, e.g. `!cancelcourt 194147`.';
+  const cancelCourtMatch = text.match(/(?:!(?:cancelcourt|cancelreservation)|\b(?:cancel|delete)\s+(?:court\s+)?(?:reservation|booking)\b)\s+([A-Za-z0-9_]+)/i);
+  if (cancelCourtMatch) {
+    const res = await scvcc.cancelCourtReservation(cancelCourtMatch[1], chatId);
+    if (res && res.success && res.message) {
+      await sendBookingNotifications(sock, chatId, res.message);
     }
-    const res = await scvcc.cancelCourtReservation(resIdMatch[1], chatId);
     return res?.message || 'Could not cancel reservation.';
   }
 
@@ -6526,8 +6601,10 @@ function isDirectBookingUser(member, chatId = null) {
   const idNum = id.split('@')[0];
   const pn = (member.pn || '').toLowerCase();
   const pnNum = pn.split('@')[0];
+  const full = (member.fullName || '').toLowerCase().trim();
+  const disp = (member.name || '').toLowerCase().trim();
 
-  return directAccounts.has(id) || directAccounts.has(idNum) || (pn && (directAccounts.has(pn) || directAccounts.has(pnNum)));
+  return directAccounts.has(id) || directAccounts.has(idNum) || (pn && (directAccounts.has(pn) || directAccounts.has(pnNum))) || (full && directAccounts.has(full)) || (disp && directAccounts.has(disp));
 }
 
 /**
@@ -6817,17 +6894,6 @@ async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWor
   // Advance court booking: if courtBookingType is 'pre-book', book court(s) before creating poll instance
   const isPreBook = String(courtBookingType).toLowerCase() === 'pre-book' || String(courtBookingType).toLowerCase() === 'prebook';
   if (isPreBook && groupsConfig.isCourtBookingEnabled(remoteJid)) {
-    let listsToBook = [];
-    if (bookingPlayers) {
-      listsToBook = groupsConfig.normalizeBookingPlayerLists(bookingPlayers);
-    }
-    if (!listsToBook || listsToBook.length === 0) {
-      listsToBook = groupsConfig.getDefaultBookingPlayers(remoteJid);
-    }
-    if (!listsToBook || listsToBook.length === 0) {
-      listsToBook = [[creatorName || 'Member']];
-    }
-
     const groupCfg = groupsConfig.getGroupConfig(remoteJid);
     const sport = groupCfg?.sport || 'tennis';
 
@@ -6853,59 +6919,167 @@ async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWor
 
     console.log(`[poll] Pre-book court calculation for ${remoteJid}: size=${size}, isAuto=${isAuto}, targetCourtsCount=${targetCourtsCount}`);
 
-    const defaultLists = groupsConfig.getDefaultBookingPlayers(remoteJid);
+    // Helper to shuffle an array (Fisher-Yates)
+    const shuffleArray = (arr) => {
+      const copy = [...arr];
+      for (let i = copy.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [copy[i], copy[j]] = [copy[j], copy[i]];
+      }
+      return copy;
+    };
 
-    // Adjust listsToBook to match targetCourtsCount
-    if (listsToBook.length > targetCourtsCount) {
-      listsToBook = listsToBook.slice(0, targetCourtsCount);
-    } else if (listsToBook.length < targetCourtsCount) {
-      while (listsToBook.length < targetCourtsCount) {
-        const nextIdx = listsToBook.length;
-        if (defaultLists && defaultLists[nextIdx]) {
-          listsToBook.push(defaultLists[nextIdx]);
-        } else if (defaultLists && defaultLists[0]) {
-          listsToBook.push(defaultLists[0]);
-        } else {
-          listsToBook.push([creatorName || 'Member']);
-        }
+    // 1. Get candidate pool of booking players (flat list from bookingPlayers or defaultBookingPlayers)
+    let rawPool = [];
+    if (bookingPlayers) {
+      rawPool = Array.isArray(bookingPlayers) ? bookingPlayers : (typeof bookingPlayers === 'string' ? bookingPlayers.split(/[,;]+/).map(s => s.trim()).filter(Boolean) : []);
+    }
+    if (!rawPool || rawPool.length === 0) {
+      rawPool = groupsConfig.getDefaultBookingPlayers(remoteJid);
+    }
+    if (!rawPool || rawPool.length === 0) {
+      rawPool = [creatorName || 'Member'];
+    }
+
+    // Resolve each player's full name and deduplicate case-insensitively
+    const seenPoolNames = new Set();
+    const candidatePool = [];
+    for (const p of rawPool) {
+      const resolved = namesStore.resolveFullName(p);
+      const key = resolved.toLowerCase().trim();
+      if (!seenPoolNames.has(key)) {
+        seenPoolNames.add(key);
+        candidatePool.push(resolved);
       }
     }
 
-    for (let i = 0; i < listsToBook.length; i++) {
-      const pList = listsToBook[i];
-      try {
-        console.log(`[poll] Pre-booking court ${i + 1}/${listsToBook.length} for ${remoteJid} on ${targetDateMDY} at ${queryTime} with players:`, pList);
-        const bookRes = await scvcc.bookCourt({
-          when: targetDateMDY,
-          date: targetDateMDY,
-          time: queryTime,
-          players: pList,
-          requester: pList[0] || creatorName || 'Member',
-          requestedBy: creatorName || 'Member',
-          sport,
-          chatId: remoteJid
-        });
-        if (bookRes && bookRes.success) {
-          advanceBookedCourts.push({
-            court: bookRes.court,
-            players: bookRes.players || pList,
-            date: bookRes.date,
-            time: bookRes.time
-          });
-          prebookedCourts.push({
-            court: bookRes.court,
-            player: pList[0] || creatorName || 'Member',
-            fullName: (pList && pList.length > 0) ? pList.join(', ') : (creatorName || 'Member')
-          });
-          if (sock && remoteJid && bookRes.message) {
-            messageHistory.recordMessage(remoteJid, 'tenbot', bookRes.message, Date.now(), true);
-            await sock.sendMessage(remoteJid, { text: bookRes.message });
+    // 2. Identify authorized direct court booking accounts for this group (full names)
+    const directNames = groupCfg?.directCourtBookingAccounts || [];
+    const directBookingPlayers = [];
+    for (const name of directNames) {
+      const resolved = namesStore.resolveFullName(name);
+      const key = resolved.toLowerCase().trim();
+      if (!directBookingPlayers.some(dp => dp.toLowerCase().trim() === key)) {
+        directBookingPlayers.push(resolved);
+      }
+      if (!seenPoolNames.has(key)) {
+        seenPoolNames.add(key);
+        candidatePool.push(resolved);
+      }
+    }
+
+    const playersPerCourt = (!isAuto && size && parseInt(size, 10) === 2) ? 2 : 4;
+    const bookedPlayerKeys = new Set();
+    let availableDirectAccounts = shuffleArray(directBookingPlayers);
+
+    for (let courtIdx = 0; courtIdx < targetCourtsCount; courtIdx++) {
+      let courtBooked = false;
+      const MAX_RETRIES = 2; // 2 retries on failure (total 3 attempts)
+      const MAX_ATTEMPTS = 1 + MAX_RETRIES;
+      const triedSetsForCourt = new Set();
+
+      for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+        // Find players not yet booked on any previous court
+        const unbookedDirect = availableDirectAccounts.filter(p => !bookedPlayerKeys.has(p.toLowerCase().trim()));
+        const unbookedCandidates = candidatePool.filter(p => !bookedPlayerKeys.has(p.toLowerCase().trim()));
+
+        // Condition: The first player in the group for a court should be one of the players in directCourtBookingAccounts unless that list is exhausted
+        let p1 = null;
+        if (unbookedDirect.length > 0) {
+          const shuffledDirect = shuffleArray(unbookedDirect);
+          p1 = shuffledDirect[0];
+        } else {
+          const shuffledCandidates = shuffleArray(unbookedCandidates);
+          p1 = shuffledCandidates[0] || (creatorName || 'Member');
+        }
+
+        // Available teammates: all unbooked candidates except p1
+        const availableTeammates = unbookedCandidates.filter(p => p.toLowerCase().trim() !== p1.toLowerCase().trim());
+        const neededTeammates = Math.max(0, playersPerCourt - 1);
+        let selectedTeammates = [];
+
+        if (availableTeammates.length > 0 && neededTeammates > 0) {
+          let foundNewCombo = false;
+          for (let sampleTry = 0; sampleTry < 15; sampleTry++) {
+            const shuffledTeammates = shuffleArray(availableTeammates);
+            const candidateTeammates = shuffledTeammates.slice(0, neededTeammates);
+            const setSig = [p1, ...candidateTeammates].map(x => x.toLowerCase().trim()).sort().join('|');
+            if (!triedSetsForCourt.has(setSig)) {
+              selectedTeammates = candidateTeammates;
+              triedSetsForCourt.add(setSig);
+              foundNewCombo = true;
+              break;
+            }
+          }
+          if (!foundNewCombo) {
+            selectedTeammates = shuffleArray(availableTeammates).slice(0, neededTeammates);
+            const setSig = [p1, ...selectedTeammates].map(x => x.toLowerCase().trim()).sort().join('|');
+            triedSetsForCourt.add(setSig);
           }
         } else {
-          console.warn(`[poll] Advance court booking failed for court ${i + 1}/${listsToBook.length}:`, bookRes?.message);
+          const setSig = [p1].map(x => x.toLowerCase().trim()).join('|');
+          triedSetsForCourt.add(setSig);
         }
-      } catch (bookErr) {
-        console.error(`[poll] Error during advance court booking:`, bookErr.message);
+
+        const currentCourtPlayers = [p1, ...selectedTeammates];
+        const retryLabel = attempt > 1 ? ` (retry ${attempt - 1}/${MAX_RETRIES})` : '';
+        console.log(`[poll] Pre-booking court ${courtIdx + 1}/${targetCourtsCount}${retryLabel} for ${remoteJid} on ${targetDateMDY} at ${queryTime} with players:`, currentCourtPlayers);
+
+        try {
+          const bookRes = await scvcc.bookCourt({
+            when: targetDateMDY,
+            date: targetDateMDY,
+            time: queryTime,
+            players: currentCourtPlayers,
+            requester: currentCourtPlayers[0] || creatorName || 'Member',
+            requestedBy: creatorName || 'Member',
+            sport,
+            chatId: remoteJid
+          });
+
+          if (bookRes && bookRes.success) {
+            advanceBookedCourts.push({
+              court: bookRes.court,
+              players: bookRes.players || currentCourtPlayers,
+              date: bookRes.date,
+              time: bookRes.time
+            });
+            prebookedCourts.push({
+              court: bookRes.court,
+              player: currentCourtPlayers[0] || creatorName || 'Member',
+              fullName: (currentCourtPlayers && currentCourtPlayers.length > 0) ? currentCourtPlayers.join(', ') : (creatorName || 'Member')
+            });
+
+            // Mark these players as booked so subsequent courts do not repeat them
+            currentCourtPlayers.forEach(p => bookedPlayerKeys.add(p.toLowerCase().trim()));
+
+            // Remove p1 from availableDirectAccounts so direct list progresses towards exhaustion
+            availableDirectAccounts = availableDirectAccounts.filter(p => p.toLowerCase().trim() !== p1.toLowerCase().trim());
+
+            if (sock && remoteJid && bookRes.message) {
+              messageHistory.recordMessage(remoteJid, 'tenbot', bookRes.message, Date.now(), true);
+              await sock.sendMessage(remoteJid, { text: bookRes.message });
+              await sendBookingNotifications(sock, remoteJid, bookRes.message);
+            }
+
+            courtBooked = true;
+            break; // Succeeded, exit retry loop for this court
+          } else {
+            console.warn(`[poll] Advance court booking failed for court ${courtIdx + 1}/${targetCourtsCount}${retryLabel}:`, bookRes?.message);
+            if (attempt <= MAX_RETRIES) {
+              console.log(`[poll] Retrying court ${courtIdx + 1}/${targetCourtsCount} with another set of random players...`);
+            }
+          }
+        } catch (bookErr) {
+          console.error(`[poll] Error during advance court booking for court ${courtIdx + 1}/${targetCourtsCount}${retryLabel}:`, bookErr.message);
+          if (attempt <= MAX_RETRIES) {
+            console.log(`[poll] Retrying court ${courtIdx + 1}/${targetCourtsCount} with another set of random players...`);
+          }
+        }
+      }
+
+      if (!courtBooked) {
+        console.warn(`[poll] Advance court booking failed for court ${courtIdx + 1}/${targetCourtsCount} after all ${MAX_ATTEMPTS} attempts.`);
       }
     }
   }
