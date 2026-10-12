@@ -6842,7 +6842,8 @@ async function preBookCourtsForMatch({
 
   for (let courtIdx = alreadyBookedCount; courtIdx < targetCourtsCount; courtIdx++) {
     let courtBooked = false;
-    const MAX_RETRIES = 2;
+    const MAX_RETRIES = 3;
+    const RETRY_DELAY_MS = 45 * 1000;
     const MAX_ATTEMPTS = 1 + MAX_RETRIES;
     const triedSetsForCourt = new Set();
 
@@ -6928,15 +6929,14 @@ async function preBookCourtsForMatch({
           break;
         } else {
           console.warn(`[poll] Advance court booking failed for court ${courtIdx + 1}/${targetCourtsCount}${retryLabel}:`, bookRes?.message);
-          if (attempt <= MAX_RETRIES) {
-            console.log(`[poll] Retrying court ${courtIdx + 1}/${targetCourtsCount} with another set of random players...`);
-          }
         }
       } catch (bookErr) {
         console.error(`[poll] Error during advance court booking for court ${courtIdx + 1}/${targetCourtsCount}${retryLabel}:`, bookErr.message);
-        if (attempt <= MAX_RETRIES) {
-          console.log(`[poll] Retrying court ${courtIdx + 1}/${targetCourtsCount} with another set of random players...`);
-        }
+      }
+
+      if (!courtBooked && attempt <= MAX_RETRIES) {
+        console.log(`[poll] Waiting 45s before retrying court ${courtIdx + 1}/${targetCourtsCount} with another set of random players...`);
+        await new Promise((r) => setTimeout(r, RETRY_DELAY_MS));
       }
     }
 
