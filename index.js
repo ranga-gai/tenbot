@@ -273,6 +273,10 @@ const CLAUDE_TOOLS = [
           enum: ['pre-book', 'none'],
           description: 'Optional court booking type. If "pre-book", automatically books a court in advance before creating the poll instance.'
         },
+        preBookCourts: {
+          type: 'integer',
+          description: "Optional number of courts to pre-book when poll size is 'auto'. If not specified, uses group setting or defaults to 1."
+        },
         bookingPlayers: {
           description: 'Optional player names to use for court pre-booking. Can be a single list of names (e.g. ["P1", "P2"]) or multiple lists for booking more than one court (e.g. [["P1", "P2"], ["P3", "P4"]]). If omitted, the default list from group configuration is used.'
         }
@@ -582,6 +586,10 @@ const CLAUDE_TOOLS = [
           enum: ['pre-book', 'none'],
           description: 'Optional court booking type. If "pre-book", automatically books a court in advance before posting each recurring poll instance.'
         },
+        preBookCourts: {
+          type: 'integer',
+          description: "Optional number of courts to pre-book when recurring poll size is 'auto'. If not specified, uses group setting or defaults to 1."
+        },
         bookingPlayers: {
           description: 'Optional player names to use for advance court booking. Can be multiple lists for booking more than one court. If omitted, the group configuration default list will be used.'
         }
@@ -659,6 +667,10 @@ const CLAUDE_TOOLS = [
           type: 'string',
           enum: ['pre-book', 'none'],
           description: 'Optional new court booking type ("pre-book" or "none").'
+        },
+        preBookCourts: {
+          type: 'integer',
+          description: "Optional number of courts to pre-book when recurring poll size is 'auto'."
         },
         bookingPlayers: {
           description: 'Optional player names to use for advance booking (multiple lists supported for multiple courts).'
@@ -742,6 +754,10 @@ const CLAUDE_TOOLS = [
           type: 'string',
           enum: ['pre-book', 'none'],
           description: 'Optional court booking type ("pre-book" or "none").'
+        },
+        preBookCourts: {
+          type: 'integer',
+          description: "Optional number of courts to pre-book when poll size is 'auto'."
         },
         bookingPlayers: {
           description: 'Optional player names to use for advance booking (multiple lists supported for booking more than one court).'
@@ -931,6 +947,10 @@ const CLAUDE_TOOLS = [
           items: { type: "string" },
           description: "Member WhatsApp LIDs authorized for direct court booking."
         },
+        preBookCourts: {
+          type: "integer",
+          description: "Number of courts to pre-book when poll size is 'auto' (defaults to 1 if not specified)."
+        },
         defaultBookingPlayers: {
           description: "Default list of player names for pre-booking courts. Can be an array of player names (e.g. ['P1', 'P2']) or array of arrays for booking multiple courts (e.g. [['P1', 'P2'], ['P3', 'P4']])."
         }
@@ -995,6 +1015,10 @@ const CLAUDE_TOOLS = [
           type: "array",
           items: { type: "string" },
           description: "Courts to ignore."
+        },
+        preBookCourts: {
+          type: "integer",
+          description: "Number of courts to pre-book when poll size is 'auto' (defaults to 1 if not specified)."
         },
         defaultBookingPlayers: {
           description: "Default list of player names for pre-booking courts. Can be an array of player names (e.g. ['P1', 'P2']) or array of arrays for multiple courts (e.g. [['P1', 'P2'], ['P3', 'P4']])."
@@ -1614,6 +1638,15 @@ function parsePollCreationText(text) {
     courtBookingType = 'none';
   }
 
+  let preBookCourts = null;
+  const pbCourtsMatch = text.match(/(?:--(?:pre-?book-?courts?|courts-?to-?book|prebook-?courts?)(?:=(\d+)|\s+(\d+))|\b(?:pre-?book|book)\s+(\d+)\s+courts?|\b(?:pre-?book-?courts?|preBookCourts)\s*[:=]\s*(\d+))/i);
+  if (pbCourtsMatch) {
+    const valStr = pbCourtsMatch[1] || pbCourtsMatch[2] || pbCourtsMatch[3] || pbCourtsMatch[4];
+    if (valStr && parseInt(valStr, 10) > 0) {
+      preBookCourts = parseInt(valStr, 10);
+    }
+  }
+
   // Determine bookingPlayers if specified in message
   let bookingPlayers = null;
   const bpFlagMatch = text.match(/(?:--(?:booking-?players?|booking-?names?|players?)\s*=?|(?:booking[-_\s]*players?|booking[-_\s]*names?|players?)\s*[:=]|\bwith\s+players?\s+)\s*(?:"([^"]+)"|'([^']+)'|(\[[^\]]+\](?:\s*,\s*\[[^\]]+\])*)|([^\n\r-]+?))(?=\s+--|$)/i);
@@ -1631,6 +1664,7 @@ function parsePollCreationText(text) {
 
   return {
     courtBookingType,
+    preBookCourts,
     bookingPlayers,
     size,
     when,
@@ -1688,7 +1722,8 @@ async function handleDirectPollCreation(sock, chatId, sender, msg, parsed, opts 
     null,
     court,
     courtBookingType,
-    bookingPlayers
+    bookingPlayers,
+    parsed.preBookCourts || null
   );
 
   if (res?.err) {
@@ -3011,6 +3046,14 @@ function parseModifyInstanceCommand(rawText) {
     updates.courtBookingType = 'none';
   }
 
+  const pbCourtsModMatch = rem.match(/(?:--(?:pre-?book-?courts?|courts-?to-?book|prebook-?courts?)(?:=(\d+)|\s+(\d+))|\b(?:pre-?book|book)\s+(\d+)\s+courts?|\b(?:pre-?book-?courts?|preBookCourts)\s*[:=]\s*(\d+))/i);
+  if (pbCourtsModMatch) {
+    const valStr = pbCourtsModMatch[1] || pbCourtsModMatch[2] || pbCourtsModMatch[3] || pbCourtsModMatch[4];
+    if (valStr && parseInt(valStr, 10) > 0) {
+      updates.preBookCourts = parseInt(valStr, 10);
+    }
+  }
+
   const bpMatch = rem.match(/(?:--(?:booking-?players?|booking-?names?|players?)\s*=?|(?:booking[-_\s]*players?|booking[-_\s]*names?|players?)\s*[:=]|\bwith\s+players?\s+)\s*(?:"([^"]+)"|'([^']+)'|(\[[^\]]+\](?:\s*,\s*\[[^\]]+\])*)|([^\n\r-]+?))(?=\s+--|$)/i);
   if (bpMatch) {
     const rawVal = bpMatch[1] || bpMatch[2] || bpMatch[3] || bpMatch[4];
@@ -3171,6 +3214,9 @@ async function handleModifyPollInstance(sock, chatId, sender, senderJid, targetI
   const bookingPlayers = updates.bookingPlayers !== undefined
     ? updates.bookingPlayers
     : (matchedPollState.bookingPlayers || null);
+  const preBookCourts = updates.preBookCourts !== undefined
+    ? updates.preBookCourts
+    : (updates.preBookCourtsCount !== undefined ? updates.preBookCourtsCount : (matchedPollState.preBookCourts || null));
 
   const res = await createMatchPoll(
     sock,
@@ -3192,7 +3238,8 @@ async function handleModifyPollInstance(sock, chatId, sender, senderJid, targetI
     schedId,
     newCourt,
     courtBookingType,
-    bookingPlayers
+    bookingPlayers,
+    preBookCourts
   );
 
   if (res?.err) {
@@ -4550,7 +4597,12 @@ async function executeTool(sock, chatId, sender, toolUse, msg) {
     const includePrebookedSpots = input['prebooked-spots'] === true || input.prebookedSpots === true || input.includePrebookedSpots === true;
     const courtBookingType = input.courtBookingType || null;
     const bookingPlayers = input.bookingPlayers ? groupsConfig.normalizeBookingPlayerLists(input.bookingPlayers) : null;
-    const res = await createMatchPoll(sock, targetChatId, size, when, dayWord, timeWord, creatorName, creatorJid, includeCreator, replacePollId, cancelExisting, false, noMatchups, checkCourts, includePrebookedSpots, false, null, court, courtBookingType, bookingPlayers);
+    const preBookCourts = (input.preBookCourts !== undefined && input.preBookCourts !== null && parseInt(input.preBookCourts, 10) > 0)
+      ? parseInt(input.preBookCourts, 10)
+      : (input.preBookCourtsCount !== undefined && input.preBookCourtsCount !== null && parseInt(input.preBookCourtsCount, 10) > 0
+        ? parseInt(input.preBookCourtsCount, 10)
+        : null);
+    const res = await createMatchPoll(sock, targetChatId, size, when, dayWord, timeWord, creatorName, creatorJid, includeCreator, replacePollId, cancelExisting, false, noMatchups, checkCourts, includePrebookedSpots, false, null, court, courtBookingType, bookingPlayers, preBookCourts);
     if (res?.err) {
       return `Could not create poll: ${res.err}`;
     }
@@ -6630,7 +6682,7 @@ const inFlightPollCreations = new Set();
  *   "Yes" and "No". The bot then waits for a user prompt to generate matchups from Yes voters.
  * - If replacePollId or cancelExisting is specified, deletes the older poll from WhatsApp.
  */
-async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWord = null, timeWord = null, creatorName = null, creatorJid = null, includeCreator = true, replacePollId = null, cancelExisting = false, isCommand = false, noMatchups = false, checkCourts = false, includePrebookedSpots = false, isRecurring = false, scheduleId = null, targetCourt = null, courtBookingType = null, bookingPlayers = null) {
+async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWord = null, timeWord = null, creatorName = null, creatorJid = null, includeCreator = true, replacePollId = null, cancelExisting = false, isCommand = false, noMatchups = false, checkCourts = false, includePrebookedSpots = false, isRecurring = false, scheduleId = null, targetCourt = null, courtBookingType = null, bookingPlayers = null, preBookCourts = null) {
   const isAuto = size === 'auto' || String(size).toLowerCase() === 'auto';
   const isOptIn = !size && !isAuto;
 
@@ -6778,6 +6830,46 @@ async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWor
 
     const groupCfg = groupsConfig.getGroupConfig(remoteJid);
     const sport = groupCfg?.sport || 'tennis';
+
+    // Calculate number of courts to pre-book:
+    // 1. If number of players is known, use it as a proxy (e.g. 4 -> 1 court, 8 -> 2 courts, etc.)
+    // 2. If number of players is specified as auto (or opt-in), use setting by which user can specify number of courts to pre-book; if not specified, default to 1 court.
+    let targetCourtsCount = 1;
+    if (!isAuto && size && parseInt(size, 10) > 0) {
+      const numPlayers = parseInt(size, 10);
+      targetCourtsCount = Math.max(1, Math.ceil(numPlayers / 4));
+    } else {
+      const explicitCourts = (preBookCourts !== undefined && preBookCourts !== null && parseInt(preBookCourts, 10) > 0)
+        ? parseInt(preBookCourts, 10)
+        : null;
+      const cfgCourts = (groupCfg?.preBookCourts !== undefined && groupCfg?.preBookCourts !== null && parseInt(groupCfg.preBookCourts, 10) > 0)
+        ? parseInt(groupCfg.preBookCourts, 10)
+        : (groupCfg?.preBookCourtsCount !== undefined && groupCfg?.preBookCourtsCount !== null && parseInt(groupCfg.preBookCourtsCount, 10) > 0
+          ? parseInt(groupCfg.preBookCourtsCount, 10)
+          : 1);
+
+      targetCourtsCount = explicitCourts || cfgCourts || 1;
+    }
+
+    console.log(`[poll] Pre-book court calculation for ${remoteJid}: size=${size}, isAuto=${isAuto}, targetCourtsCount=${targetCourtsCount}`);
+
+    const defaultLists = groupsConfig.getDefaultBookingPlayers(remoteJid);
+
+    // Adjust listsToBook to match targetCourtsCount
+    if (listsToBook.length > targetCourtsCount) {
+      listsToBook = listsToBook.slice(0, targetCourtsCount);
+    } else if (listsToBook.length < targetCourtsCount) {
+      while (listsToBook.length < targetCourtsCount) {
+        const nextIdx = listsToBook.length;
+        if (defaultLists && defaultLists[nextIdx]) {
+          listsToBook.push(defaultLists[nextIdx]);
+        } else if (defaultLists && defaultLists[0]) {
+          listsToBook.push(defaultLists[0]);
+        } else {
+          listsToBook.push([creatorName || 'Member']);
+        }
+      }
+    }
 
     for (let i = 0; i < listsToBook.length; i++) {
       const pList = listsToBook[i];
@@ -6936,8 +7028,9 @@ async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWor
   }
 
   if (isAuto) {
-    selectedPrebooked = prebookedCourts.slice(0, 3);
-    const remainingNeeded = Math.min(freeCourts.length, Math.max(0, 3 - selectedPrebooked.length));
+    const maxAutoCourts = Math.max(3, advanceBookedCourts.length, (preBookCourts ? parseInt(preBookCourts, 10) : 0));
+    selectedPrebooked = prebookedCourts.slice(0, maxAutoCourts);
+    const remainingNeeded = Math.min(freeCourts.length, Math.max(0, maxAutoCourts - selectedPrebooked.length));
     const selectedFree = freeCourts.slice(0, remainingNeeded);
 
     const totalCourtsCount = selectedPrebooked.length + selectedFree.length;
@@ -7110,6 +7203,7 @@ async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWor
     checkCourts: Boolean(effectiveCheckCourts),
     court: targetCourt || null,
     courtBookingType: courtBookingType || null,
+    preBookCourts: (preBookCourts !== undefined && preBookCourts !== null && parseInt(preBookCourts, 10) > 0) ? parseInt(preBookCourts, 10) : null,
     advanceBookedCourts: advanceBookedCourts.length > 0 ? advanceBookedCourts : null,
     bookingPlayers: bookingPlayers || null,
     prebookedCourts: (selectedPrebooked && selectedPrebooked.length > 0)
@@ -7156,6 +7250,7 @@ async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWor
     replacedOldPoll,
     checkCourts: Boolean(effectiveCheckCourts),
     courtBookingType: courtBookingType || null,
+    preBookCourts: (preBookCourts !== undefined && preBookCourts !== null && parseInt(preBookCourts, 10) > 0) ? parseInt(preBookCourts, 10) : null,
     advanceBookedCourts
   };
   } finally {
@@ -8390,6 +8485,7 @@ if (require.main === module) {
 
 module.exports = {
   createMatchPoll,
+  parsePollCreationText,
   handleDirectPollCreation,
   handleMessage,
   resolveManualPollPlayers
