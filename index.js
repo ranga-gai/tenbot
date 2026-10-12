@@ -1568,16 +1568,19 @@ function parsePollCreationText(text) {
     return null;
   }
 
+  // Extract all flags and strip them from text so they don't bleed into size/time/court parsing
+  const { flags, remainingText: textCleanFlags } = recurringPollsModule.extractCommonFlags(text);
+
   // Extract timeWord first (e.g. 10:30am, 9am, 6:00pm)
   let timeWord = null;
-  const timeMatch = text.match(/\b(\d{1,2}(?:[:.]\d{2})?\s*(?:am|pm))\b/i) || text.match(/\b(\d{1,2}[:.]\d{2})\b/i);
+  const timeMatch = textCleanFlags.match(/\b(\d{1,2}(?:[:.]\d{2})?\s*(?:am|pm))\b/i) || textCleanFlags.match(/\b(\d{1,2}[:.]\d{2})\b/i);
   if (timeMatch) {
     timeWord = timeMatch[1].trim();
   }
 
   // Extract dayWord (e.g. today, tomorrow, Saturday)
   let dayWord = null;
-  const dayMatch = text.match(/\b(today|tonight|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tue|wed|thu|fri|sat|sun)\b/i);
+  const dayMatch = textCleanFlags.match(/\b(today|tonight|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tue|wed|thu|fri|sat|sun)\b/i);
   if (dayMatch) {
     dayWord = dayMatch[1];
   }
@@ -1595,7 +1598,7 @@ function parsePollCreationText(text) {
 
   // Extract court mention if any (e.g. "court 2", "Court 2", "ct 2", "pickleball 1")
   let court = null;
-  const courtMatch = text.match(/\b(?:on\s+|at\s+|for\s+)?(?:the\s+)?(court\s*#?\s*\d+|pickleball\s*#?\s*\d+|pb\s*#?\s*\d+)\b/i);
+  const courtMatch = textCleanFlags.match(/\b(?:on\s+|at\s+|for\s+)?(?:the\s+)?(court\s*#?\s*\d+|pickleball\s*#?\s*\d+|pb\s*#?\s*\d+)\b/i);
   if (courtMatch) {
     const rawCourt = courtMatch[1].replace(/#/g, '').replace(/\s+/g, ' ').trim();
     if (/^court\s*\d+$/i.test(rawCourt)) {
@@ -1613,7 +1616,7 @@ function parsePollCreationText(text) {
   }
 
   // Remove time patterns from text before parsing size so that times like "10:30am" or "10am" don't match as size 10
-  let textWithoutTime = text;
+  let textWithoutTime = textCleanFlags;
   if (timeMatch) {
     textWithoutTime = textWithoutTime.replace(timeMatch[0], ' ');
   }
@@ -1623,7 +1626,7 @@ function parsePollCreationText(text) {
   let textCleanedForSize = textWithoutTime.replace(/\b(?:on\s+|at\s+|for\s+)?(?:the\s+)?(?:courts?|pickleball|pb)\s*#?\s*\d+\b/gi, ' ');
 
   // Determine size
-  const isExplicitOptIn = /\b(?:opt-?in|yes\s*\/\s*no|yesno|open)\b/i.test(text) ||
+  const isExplicitOptIn = /\b(?:opt-?in|yes\s*\/\s*no|yesno|open)\b/i.test(textCleanFlags) ||
     /^!(?:optinpoll|yesnopoll|createoptinpoll|createyesnopoll)\b/i.test(text);
   let size = null;
   if (!isExplicitOptIn) {
@@ -1664,10 +1667,9 @@ function parsePollCreationText(text) {
   }
 
   // Determine includeCreator
-  let includeCreator = true;
-  if (/\b(?:not\s+playing|won't\s+play|wont\s+play|without\s+me|exclude\s+me|not\s+for\s+me|i'm\s+not\s+playing|im\s+not\s+playing)\b/i.test(text)) {
-    includeCreator = false;
-  }
+  let includeCreator = flags.includeCreator !== undefined
+    ? flags.includeCreator
+    : !(/\b(?:not\s+playing|won't\s+play|wont\s+play|without\s+me|exclude\s+me|not\s+for\s+me|i'm\s+not\s+playing|im\s+not\s+playing)\b/i.test(text));
 
   // Determine cancelExisting / replacement
   let cancelExisting = false;
@@ -1675,65 +1677,21 @@ function parsePollCreationText(text) {
     cancelExisting = true;
   }
 
-  // Determine noMatchups
-  const noMatchups = /(?:^|\s)(?:--no-?matchups?|--no-?draw)\b|\b(?:no[-_\s]*matchups?|no[-_\s]*draw|without\s+(?:auto[-_\s]*|automatic\s+)?matchups?|without\s+(?:auto[-_\s]*|automatic\s+)?draw|(?:do\s*not|don'?t)\s+(?:create|make|generate|post|auto-?generate)\s+(?:matchups?|draw|the\s+draw|the\s+matchups?)|no[-_\s]*(?:auto\s+|automatic\s+)?matchups?)\b/i.test(text);
-
-  // Determine court availability checking (default: false / do not check court availability)
-  const checkCourts = /(?:^|\s)(?:--courts?|--check-?courts?|--court-?avail(?:ability)?|--include-?courts?|--with-?courts?|--consider-?courts?|--consider-?court-?avail(?:ability)?)\b/i.test(text) ||
-    /\b(?:(?:consider|considering|check|checking|include|including)\s+(?:the\s+)?(?:courts?|court\s+availability|availability)|with\s+(?:the\s+)?(?:courts|court\s+availability)|(?:consider|check)\s+availability)\b/i.test(text);
-
-  // Determine includePrebookedSpots
-  let includePrebookedSpots = false;
-  if (/(?:^|\s)(?:--?no-?prebooked[-_]?spots?|no-?prebooked[-_]?spots?|--?no-?named-?spots?|--?prebooked[-_]?spots?=(?:false|no|0)|prebooked[-_]?spots?=(?:false|no|0))\b|\b(?:without|no)\s+(?:named\s+|the\s+)?prebooked[-_]?spots?\b/i.test(text)) {
-    includePrebookedSpots = false;
-  } else if (/(?:^|\s)(?:--?prebooked[-_]?spots?|prebooked[-_]?spots?)(?:=(?:true|yes|1))?\b|(?:^|\s)(?:--with-?prebooked-?spots?|--named-?prebooked-?slots?|--prebooked-?slots?)\b|\b(?:with|include)\s+(?:named\s+|the\s+)?prebooked[-_]?(?:spots?|slots?)\b/i.test(text)) {
-    includePrebookedSpots = true;
-  }
-
-  // Determine courtBookingType ('pre-book' or 'none' / null)
-  let courtBookingType = null;
-  if (/(?:^|\s)(?:--court-booking-type=(?:pre-?book|none)|--court-booking=(?:pre-?book|none)|--booking-type=(?:pre-?book|none)|--booking=(?:pre-?book|none)|--pre-?book|--prebook)\b/i.test(text)) {
-    const match = text.match(/(?:--court-booking-type|--court-booking|--booking-type|--booking)=([a-z-]+)/i);
-    if (match) {
-      const val = match[1].toLowerCase();
-      courtBookingType = (val === 'prebook' || val === 'pre-book') ? 'pre-book' : (val === 'none' ? 'none' : val);
-    } else {
-      courtBookingType = 'pre-book';
-    }
-  } else if (/\b(?:court\s*booking\s*type\s*[:=]?\s*pre-?book|booking\s*type\s*[:=]?\s*pre-?book|pre-?book(?:ing)?(?:\s+(?:a\s+)?courts?)?|book\s+(?:a\s+)?courts?\s+in\s+advance|advance\s+court\s+booking)\b/i.test(text)) {
-    courtBookingType = 'pre-book';
-  } else if (/\b(?:court\s*booking\s*type\s*[:=]?\s*none|booking\s*type\s*[:=]?\s*none|no\s+pre-?book(?:ing)?)\b/i.test(text)) {
-    courtBookingType = 'none';
-  }
-
-  let preBookCourts = null;
-  const pbCourtsMatch = text.match(/(?:--(?:pre-?book-?courts?|courts-?to-?book|prebook-?courts?)(?:=(\d+)|\s+(\d+))|\b(?:pre-?book|book)\s+(\d+)\s+courts?|\b(?:pre-?book-?courts?|preBookCourts)\s*[:=]\s*(\d+))/i);
-  if (pbCourtsMatch) {
-    const valStr = pbCourtsMatch[1] || pbCourtsMatch[2] || pbCourtsMatch[3] || pbCourtsMatch[4];
-    if (valStr && parseInt(valStr, 10) > 0) {
-      preBookCourts = parseInt(valStr, 10);
-    }
-  }
-
-  // Determine bookingPlayers if specified in message
-  let bookingPlayers = null;
-  const bpFlagMatch = text.match(/(?:--(?:booking-?players?|booking-?names?|players?)\s*=?|(?:booking[-_\s]*players?|booking[-_\s]*names?|players?)\s*[:=]|\bwith\s+players?\s+)\s*(?:"([^"]+)"|'([^']+)'|(\[[^\]]+\](?:\s*,\s*\[[^\]]+\])*)|([^\n\r-]+?))(?=\s+--|$)/i);
-  if (bpFlagMatch) {
-    const rawVal = bpFlagMatch[1] || bpFlagMatch[2] || bpFlagMatch[3] || bpFlagMatch[4];
-    if (rawVal && rawVal.trim()) {
-      bookingPlayers = groupsConfig.normalizeBookingPlayerLists(rawVal.trim());
-    }
-  } else {
-    const bracketMatch = text.match(/\b(?:with\s+players?|for\s+players?|using\s+players?|players?)\s*(\[[^\]]+\](?:\s*,\s*\[[^\]]+\])*)/i);
-    if (bracketMatch && bracketMatch[1]) {
-      bookingPlayers = groupsConfig.normalizeBookingPlayerLists(bracketMatch[1].trim());
-    }
-  }
+  const noMatchups = flags.noMatchups !== undefined ? flags.noMatchups : false;
+  const checkCourts = flags.checkCourts !== undefined ? flags.checkCourts : false;
+  const includePrebookedSpots = flags.includePrebookedSpots !== undefined ? flags.includePrebookedSpots : false;
+  const courtBookingType = flags.courtBookingType || null;
+  const preBookCourts = flags.preBookCourts || null;
+  const bookingPlayers = flags.bookingPlayers || null;
+  const bookingStrategy = flags.bookingStrategy || null;
+  const bookingSchedule = flags.bookingSchedule || null;
 
   return {
     courtBookingType,
     preBookCourts,
     bookingPlayers,
+    bookingStrategy,
+    bookingSchedule,
     size,
     when,
     dayWord,
@@ -3066,8 +3024,18 @@ function parseModifyInstanceCommand(rawText) {
   }
 
   const updates = {};
-  let remForSize = rem;
-  const courtM = rem.match(/\b(?:on\s+|at\s+|for\s+)?(?:the\s+)?(court\s*#?\s*\d+|pickleball\s*#?\s*\d+|pb\s*#?\s*\d+)\b/i);
+  const { flags, remainingText: remClean } = recurringPollsModule.extractCommonFlags(rem);
+  if (flags.courtBookingType !== undefined) updates.courtBookingType = flags.courtBookingType;
+  if (flags.preBookCourts !== undefined) updates.preBookCourts = flags.preBookCourts;
+  if (flags.bookingPlayers !== undefined) updates.bookingPlayers = flags.bookingPlayers;
+  if (flags.bookingStrategy !== undefined) updates.bookingStrategy = flags.bookingStrategy;
+  if (flags.bookingSchedule !== undefined) updates.bookingSchedule = flags.bookingSchedule;
+  if (flags.checkCourts !== undefined) updates.checkCourts = flags.checkCourts;
+  if (flags.noMatchups !== undefined) updates.noMatchups = flags.noMatchups;
+  if (flags.includePrebookedSpots !== undefined) updates.includePrebookedSpots = flags.includePrebookedSpots;
+
+  let remForSize = remClean;
+  const courtM = remClean.match(/\b(?:on\s+|at\s+|for\s+)?(?:the\s+)?(court\s*#?\s*\d+|pickleball\s*#?\s*\d+|pb\s*#?\s*\d+)\b/i);
   if (courtM) {
     remForSize = remForSize.replace(courtM[0], ' ');
     const rawCourt = courtM[1].replace(/#/g, '').replace(/\s+/g, ' ').trim();
@@ -3079,10 +3047,10 @@ function parseModifyInstanceCommand(rawText) {
   }
   remForSize = remForSize.replace(/\b(?:on\s+|at\s+|for\s+)?(?:the\s+)?(?:courts?|pickleball|pb)\s*#?\s*\d+\b/gi, ' ');
 
-  if (/\b(?:opt-?in|yes\s*\/\s*no|yesno|open)\b/i.test(rem)) {
+  if (/\b(?:opt-?in|yes\s*\/\s*no|yesno|open)\b/i.test(remClean)) {
     updates.type = 'opt_in';
     updates.size = null;
-  } else if (/\bauto\b/i.test(rem)) {
+  } else if (/\bauto\b/i.test(remClean)) {
     updates.size = 'auto';
   } else {
     const sizeM = remForSize.match(new RegExp(`\\b(?:for|size|spots?|players?)\\s*[:=]?\\s*(\\d+|${NUMBER_WORDS_PATTERN})\\b`, 'i')) ||
@@ -3098,12 +3066,12 @@ function parseModifyInstanceCommand(rawText) {
     }
   }
 
-  const timeM = rem.match(/\b(\d{1,2}(?:[:.]\d{2})?\s*(?:am|pm))\b/i) || rem.match(/\b(\d{1,2}[:.]\d{2})\b/i);
+  const timeM = remClean.match(/\b(\d{1,2}(?:[:.]\d{2})?\s*(?:am|pm))\b/i) || remClean.match(/\b(\d{1,2}[:.]\d{2})\b/i);
   if (timeM) {
     updates.timeWord = timeM[1].trim();
   }
 
-  const dayM = rem.match(/\b(today|tonight|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tue|wed|thu|fri|sat|sun)\b/i);
+  const dayM = remClean.match(/\b(today|tonight|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tue|wed|thu|fri|sat|sun)\b/i);
   if (dayM) {
     updates.dayWord = dayM[1].trim();
   }
@@ -3115,57 +3083,6 @@ function parseModifyInstanceCommand(rawText) {
     updates.when = updates.timeWord;
   } else if (updates.dayWord) {
     updates.when = updates.dayWord.charAt(0).toUpperCase() + updates.dayWord.slice(1).toLowerCase();
-  }
-
-  if (/(?:--no-?matchups?|no[-_\s]*matchups?|without[-_\s]*matchups?)/i.test(rem)) {
-    updates.noMatchups = true;
-  } else if (/(?:--auto-?matchups?|with[-_\s]*matchups?)/i.test(rem)) {
-    updates.noMatchups = false;
-  }
-
-  if (/(?:--include-?courts?|--courts?|--check-?courts?|--court-?avail(?:ability)?|with[-_\s]*courts?|check[-_\s]*courts?|consider[-_\s]*courts?)/i.test(rem)) {
-    updates.checkCourts = true;
-  }
-
-  if (/(?:^|\s)(?:--court-booking-type=(?:pre-?book|none)|--court-booking=(?:pre-?book|none)|--booking-type=(?:pre-?book|none)|--booking=(?:pre-?book|none)|--pre-?book|--prebook)\b/i.test(rem)) {
-    const match = rem.match(/(?:--court-booking-type|--court-booking|--booking-type|--booking)=([a-z-]+)/i);
-    if (match) {
-      const val = match[1].toLowerCase();
-      updates.courtBookingType = (val === 'prebook' || val === 'pre-book') ? 'pre-book' : (val === 'none' ? 'none' : val);
-    } else {
-      updates.courtBookingType = 'pre-book';
-    }
-  } else if (/\b(?:court\s*booking\s*type\s*[:=]?\s*pre-?book|booking\s*type\s*[:=]?\s*pre-?book|pre-?book(?:ing)?(?:\s+(?:a\s+)?courts?)?|book\s+(?:a\s+)?courts?\s+in\s+advance|advance\s+court\s+booking)\b/i.test(rem)) {
-    updates.courtBookingType = 'pre-book';
-  } else if (/\b(?:court\s*booking\s*type\s*[:=]?\s*none|booking\s*type\s*[:=]?\s*none|no\s+pre-?book(?:ing)?)\b/i.test(rem)) {
-    updates.courtBookingType = 'none';
-  }
-
-  const pbCourtsModMatch = rem.match(/(?:--(?:pre-?book-?courts?|courts-?to-?book|prebook-?courts?)(?:=(\d+)|\s+(\d+))|\b(?:pre-?book|book)\s+(\d+)\s+courts?|\b(?:pre-?book-?courts?|preBookCourts)\s*[:=]\s*(\d+))/i);
-  if (pbCourtsModMatch) {
-    const valStr = pbCourtsModMatch[1] || pbCourtsModMatch[2] || pbCourtsModMatch[3] || pbCourtsModMatch[4];
-    if (valStr && parseInt(valStr, 10) > 0) {
-      updates.preBookCourts = parseInt(valStr, 10);
-    }
-  }
-
-  const bpMatch = rem.match(/(?:--(?:booking-?players?|booking-?names?|players?)\s*=?|(?:booking[-_\s]*players?|booking[-_\s]*names?|players?)\s*[:=]|\bwith\s+players?\s+)\s*(?:"([^"]+)"|'([^']+)'|(\[[^\]]+\](?:\s*,\s*\[[^\]]+\])*)|([^\n\r-]+?))(?=\s+--|$)/i);
-  if (bpMatch) {
-    const rawVal = bpMatch[1] || bpMatch[2] || bpMatch[3] || bpMatch[4];
-    if (rawVal && rawVal.trim()) {
-      updates.bookingPlayers = groupsConfig.normalizeBookingPlayerLists(rawVal.trim());
-    }
-  } else {
-    const bracketMatch = rem.match(/\b(?:with\s+players?|for\s+players?|using\s+players?|players?)\s*(\[[^\]]+\](?:\s*,\s*\[[^\]]+\])*)/i);
-    if (bracketMatch && bracketMatch[1]) {
-      updates.bookingPlayers = groupsConfig.normalizeBookingPlayerLists(bracketMatch[1].trim());
-    }
-  }
-
-  if (/(?:--?prebooked[-_]?spots?|with[-_\s]*prebooked[-_]?spots?)/i.test(rem)) {
-    updates.includePrebookedSpots = true;
-  } else if (/(?:--?no-?prebooked[-_]?spots?|without[-_\s]*prebooked[-_]?spots?)/i.test(rem)) {
-    updates.includePrebookedSpots = false;
   }
 
   return { targetId, updates };
@@ -8315,7 +8232,9 @@ function pollStatusText(chatId = null, opts = {}) {
           const matchStr = targetSched.matchDisplay || targetSched.matchTime || 'unspecified time';
           const postStr = targetSched.postDisplay || targetSched.postTime || 'unspecified post time';
           const statusStr = targetSched.enabled === false ? 'PAUSED' : (targetSched.status ? targetSched.status.toUpperCase() : 'ACTIVE');
-          return `ℹ️ Recurring schedule \`${sid}\` (${statusStr}) is configured for ${daysStr} at ${matchStr} (posts at ${postStr}), but there is no active poll instance currently on record in active polls.\nUse "!recurringpolls" to inspect all schedules or wait for the next scheduled trigger.`;
+          const isPreBook = targetSched.courtBookingType === 'pre-book' || targetSched.bookingStrategy === 'advanced' || Boolean(targetSched.bookingSchedule);
+          const bookingTypeDesc = isPreBook ? 'Pre-book' : 'None';
+          return `ℹ️ Recurring schedule \`${sid}\` (${statusStr}) is configured for ${daysStr} at ${matchStr} (posts at ${postStr}, court booking type: ${bookingTypeDesc}), but there is no active poll instance currently on record in active polls.\nUse "!recurringpolls" to inspect all schedules or wait for the next scheduled trigger.`;
         }
         return `⚠️ No active poll instance or recurring schedule found matching "${targetId}". Use "!pollstatus" to view current polls or "!recurringpolls" for schedule IDs.`;
       }
@@ -8360,7 +8279,9 @@ function pollStatusText(chatId = null, opts = {}) {
       if (linkedPolls.length > 0) {
         instanceDesc = linkedPolls.map(([id, p]) => `Poll \`${id}\` (${p.when || p.status}) — Status: ${p.status}`).join(', ');
       }
-      return `• \`${sid}\` (${statusStr}): ${daysStr} at ${matchStr} (posts at ${postStr})\n  └ Current Instance: ${instanceDesc}`;
+      const isPreBook = s.courtBookingType === 'pre-book' || s.bookingStrategy === 'advanced' || Boolean(s.bookingSchedule);
+      const bookingTypeStr = isPreBook ? ', court booking: Pre-book' : '';
+      return `• \`${sid}\` (${statusStr}): ${daysStr} at ${matchStr} (posts at ${postStr}${bookingTypeStr})\n  └ Current Instance: ${instanceDesc}`;
     });
     recurringSummary = `\n\n━━━━━━━━━━━━━━━━━━━━━\n🔁 *Recurring Poll Schedules & Created Instances:*\n${schedLines.join('\n')}`;
   }
@@ -8462,6 +8383,7 @@ function pollStatusText(chatId = null, opts = {}) {
       const lines = [
         `${groupHeader}Poll ${pollId}${pollState.when ? ` (${pollState.when})` : ''}: Opt-in (Yes/No).`,
         getPollScheduleId(pollState) ? `🔄 Recurring Schedule: \`${getPollScheduleId(pollState)}\` (created as per schedule)` : (pollState.isRecurring ? '🔄 Recurring Schedule: (created as per schedule)' : null),
+        pollState.courtBookingType ? `Court Booking Type: ${pollState.courtBookingType === 'pre-book' ? 'Pre-book' : pollState.courtBookingType}` : null,
         pollState.creator?.name ? `Creator: ${pollState.creator.name}` : null,
         `Status: ${pollState.status}${manualDesc}`,
         `Play time: ${playAtLocal} (kept for 2 weeks after scheduled play time)`,
@@ -8520,6 +8442,7 @@ function pollStatusText(chatId = null, opts = {}) {
     const lines = [
       `${groupHeader}Poll ${pollId}${pollState.when ? ` (${pollState.when})` : ''}: ${pollState.size} spots (${pollState.size === 2 ? 'Singles' : 'Doubles'})${limitNote}.`,
       getPollScheduleId(pollState) ? `🔁 Recurring Schedule: \`${getPollScheduleId(pollState)}\` (created as per schedule)` : (pollState.isRecurring ? '🔁 Recurring Schedule: (created as per schedule)' : null),
+      pollState.courtBookingType ? `Court Booking Type: ${pollState.courtBookingType === 'pre-book' ? 'Pre-book' : pollState.courtBookingType}` : null,
       creatorDesc,
       `Status: ${pollState.status}`,
       `Play time: ${playAtLocal} (kept for 2 weeks after scheduled play time)`,
