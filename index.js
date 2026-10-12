@@ -592,6 +592,15 @@ const CLAUDE_TOOLS = [
         },
         bookingPlayers: {
           description: 'Optional player names to use for advance court booking. Can be multiple lists for booking more than one court. If omitted, the group configuration default list will be used.'
+        },
+        bookingStrategy: {
+          type: 'string',
+          enum: ['advanced', 'instant', 'none'],
+          description: 'Optional court booking strategy. Set to "advanced" to pre-book courts in advance according to bookingSchedule.'
+        },
+        bookingSchedule: {
+          type: 'string',
+          description: 'Optional schedule specifying when to book courts in advance (e.g. "-7days 7:00AM").'
         }
       },
       required: ['matchTime']
@@ -674,6 +683,15 @@ const CLAUDE_TOOLS = [
         },
         bookingPlayers: {
           description: 'Optional player names to use for advance booking (multiple lists supported for multiple courts).'
+        },
+        bookingStrategy: {
+          type: 'string',
+          enum: ['advanced', 'instant', 'none'],
+          description: 'Optional new court booking strategy (e.g. "advanced").'
+        },
+        bookingSchedule: {
+          type: 'string',
+          description: 'Optional new schedule specifying when to book courts in advance (e.g. "-7days 7:00AM").'
         }
       },
       required: ['scheduleId']
@@ -977,6 +995,14 @@ const CLAUDE_TOOLS = [
           type: "array",
           items: { type: "integer" },
           description: "Preferred order of courts to book if available (e.g. [2, 3, 1, 5, 6])."
+        },
+        bookingStrategy: {
+          type: "string",
+          description: "Optional court booking strategy for this group ('advanced', 'instant', or 'none')."
+        },
+        bookingSchedule: {
+          type: "string",
+          description: "Optional schedule specifying when to book courts in advance (e.g. '-7days 7:00AM')."
         }
       }
     }
@@ -1056,6 +1082,14 @@ const CLAUDE_TOOLS = [
           type: "array",
           items: { type: "integer" },
           description: "Preferred order of courts to book if available (e.g. [2, 3, 1, 5, 6])."
+        },
+        bookingStrategy: {
+          type: "string",
+          description: "Optional court booking strategy for this group ('advanced', 'instant', or 'none')."
+        },
+        bookingSchedule: {
+          type: "string",
+          description: "Optional schedule specifying when to book courts in advance (e.g. '-7days 7:00AM')."
         }
       },
       required: ["jidOrName"]
@@ -4128,17 +4162,27 @@ setInterval(() => {
   if (botSock) checkAndSendPollReminders(botSock);
 }, POLL_REMINDER_CHECK_INTERVAL_MS);
 
-// Check and automatically trigger recurring daily polls every 30 seconds
+// Check and automatically trigger recurring daily polls and advance court bookings every 30 seconds
 const RECURRING_POLL_CHECK_INTERVAL_MS = 30 * 1000;
 setInterval(() => {
   if (botSock) {
+    recurringPollsModule.checkAndExecuteAdvanceBookings({
+      sock: botSock,
+      recurringPolls,
+      persistPolls,
+      preBookCourtsForMatch,
+      activePolls
+    }).catch(err => console.error('[advance-booking] Error in sweep:', err.message));
+
     recurringPollsModule.checkAndPostRecurringPolls({
       sock: botSock,
       recurringPolls,
       persistPolls,
       createMatchPoll,
-      getTargetGroupJid
-    });
+      getTargetGroupJid,
+      preBookCourtsForMatch,
+      activePolls
+    }).catch(err => console.error('[recurring-poll] Error in sweep:', err.message));
   }
 }, RECURRING_POLL_CHECK_INTERVAL_MS);
 
@@ -4312,13 +4356,23 @@ async function startBot() {
       }
 
       checkAndSendPollReminders(sock);
+      recurringPollsModule.checkAndExecuteAdvanceBookings({
+        sock,
+        recurringPolls,
+        persistPolls,
+        preBookCourtsForMatch,
+        activePolls
+      }).catch(err => console.error('[advance-booking] Error in sweep:', err.message));
+
       recurringPollsModule.checkAndPostRecurringPolls({
         sock,
         recurringPolls,
         persistPolls,
         createMatchPoll,
-        getTargetGroupJid
-      });
+        getTargetGroupJid,
+        preBookCourtsForMatch,
+        activePolls
+      }).catch(err => console.error('[recurring-poll] Error in sweep:', err.message));
     }
   });
 
@@ -6759,7 +6813,221 @@ const inFlightPollCreations = new Set();
  *   "Yes" and "No". The bot then waits for a user prompt to generate matchups from Yes voters.
  * - If replacePollId or cancelExisting is specified, deletes the older poll from WhatsApp.
  */
-async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWord = null, timeWord = null, creatorName = null, creatorJid = null, includeCreator = true, replacePollId = null, cancelExisting = false, isCommand = false, noMatchups = false, checkCourts = false, includePrebookedSpots = false, isRecurring = false, scheduleId = null, targetCourt = null, courtBookingType = null, bookingPlayers = null, preBookCourts = null) {
+/**
+ * Books court(s) for a given match date and time using group configuration.
+ * Used both by advance booking schedule sweeps and during poll creation.
+ */
+async function preBookCourtsForMatch({
+  sock,
+  remoteJid,
+  targetDateMDY,
+  queryTime,
+  size = null,
+  isAuto = true,
+  preBookCourts = null,
+  bookingPlayers = null,
+  creatorName = 'Member',
+  creatorJid = null
+}) {
+  const advanceBookedCourts = [];
+  const prebookedCourts = [];
+
+  if (!groupsConfig.isCourtBookingEnabled(remoteJid)) {
+    return { advanceBookedCourts, prebookedCourts };
+  }
+
+  const groupCfg = groupsConfig.getGroupConfig(remoteJid);
+  const sport = groupCfg?.sport || 'tennis';
+
+  let targetCourtsCount = 1;
+  if (!isAuto && size && parseInt(size, 10) > 0) {
+    const numPlayers = parseInt(size, 10);
+    targetCourtsCount = Math.max(1, Math.ceil(numPlayers / 4));
+  } else {
+    const explicitCourts = (preBookCourts !== undefined && preBookCourts !== null && parseInt(preBookCourts, 10) > 0)
+      ? parseInt(preBookCourts, 10)
+      : null;
+    const cfgCourts = (groupCfg?.preBookCourts !== undefined && groupCfg?.preBookCourts !== null && parseInt(groupCfg.preBookCourts, 10) > 0)
+      ? parseInt(groupCfg.preBookCourts, 10)
+      : (groupCfg?.preBookCourtsCount !== undefined && groupCfg?.preBookCourtsCount !== null && parseInt(groupCfg.preBookCourtsCount, 10) > 0
+        ? parseInt(groupCfg.preBookCourtsCount, 10)
+        : 1);
+
+    targetCourtsCount = explicitCourts || cfgCourts || 1;
+  }
+
+  console.log(`[poll] Pre-book court calculation for ${remoteJid}: size=${size}, isAuto=${isAuto}, targetCourtsCount=${targetCourtsCount}`);
+
+  const shuffleArray = (arr) => {
+    const copy = [...arr];
+    for (let i = copy.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [copy[i], copy[j]] = [copy[j], copy[i]];
+    }
+    return copy;
+  };
+
+  let rawPool = [];
+  if (bookingPlayers) {
+    rawPool = Array.isArray(bookingPlayers) ? bookingPlayers : (typeof bookingPlayers === 'string' ? bookingPlayers.split(/[,;]+/).map(s => s.trim()).filter(Boolean) : []);
+  }
+  if (!rawPool || rawPool.length === 0) {
+    rawPool = groupsConfig.getDefaultBookingPlayers(remoteJid);
+  }
+  if (!rawPool || rawPool.length === 0) {
+    rawPool = [creatorName || 'Member'];
+  }
+
+  const seenPoolNames = new Set();
+  const candidatePool = [];
+  for (const p of rawPool) {
+    const resolved = namesStore.resolveFullName(p);
+    const key = resolved.toLowerCase().trim();
+    if (!seenPoolNames.has(key)) {
+      seenPoolNames.add(key);
+      candidatePool.push(resolved);
+    }
+  }
+
+  const directNames = groupCfg?.directCourtBookingAccounts || [];
+  const directBookingPlayers = [];
+  for (const name of directNames) {
+    const resolved = namesStore.resolveFullName(name);
+    const key = resolved.toLowerCase().trim();
+    if (!directBookingPlayers.some(dp => dp.toLowerCase().trim() === key)) {
+      directBookingPlayers.push(resolved);
+    }
+    if (!seenPoolNames.has(key)) {
+      seenPoolNames.add(key);
+      candidatePool.push(resolved);
+    }
+  }
+
+  const playersPerCourt = (!isAuto && size && parseInt(size, 10) === 2) ? 2 : 4;
+  const bookedPlayerKeys = new Set();
+  let availableDirectAccounts = shuffleArray(directBookingPlayers);
+
+  for (let courtIdx = 0; courtIdx < targetCourtsCount; courtIdx++) {
+    let courtBooked = false;
+    const MAX_RETRIES = 2;
+    const MAX_ATTEMPTS = 1 + MAX_RETRIES;
+    const triedSetsForCourt = new Set();
+
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      const unbookedDirect = availableDirectAccounts.filter(p => !bookedPlayerKeys.has(p.toLowerCase().trim()));
+      const unbookedCandidates = candidatePool.filter(p => !bookedPlayerKeys.has(p.toLowerCase().trim()));
+
+      let p1 = null;
+      if (unbookedDirect.length > 0) {
+        const shuffledDirect = shuffleArray(unbookedDirect);
+        p1 = shuffledDirect[0];
+      } else {
+        const shuffledCandidates = shuffleArray(unbookedCandidates);
+        p1 = shuffledCandidates[0] || (creatorName || 'Member');
+      }
+
+      const availableTeammates = unbookedCandidates.filter(p => p.toLowerCase().trim() !== p1.toLowerCase().trim());
+      const neededTeammates = Math.max(0, playersPerCourt - 1);
+      let selectedTeammates = [];
+
+      if (availableTeammates.length > 0 && neededTeammates > 0) {
+        let foundNewCombo = false;
+        for (let sampleTry = 0; sampleTry < 15; sampleTry++) {
+          const shuffledTeammates = shuffleArray(availableTeammates);
+          const candidateTeammates = shuffledTeammates.slice(0, neededTeammates);
+          const setSig = [p1, ...candidateTeammates].map(x => x.toLowerCase().trim()).sort().join('|');
+          if (!triedSetsForCourt.has(setSig)) {
+            selectedTeammates = candidateTeammates;
+            triedSetsForCourt.add(setSig);
+            foundNewCombo = true;
+            break;
+          }
+        }
+        if (!foundNewCombo) {
+          selectedTeammates = shuffleArray(availableTeammates).slice(0, neededTeammates);
+          const setSig = [p1, ...selectedTeammates].map(x => x.toLowerCase().trim()).sort().join('|');
+          triedSetsForCourt.add(setSig);
+        }
+      } else {
+        const setSig = [p1].map(x => x.toLowerCase().trim()).join('|');
+        triedSetsForCourt.add(setSig);
+      }
+
+      const currentCourtPlayers = [p1, ...selectedTeammates];
+      const retryLabel = attempt > 1 ? ` (retry ${attempt - 1}/${MAX_RETRIES})` : '';
+      console.log(`[poll] Pre-booking court ${courtIdx + 1}/${targetCourtsCount}${retryLabel} for ${remoteJid} on ${targetDateMDY} at ${queryTime} with players:`, currentCourtPlayers);
+
+      try {
+        const bookRes = await scvcc.bookCourt({
+          when: targetDateMDY,
+          date: targetDateMDY,
+          time: queryTime,
+          players: currentCourtPlayers,
+          requester: currentCourtPlayers[0] || creatorName || 'Member',
+          requestedBy: creatorName || 'Member',
+          sport,
+          chatId: remoteJid
+        });
+
+        if (bookRes && bookRes.success) {
+          advanceBookedCourts.push({
+            court: bookRes.court,
+            players: bookRes.players || currentCourtPlayers,
+            date: bookRes.date,
+            time: bookRes.time
+          });
+          prebookedCourts.push({
+            court: bookRes.court,
+            player: currentCourtPlayers[0] || creatorName || 'Member',
+            fullName: (currentCourtPlayers && currentCourtPlayers.length > 0) ? currentCourtPlayers.join(', ') : (creatorName || 'Member')
+          });
+
+          currentCourtPlayers.forEach(p => bookedPlayerKeys.add(p.toLowerCase().trim()));
+          availableDirectAccounts = availableDirectAccounts.filter(p => p.toLowerCase().trim() !== p1.toLowerCase().trim());
+
+          if (sock && remoteJid && bookRes.message) {
+            messageHistory.recordMessage(remoteJid, 'tenbot', bookRes.message, Date.now(), true);
+            await sock.sendMessage(remoteJid, { text: bookRes.message });
+            await sendBookingNotifications(sock, remoteJid, bookRes.message);
+          }
+
+          courtBooked = true;
+          break;
+        } else {
+          console.warn(`[poll] Advance court booking failed for court ${courtIdx + 1}/${targetCourtsCount}${retryLabel}:`, bookRes?.message);
+          if (attempt <= MAX_RETRIES) {
+            console.log(`[poll] Retrying court ${courtIdx + 1}/${targetCourtsCount} with another set of random players...`);
+          }
+        }
+      } catch (bookErr) {
+        console.error(`[poll] Error during advance court booking for court ${courtIdx + 1}/${targetCourtsCount}${retryLabel}:`, bookErr.message);
+        if (attempt <= MAX_RETRIES) {
+          console.log(`[poll] Retrying court ${courtIdx + 1}/${targetCourtsCount} with another set of random players...`);
+        }
+      }
+    }
+
+    if (!courtBooked) {
+      console.warn(`[poll] Advance court booking failed for court ${courtIdx + 1}/${targetCourtsCount} after all ${MAX_ATTEMPTS} attempts.`);
+    }
+  }
+
+  return { advanceBookedCourts, prebookedCourts };
+}
+
+function formatCourtLabel(court) {
+  if (!court) return 'Court';
+  const str = String(court).trim();
+  if (/^court\s*\d+/i.test(str)) {
+    return str.replace(/^court\s*/i, 'Court ');
+  }
+  if (/^\d+$/.test(str)) {
+    return `Court ${str}`;
+  }
+  return str;
+}
+
+async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWord = null, timeWord = null, creatorName = null, creatorJid = null, includeCreator = true, replacePollId = null, cancelExisting = false, isCommand = false, noMatchups = false, checkCourts = false, includePrebookedSpots = false, isRecurring = false, scheduleId = null, targetCourt = null, courtBookingType = null, bookingPlayers = null, preBookCourts = null, bookingStrategy = null, preExistingBookings = null) {
   const isAuto = size === 'auto' || String(size).toLowerCase() === 'auto';
   const isOptIn = !size && !isAuto;
 
@@ -6891,195 +7159,39 @@ async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWor
   let freeCourts = [];
   const advanceBookedCourts = [];
 
-  // Advance court booking: if courtBookingType is 'pre-book', book court(s) before creating poll instance
-  const isPreBook = String(courtBookingType).toLowerCase() === 'pre-book' || String(courtBookingType).toLowerCase() === 'prebook';
-  if (isPreBook && groupsConfig.isCourtBookingEnabled(remoteJid)) {
-    const groupCfg = groupsConfig.getGroupConfig(remoteJid);
-    const sport = groupCfg?.sport || 'tennis';
-
-    // Calculate number of courts to pre-book:
-    // 1. If number of players is known, use it as a proxy (e.g. 4 -> 1 court, 8 -> 2 courts, etc.)
-    // 2. If number of players is specified as auto (or opt-in), use setting by which user can specify number of courts to pre-book; if not specified, default to 1 court.
-    let targetCourtsCount = 1;
-    if (!isAuto && size && parseInt(size, 10) > 0) {
-      const numPlayers = parseInt(size, 10);
-      targetCourtsCount = Math.max(1, Math.ceil(numPlayers / 4));
-    } else {
-      const explicitCourts = (preBookCourts !== undefined && preBookCourts !== null && parseInt(preBookCourts, 10) > 0)
-        ? parseInt(preBookCourts, 10)
-        : null;
-      const cfgCourts = (groupCfg?.preBookCourts !== undefined && groupCfg?.preBookCourts !== null && parseInt(groupCfg.preBookCourts, 10) > 0)
-        ? parseInt(groupCfg.preBookCourts, 10)
-        : (groupCfg?.preBookCourtsCount !== undefined && groupCfg?.preBookCourtsCount !== null && parseInt(groupCfg.preBookCourtsCount, 10) > 0
-          ? parseInt(groupCfg.preBookCourtsCount, 10)
-          : 1);
-
-      targetCourtsCount = explicitCourts || cfgCourts || 1;
+  if (preExistingBookings && Array.isArray(preExistingBookings.advanceBookedCourts) && preExistingBookings.advanceBookedCourts.length > 0) {
+    advanceBookedCourts.push(...preExistingBookings.advanceBookedCourts);
+    if (Array.isArray(preExistingBookings.prebookedCourts)) {
+      prebookedCourts.push(...preExistingBookings.prebookedCourts);
     }
-
-    console.log(`[poll] Pre-book court calculation for ${remoteJid}: size=${size}, isAuto=${isAuto}, targetCourtsCount=${targetCourtsCount}`);
-
-    // Helper to shuffle an array (Fisher-Yates)
-    const shuffleArray = (arr) => {
-      const copy = [...arr];
-      for (let i = copy.length - 1; i > 0; i--) {
-        const j = Math.floor(Math.random() * (i + 1));
-        [copy[i], copy[j]] = [copy[j], copy[i]];
-      }
-      return copy;
-    };
-
-    // 1. Get candidate pool of booking players (flat list from bookingPlayers or defaultBookingPlayers)
-    let rawPool = [];
-    if (bookingPlayers) {
-      rawPool = Array.isArray(bookingPlayers) ? bookingPlayers : (typeof bookingPlayers === 'string' ? bookingPlayers.split(/[,;]+/).map(s => s.trim()).filter(Boolean) : []);
-    }
-    if (!rawPool || rawPool.length === 0) {
-      rawPool = groupsConfig.getDefaultBookingPlayers(remoteJid);
-    }
-    if (!rawPool || rawPool.length === 0) {
-      rawPool = [creatorName || 'Member'];
-    }
-
-    // Resolve each player's full name and deduplicate case-insensitively
-    const seenPoolNames = new Set();
-    const candidatePool = [];
-    for (const p of rawPool) {
-      const resolved = namesStore.resolveFullName(p);
-      const key = resolved.toLowerCase().trim();
-      if (!seenPoolNames.has(key)) {
-        seenPoolNames.add(key);
-        candidatePool.push(resolved);
-      }
-    }
-
-    // 2. Identify authorized direct court booking accounts for this group (full names)
-    const directNames = groupCfg?.directCourtBookingAccounts || [];
-    const directBookingPlayers = [];
-    for (const name of directNames) {
-      const resolved = namesStore.resolveFullName(name);
-      const key = resolved.toLowerCase().trim();
-      if (!directBookingPlayers.some(dp => dp.toLowerCase().trim() === key)) {
-        directBookingPlayers.push(resolved);
-      }
-      if (!seenPoolNames.has(key)) {
-        seenPoolNames.add(key);
-        candidatePool.push(resolved);
-      }
-    }
-
-    const playersPerCourt = (!isAuto && size && parseInt(size, 10) === 2) ? 2 : 4;
-    const bookedPlayerKeys = new Set();
-    let availableDirectAccounts = shuffleArray(directBookingPlayers);
-
-    for (let courtIdx = 0; courtIdx < targetCourtsCount; courtIdx++) {
-      let courtBooked = false;
-      const MAX_RETRIES = 2; // 2 retries on failure (total 3 attempts)
-      const MAX_ATTEMPTS = 1 + MAX_RETRIES;
-      const triedSetsForCourt = new Set();
-
-      for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-        // Find players not yet booked on any previous court
-        const unbookedDirect = availableDirectAccounts.filter(p => !bookedPlayerKeys.has(p.toLowerCase().trim()));
-        const unbookedCandidates = candidatePool.filter(p => !bookedPlayerKeys.has(p.toLowerCase().trim()));
-
-        // Condition: The first player in the group for a court should be one of the players in directCourtBookingAccounts unless that list is exhausted
-        let p1 = null;
-        if (unbookedDirect.length > 0) {
-          const shuffledDirect = shuffleArray(unbookedDirect);
-          p1 = shuffledDirect[0];
-        } else {
-          const shuffledCandidates = shuffleArray(unbookedCandidates);
-          p1 = shuffledCandidates[0] || (creatorName || 'Member');
+    console.log(`[poll] Using pre-existing advance booked courts for ${remoteJid} on ${targetDateMDY}:`, advanceBookedCourts);
+  } else {
+    // Advance court booking: if courtBookingType is 'pre-book', book court(s) before creating poll instance
+    const isPreBook = String(courtBookingType).toLowerCase() === 'pre-book' || String(courtBookingType).toLowerCase() === 'prebook';
+    if (isPreBook && groupsConfig.isCourtBookingEnabled(remoteJid)) {
+      const groupCfg = groupsConfig.getGroupConfig(remoteJid);
+      const effectiveStrategy = bookingStrategy || groupCfg?.bookingStrategy || 'instant';
+      if (effectiveStrategy !== 'advanced') {
+        const bookRes = await preBookCourtsForMatch({
+          sock,
+          remoteJid,
+          targetDateMDY,
+          queryTime,
+          size,
+          isAuto,
+          preBookCourts,
+          bookingPlayers,
+          creatorName,
+          creatorJid
+        });
+        if (bookRes.advanceBookedCourts?.length > 0) {
+          advanceBookedCourts.push(...bookRes.advanceBookedCourts);
         }
-
-        // Available teammates: all unbooked candidates except p1
-        const availableTeammates = unbookedCandidates.filter(p => p.toLowerCase().trim() !== p1.toLowerCase().trim());
-        const neededTeammates = Math.max(0, playersPerCourt - 1);
-        let selectedTeammates = [];
-
-        if (availableTeammates.length > 0 && neededTeammates > 0) {
-          let foundNewCombo = false;
-          for (let sampleTry = 0; sampleTry < 15; sampleTry++) {
-            const shuffledTeammates = shuffleArray(availableTeammates);
-            const candidateTeammates = shuffledTeammates.slice(0, neededTeammates);
-            const setSig = [p1, ...candidateTeammates].map(x => x.toLowerCase().trim()).sort().join('|');
-            if (!triedSetsForCourt.has(setSig)) {
-              selectedTeammates = candidateTeammates;
-              triedSetsForCourt.add(setSig);
-              foundNewCombo = true;
-              break;
-            }
-          }
-          if (!foundNewCombo) {
-            selectedTeammates = shuffleArray(availableTeammates).slice(0, neededTeammates);
-            const setSig = [p1, ...selectedTeammates].map(x => x.toLowerCase().trim()).sort().join('|');
-            triedSetsForCourt.add(setSig);
-          }
-        } else {
-          const setSig = [p1].map(x => x.toLowerCase().trim()).join('|');
-          triedSetsForCourt.add(setSig);
+        if (bookRes.prebookedCourts?.length > 0) {
+          prebookedCourts.push(...bookRes.prebookedCourts);
         }
-
-        const currentCourtPlayers = [p1, ...selectedTeammates];
-        const retryLabel = attempt > 1 ? ` (retry ${attempt - 1}/${MAX_RETRIES})` : '';
-        console.log(`[poll] Pre-booking court ${courtIdx + 1}/${targetCourtsCount}${retryLabel} for ${remoteJid} on ${targetDateMDY} at ${queryTime} with players:`, currentCourtPlayers);
-
-        try {
-          const bookRes = await scvcc.bookCourt({
-            when: targetDateMDY,
-            date: targetDateMDY,
-            time: queryTime,
-            players: currentCourtPlayers,
-            requester: currentCourtPlayers[0] || creatorName || 'Member',
-            requestedBy: creatorName || 'Member',
-            sport,
-            chatId: remoteJid
-          });
-
-          if (bookRes && bookRes.success) {
-            advanceBookedCourts.push({
-              court: bookRes.court,
-              players: bookRes.players || currentCourtPlayers,
-              date: bookRes.date,
-              time: bookRes.time
-            });
-            prebookedCourts.push({
-              court: bookRes.court,
-              player: currentCourtPlayers[0] || creatorName || 'Member',
-              fullName: (currentCourtPlayers && currentCourtPlayers.length > 0) ? currentCourtPlayers.join(', ') : (creatorName || 'Member')
-            });
-
-            // Mark these players as booked so subsequent courts do not repeat them
-            currentCourtPlayers.forEach(p => bookedPlayerKeys.add(p.toLowerCase().trim()));
-
-            // Remove p1 from availableDirectAccounts so direct list progresses towards exhaustion
-            availableDirectAccounts = availableDirectAccounts.filter(p => p.toLowerCase().trim() !== p1.toLowerCase().trim());
-
-            if (sock && remoteJid && bookRes.message) {
-              messageHistory.recordMessage(remoteJid, 'tenbot', bookRes.message, Date.now(), true);
-              await sock.sendMessage(remoteJid, { text: bookRes.message });
-              await sendBookingNotifications(sock, remoteJid, bookRes.message);
-            }
-
-            courtBooked = true;
-            break; // Succeeded, exit retry loop for this court
-          } else {
-            console.warn(`[poll] Advance court booking failed for court ${courtIdx + 1}/${targetCourtsCount}${retryLabel}:`, bookRes?.message);
-            if (attempt <= MAX_RETRIES) {
-              console.log(`[poll] Retrying court ${courtIdx + 1}/${targetCourtsCount} with another set of random players...`);
-            }
-          }
-        } catch (bookErr) {
-          console.error(`[poll] Error during advance court booking for court ${courtIdx + 1}/${targetCourtsCount}${retryLabel}:`, bookErr.message);
-          if (attempt <= MAX_RETRIES) {
-            console.log(`[poll] Retrying court ${courtIdx + 1}/${targetCourtsCount} with another set of random players...`);
-          }
-        }
-      }
-
-      if (!courtBooked) {
-        console.warn(`[poll] Advance court booking failed for court ${courtIdx + 1}/${targetCourtsCount} after all ${MAX_ATTEMPTS} attempts.`);
+      } else {
+        console.log(`[poll] bookingStrategy is 'advanced' for ${remoteJid}; court pre-booking is managed by bookingSchedule.`);
       }
     }
   }
@@ -7215,7 +7327,7 @@ async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWor
     for (const pb of selectedPrebooked) {
       const match = namesStore.findIdByNameOrAlias(pb.player);
       const canonicalName = (match && match.entry?.name) ? match.entry.name : pb.player;
-      courtLines.push(`${pb.court} - ${canonicalName}'s Booking`);
+      courtLines.push(`${formatCourtLabel(pb.court)} - Booked`);
       if (includePrebookedSpots) {
         const slotPlayerName = addNextCreatorPlayer(prebookedCourtPlayers, canonicalName);
         const slotLabel = `${slotPlayerName}'s Spot`;
@@ -7228,7 +7340,7 @@ async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWor
       }
     }
     for (const fc of selectedFree) {
-      courtLines.push(`${fc.court} - Available`);
+      courtLines.push(`${formatCourtLabel(fc.court)} - Available`);
     }
 
     if (courtLines.length > 0) {
@@ -7270,12 +7382,12 @@ async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWor
     const totalCourtsCount = prebookedCourts.length + freeCourts.length;
     if (targetCourt || (effectiveCheckCourts && totalCourtsCount > 0) || prebookedCourts.length > 0) {
       if (prebookedCourts.length > 0 && !targetCourt) {
-        const pbLines = prebookedCourts.map(pb => `${pb.court} - ${pb.player}'s Booking`);
+        const pbLines = prebookedCourts.map(pb => `${formatCourtLabel(pb.court)} - Booked`);
         courtLine = `\n\n${pbLines.join('\n')}\n`;
       } else if (targetCourt) {
         const pbMatch = prebookedCourts.find(pb => pb.court.toLowerCase() === targetCourt.toLowerCase());
-        if (pbMatch && pbMatch.player && pbMatch.player !== 'Member') {
-          courtLine = `\n\n${targetCourt} - ${pbMatch.player}'s Booking\n`;
+        if (pbMatch) {
+          courtLine = `\n\n${formatCourtLabel(targetCourt)} - Booked\n`;
         } else {
           const rawCourtText = `${targetCourt.toUpperCase()} AVAILABLE`;
           const largeCourtText = rawCourtText.replace(/[A-Z0-9]/g, (ch) => {
@@ -7302,11 +7414,14 @@ async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWor
     values = ['Yes', 'No'];
 
     const totalCourtsCount = prebookedCourts.length + freeCourts.length;
-    if (targetCourt || (effectiveCheckCourts && totalCourtsCount > 0)) {
-      if (targetCourt) {
+    if (targetCourt || (effectiveCheckCourts && totalCourtsCount > 0) || prebookedCourts.length > 0) {
+      if (prebookedCourts.length > 0 && !targetCourt) {
+        const pbLines = prebookedCourts.map(pb => `${formatCourtLabel(pb.court)} - Booked`);
+        courtLine = `\n\n${pbLines.join('\n')}\n`;
+      } else if (targetCourt) {
         const pbMatch = prebookedCourts.find(pb => pb.court.toLowerCase() === targetCourt.toLowerCase());
-        if (pbMatch && pbMatch.player && pbMatch.player !== 'Member') {
-          courtLine = `\n\n${targetCourt} - ${pbMatch.player}'s Booking\n`;
+        if (pbMatch) {
+          courtLine = `\n\n${formatCourtLabel(targetCourt)} - Booked\n`;
         } else {
           const rawCourtText = `${targetCourt.toUpperCase()} AVAILABLE`;
           const largeCourtText = rawCourtText.replace(/[A-Z0-9]/g, (ch) => {
@@ -7870,11 +7985,11 @@ async function getPrebookedCourtsForPoll(pollState, chatId = null) {
 
   // 3. From pollState.name (court booking lines in poll title)
   if (pollState.name) {
-    const bookingRegex = /(?:^|\n)\s*(Court\s*\d+|PB\s*\d+|Pickleball\s*\d+)\s*-\s*([^'\n]+?)(?:\'s)?\s*Booking/gi;
+    const bookingRegex = /(?:^|\n)\s*(Court\s*\d+|PB\s*\d+|Pickleball\s*\d+)\s*-\s*(?:([^'\n]+?)(?:\'s)?\s*Booking|Booked)/gi;
     let m;
     while ((m = bookingRegex.exec(pollState.name)) !== null) {
       if (isIgnoredCourt(m[1])) continue;
-      courts.push({ court: m[1], player: m[2].trim() });
+      courts.push({ court: m[1], player: m[2]?.trim() || 'Member' });
     }
   }
 

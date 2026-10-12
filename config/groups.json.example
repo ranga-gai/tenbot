@@ -24,7 +24,9 @@
       ],
       "bookingCourtPreference": [
         2, 3, 1
-      ]
+      ],
+      "bookingStrategy": "advanced",
+      "bookingSchedule": "-7days 7:00AM"
     }
   }
 }
