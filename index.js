@@ -6744,10 +6744,12 @@ async function preBookCourtsForMatch({
   preBookCourts = null,
   bookingPlayers = null,
   creatorName = 'Member',
-  creatorJid = null
+  creatorJid = null,
+  existingAdvanceBookedCourts = null,
+  existingPrebookedCourts = null
 }) {
-  const advanceBookedCourts = [];
-  const prebookedCourts = [];
+  const advanceBookedCourts = Array.isArray(existingAdvanceBookedCourts) ? [...existingAdvanceBookedCourts] : [];
+  const prebookedCourts = Array.isArray(existingPrebookedCourts) ? [...existingPrebookedCourts] : [];
 
   if (!groupsConfig.isCourtBookingEnabled(remoteJid)) {
     return { advanceBookedCourts, prebookedCourts };
@@ -6784,6 +6786,20 @@ async function preBookCourtsForMatch({
     return copy;
   };
 
+  // 1. Direct booking accounts (used ONLY as the first player / P1 for each court)
+  const directNames = groupCfg?.directCourtBookingAccounts || [];
+  const directBookingPlayers = [];
+  const directKeysSet = new Set();
+  for (const name of directNames) {
+    const resolved = namesStore.resolveFullName(name);
+    const key = resolved.toLowerCase().trim();
+    if (!directBookingPlayers.some(dp => dp.toLowerCase().trim() === key)) {
+      directBookingPlayers.push(resolved);
+    }
+    directKeysSet.add(key);
+  }
+
+  // 2. Default booking players (used for the rest of the players in the group of 4)
   let rawPool = [];
   if (bookingPlayers) {
     rawPool = Array.isArray(bookingPlayers) ? bookingPlayers : (typeof bookingPlayers === 'string' ? bookingPlayers.split(/[,;]+/).map(s => s.trim()).filter(Boolean) : []);
@@ -6795,36 +6811,36 @@ async function preBookCourtsForMatch({
     rawPool = [creatorName || 'Member'];
   }
 
-  const seenPoolNames = new Set();
-  const candidatePool = [];
+  const seenTeammateNames = new Set();
+  const defaultBookingPool = [];
   for (const p of rawPool) {
     const resolved = namesStore.resolveFullName(p);
     const key = resolved.toLowerCase().trim();
-    if (!seenPoolNames.has(key)) {
-      seenPoolNames.add(key);
-      candidatePool.push(resolved);
-    }
-  }
-
-  const directNames = groupCfg?.directCourtBookingAccounts || [];
-  const directBookingPlayers = [];
-  for (const name of directNames) {
-    const resolved = namesStore.resolveFullName(name);
-    const key = resolved.toLowerCase().trim();
-    if (!directBookingPlayers.some(dp => dp.toLowerCase().trim() === key)) {
-      directBookingPlayers.push(resolved);
-    }
-    if (!seenPoolNames.has(key)) {
-      seenPoolNames.add(key);
-      candidatePool.push(resolved);
+    // Exclude directCourtBookingAccounts so only the first player is from directCourtBookingAccounts
+    if (!directKeysSet.has(key) && !seenTeammateNames.has(key)) {
+      seenTeammateNames.add(key);
+      defaultBookingPool.push(resolved);
     }
   }
 
   const playersPerCourt = (!isAuto && size && parseInt(size, 10) === 2) ? 2 : 4;
   const bookedPlayerKeys = new Set();
-  let availableDirectAccounts = shuffleArray(directBookingPlayers);
+  for (const b of advanceBookedCourts) {
+    if (Array.isArray(b.players)) {
+      for (const p of b.players) {
+        if (p) bookedPlayerKeys.add(p.toLowerCase().trim());
+      }
+    }
+  }
+  let availableDirectAccounts = shuffleArray(directBookingPlayers).filter(p => !bookedPlayerKeys.has(p.toLowerCase().trim()));
 
-  for (let courtIdx = 0; courtIdx < targetCourtsCount; courtIdx++) {
+  const alreadyBookedCount = advanceBookedCourts.length;
+  if (alreadyBookedCount >= targetCourtsCount) {
+    console.log(`[poll] Target courts count (${targetCourtsCount}) already reached for ${remoteJid} on ${targetDateMDY} (${alreadyBookedCount} booked).`);
+    return { advanceBookedCourts, prebookedCourts };
+  }
+
+  for (let courtIdx = alreadyBookedCount; courtIdx < targetCourtsCount; courtIdx++) {
     let courtBooked = false;
     const MAX_RETRIES = 2;
     const MAX_ATTEMPTS = 1 + MAX_RETRIES;
@@ -6832,18 +6848,19 @@ async function preBookCourtsForMatch({
 
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
       const unbookedDirect = availableDirectAccounts.filter(p => !bookedPlayerKeys.has(p.toLowerCase().trim()));
-      const unbookedCandidates = candidatePool.filter(p => !bookedPlayerKeys.has(p.toLowerCase().trim()));
+      let unbookedTeammates = defaultBookingPool.filter(p => !bookedPlayerKeys.has(p.toLowerCase().trim()));
 
       let p1 = null;
       if (unbookedDirect.length > 0) {
         const shuffledDirect = shuffleArray(unbookedDirect);
         p1 = shuffledDirect[0];
       } else {
-        const shuffledCandidates = shuffleArray(unbookedCandidates);
-        p1 = shuffledCandidates[0] || (creatorName || 'Member');
+        // Fallback if direct accounts are exhausted
+        const shuffledTeammates = shuffleArray(unbookedTeammates);
+        p1 = shuffledTeammates[0] || (creatorName || 'Member');
       }
 
-      const availableTeammates = unbookedCandidates.filter(p => p.toLowerCase().trim() !== p1.toLowerCase().trim());
+      const availableTeammates = unbookedTeammates.filter(p => p.toLowerCase().trim() !== p1.toLowerCase().trim());
       const neededTeammates = Math.max(0, playersPerCourt - 1);
       let selectedTeammates = [];
 
