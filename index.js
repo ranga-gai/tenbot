@@ -164,7 +164,7 @@ const SYSTEM_PROMPT =
   'conversational (1-3 sentences) unless asked for more detail. You have ' +
   "access to tools to create match polls (fixed-spot polls for 2 singles or 4/8/12 doubles, " +
   "or Yes/No opt-in polls when no number of players is specified), generate matchups from poll votes, " +
-  "set/update player ratings, check weather, cancel/delete polls, schedule recurring match polls on specific days of the week or every day with customizable poll creation times per day of the week (schedule_recurring_poll), modify recurring schedules (modify_recurring_poll), list recurring schedules (list_recurring_polls), pause recurring schedules indefinitely or until a specific date after which they resume automatically (pause_recurring_poll), resume recurring schedules (resume_recurring_poll), skip one or more upcoming instances of a recurring poll (skip_recurring_poll_instance), restore skipped instances (unskip_recurring_poll_instance), and access the group's availability list, win/loss leaderboard, " +
+  "set/update player ratings, check weather, cancel/delete polls, schedule recurring match polls on specific days of the week or every day with customizable poll creation times, optional start date and end date (schedule_recurring_poll), modify recurring schedules including start/end dates (modify_recurring_poll), list recurring schedules (list_recurring_polls), pause recurring schedules indefinitely or until a specific date after which they resume automatically (pause_recurring_poll), resume recurring schedules (resume_recurring_poll), skip one or more upcoming instances of a recurring poll (skip_recurring_poll_instance), restore skipped instances (unskip_recurring_poll_instance), and access the group's availability list, win/loss leaderboard, " +
   'and active polls (given below). Multiple polls can be created for different times or by different users. ' +
   'The live local time in San Jose, CA is provided at the top of the context blurb below. ' +
   'Polls created manually by users for organizing tennis matches are passively tracked by the bot (marked as user-created / isManual). ' +
@@ -601,6 +601,14 @@ const CLAUDE_TOOLS = [
         bookingSchedule: {
           type: 'string',
           description: 'Optional schedule specifying when to book courts in advance (e.g. "-7days 7:00AM").'
+        },
+        startDate: {
+          type: 'string',
+          description: 'Optional start date for the recurring poll schedule (e.g. "2026-10-15", "10/15/2026", "Oct 15", "tomorrow", "next Monday"). No polls or bookings will be created for matches before this date.'
+        },
+        endDate: {
+          type: 'string',
+          description: 'Optional end date for the recurring poll schedule (e.g. "2026-11-15", "11/15/2026", "Nov 15"). No polls or bookings will be created for matches after this date.'
         }
       },
       required: ['matchTime']
@@ -692,6 +700,14 @@ const CLAUDE_TOOLS = [
         bookingSchedule: {
           type: 'string',
           description: 'Optional new schedule specifying when to book courts in advance (e.g. "-7days 7:00AM").'
+        },
+        startDate: {
+          type: 'string',
+          description: 'Optional new start date (e.g. "2026-10-15", "10/15/2026"), or "none"/"clear" to remove.'
+        },
+        endDate: {
+          type: 'string',
+          description: 'Optional new end date (e.g. "2026-11-15", "11/15/2026"), or "none"/"clear" to remove.'
         }
       },
       required: ['scheduleId']
