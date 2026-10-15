@@ -2322,12 +2322,17 @@ async function sendBookingNotifications(sock, chatId, message) {
     const recipients = groupsConfig.getBookingNotifications(chatId);
     if (!recipients || recipients.length === 0) return;
 
+    // Do not include information about admin override in notification messages
+    const cleanMessage = message
+      .replace(/\s*\*\((?:Admin\s+)?Override\)\*/gi, '')
+      .replace(/\s*\((?:Admin\s+)?Override\)/gi, '');
+
     for (const recipient of recipients) {
       if (chatId.toLowerCase() === recipient.toLowerCase()) continue;
 
       try {
-        messageHistory.recordMessage(recipient, "tenbot", message, Date.now(), true);
-        await activeSock.sendMessage(recipient, { text: message });
+        messageHistory.recordMessage(recipient, "tenbot", cleanMessage, Date.now(), true);
+        await activeSock.sendMessage(recipient, { text: cleanMessage });
         console.log(`[notifications] Sent booking notification to ${recipient} for group ${chatId}`);
       } catch (err) {
         console.error(`[notifications] Failed to send booking notification to ${recipient}:`, err.message);
@@ -6926,6 +6931,7 @@ async function preBookCourtsForMatch({
       console.log(`[poll] Pre-booking court ${courtIdx + 1}/${targetCourtsCount}${retryLabel} for ${remoteJid} on ${targetDateMDY} at ${queryTime} with players:`, currentCourtPlayers);
 
       try {
+        const alreadyBookedCourtNames = advanceBookedCourts.map(b => b.court);
         const bookRes = await scvcc.bookCourt({
           when: targetDateMDY,
           date: targetDateMDY,
@@ -6934,7 +6940,8 @@ async function preBookCourtsForMatch({
           requester: currentCourtPlayers[0] || creatorName || 'Member',
           requestedBy: creatorName || 'Member',
           sport,
-          chatId: remoteJid
+          chatId: remoteJid,
+          excludeCourts: alreadyBookedCourtNames
         });
 
         if (bookRes && bookRes.success) {
@@ -7219,6 +7226,14 @@ async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWor
             !seenPrebooked.has(c.court)
           ) {
             freeCourts.push({ court: c.court });
+          } else if (
+            c.status === 'unavailable' &&
+            (!Array.isArray(c.prebookedPlayers) || c.prebookedPlayers.length === 0) &&
+            !c.blockTitle &&
+            !seenPrebooked.has(c.court)
+          ) {
+            // Court is unavailable on grid but not booked by any players (can be booked via admin override)
+            freeCourts.push({ court: c.court, isOverride: true });
           }
         }
       }
