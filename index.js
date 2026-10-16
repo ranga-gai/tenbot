@@ -4126,7 +4126,8 @@ setInterval(() => {
       recurringPolls,
       persistPolls,
       preBookCourtsForMatch,
-      activePolls
+      activePolls,
+      sendBookingNotifications
     }).catch(err => console.error('[advance-booking] Error in sweep:', err.message));
 
     recurringPollsModule.checkAndPostRecurringPolls({
@@ -4136,7 +4137,8 @@ setInterval(() => {
       createMatchPoll,
       getTargetGroupJid,
       preBookCourtsForMatch,
-      activePolls
+      activePolls,
+      sendBookingNotifications
     }).catch(err => console.error('[recurring-poll] Error in sweep:', err.message));
   }
 }, RECURRING_POLL_CHECK_INTERVAL_MS);
@@ -4316,7 +4318,8 @@ async function startBot() {
         recurringPolls,
         persistPolls,
         preBookCourtsForMatch,
-        activePolls
+        activePolls,
+        sendBookingNotifications
       }).catch(err => console.error('[advance-booking] Error in sweep:', err.message));
 
       recurringPollsModule.checkAndPostRecurringPolls({
@@ -4326,7 +4329,8 @@ async function startBot() {
         createMatchPoll,
         getTargetGroupJid,
         preBookCourtsForMatch,
-        activePolls
+        activePolls,
+        sendBookingNotifications
       }).catch(err => console.error('[recurring-poll] Error in sweep:', err.message));
     }
   });
@@ -6784,7 +6788,8 @@ async function preBookCourtsForMatch({
   creatorName = 'Member',
   creatorJid = null,
   existingAdvanceBookedCourts = null,
-  existingPrebookedCourts = null
+  existingPrebookedCourts = null,
+  isAdvanceBooking = false
 }) {
   const advanceBookedCourts = Array.isArray(existingAdvanceBookedCourts) ? [...existingAdvanceBookedCourts] : [];
   const prebookedCourts = Array.isArray(existingPrebookedCourts) ? [...existingPrebookedCourts] : [];
@@ -6949,7 +6954,10 @@ async function preBookCourtsForMatch({
             court: bookRes.court,
             players: bookRes.players || currentCourtPlayers,
             date: bookRes.date,
-            time: bookRes.time
+            time: bookRes.time,
+            reservationId: bookRes.reservationId || null,
+            duration: bookRes.duration || '90 Minutes',
+            partySize: bookRes.partySize || (playersPerCourt === 2 ? 'Singles' : 'Doubles')
           });
           prebookedCourts.push({
             court: bookRes.court,
@@ -6983,6 +6991,21 @@ async function preBookCourtsForMatch({
     if (!courtBooked) {
       console.warn(`[poll] Advance court booking failed for court ${courtIdx + 1}/${targetCourtsCount} after all ${MAX_ATTEMPTS} attempts.`);
     }
+  }
+
+  // If called directly (not from 10-minute advance booking retry sweep), send summary notification
+  if (!isAdvanceBooking && sock && remoteJid) {
+    const isAllBooked = advanceBookedCourts.length >= targetCourtsCount && targetCourtsCount > 0;
+    const summaryMsg = scvcc.buildBookingSummaryMessage({
+      targetDateMDY,
+      queryTime,
+      sport,
+      targetCourtsCount,
+      advanceBookedCourts,
+      isExhausted: !isAllBooked
+    });
+    console.log(`[poll] Sending booking summary notification for ${remoteJid}:\n${summaryMsg}`);
+    await sendBookingNotifications(sock, remoteJid, summaryMsg);
   }
 
   return { advanceBookedCourts, prebookedCourts };
