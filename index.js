@@ -1207,7 +1207,7 @@ function isMatchSchedulingPoll(title = '', options = []) {
   const text = `${title} ${options.join(' ')}`.toLowerCase();
   const matchKeywords = /\b(tennis|match|matches|court|courts|singles|doubles|play|playing|players|player|game|games|drill|drills|session|hit|hitting|schedule|scheduling|scvcc)\b/i;
   const timeKeywords = /\b(today|tomorrow|tonight|monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tue|wed|thu|fri|sat|sun|morning|evening|afternoon)\b|\b\d{1,2}(?:[:.]\d{2})?\s*(?:am|pm)\b|\b\d{1,2}[:.]\d{2}\b/i;
-  const slotKeywords = /\b(player|spot|slot|court)\s*\d+|\b\d+\b/i;
+  const slotKeywords = /\b(?:player|spot|slot|court|p)\s*#?\s*\d+|\b\d+\b/i;
   const hasOptInOrSlot = options.some((opt) => /^(yes|no|in|out|playing|can't play)$/i.test(opt.trim()) || slotKeywords.test(opt.trim()));
 
   if (matchKeywords.test(text)) return true;
@@ -1280,7 +1280,7 @@ Please analyze this poll:
 5. Poll type: "opt_in" for Yes/No polls, or "manual" for fixed/numbered slots.
 6. Poll size: number of player spots (or null if opt-in).
 
-Respond ONLY with a JSON object in this exact format, with no other text or markdown formatting:
+CRITICAL INSTRUCTION: You MUST return strictly valid JSON format only, starting with { and ending with }. Do NOT enclose in markdown code blocks and do not output any preamble, commentary, or extra text.
 {
   "isMatchScheduling": boolean,
   "dayWord": string or null,
@@ -1343,7 +1343,7 @@ function getNextValidPlayerCount(n) {
 function getFirstSlotNumber(options) {
   if (!options || options.length === 0) return null;
   const firstLabel = String(options[0]).trim();
-  const match = firstLabel.match(/^(?:player|spot|slot|court|#|no\.?|num\.?)\s*(\d+)\b/i) ||
+  const match = firstLabel.match(/^(?:player|spot|slot|court|p|#|no\.?|num\.?)\s*#?\s*(\d+)\b/i) ||
     firstLabel.match(/\b(\d+)\b/);
   if (match) {
     const num = parseInt(match[1], 10);
@@ -4440,9 +4440,9 @@ async function startBot() {
 
           messageStore.set(storeKey(remoteJid, pollId), msg.message);
 
-          // If no explicit day word was in the poll title, ensure dayWord is null so resolvePlayDateTime rolls past times over to tomorrow
+          // Preserve interpretation.dayWord if parsed by LLM; if absent, resolvePlayDateTime handles rollover
           const hasExplicitDayInPollTitle = /\b(today|tonight|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tue|wed|thu|fri|sat|sun)\b/i.test(pollName);
-          const effectiveDayWord = hasExplicitDayInPollTitle ? interpretation.dayWord : null;
+          const effectiveDayWord = interpretation.dayWord || null;
 
           const playAt = resolvePlayDateTime(effectiveDayWord, interpretation.timeWord);
           const sjNow = getSanJoseNow();
@@ -5051,8 +5051,6 @@ function getPollMatchTime(pollState) {
  */
 function getPollPlayerNames(pollId, pollState, mePn) {
   const { interestedPlayers, aggregated } = getPollVoters(pollId, pollState, mePn);
-  const roster = resolveFixedPollRoster(pollState, aggregated);
-
   const players = [];
   const addPlayer = (name) => {
     if (!name || ratings.isPlaceholder(name)) return;
@@ -5061,8 +5059,20 @@ function getPollPlayerNames(pollId, pollState, mePn) {
     }
   };
 
-  if (Array.isArray(roster.players)) {
-    for (const p of roster.players) addPlayer(p);
+  let rosterPlayers = [];
+  let filledCount = 0;
+  if (pollState.isManual) {
+    const manualRoster = resolveManualPollPlayers(pollState, interestedPlayers);
+    rosterPlayers = manualRoster.players || [];
+    filledCount = interestedPlayers.length;
+  } else {
+    const roster = resolveFixedPollRoster(pollState, aggregated);
+    rosterPlayers = roster.players || [];
+    filledCount = roster.filledCount || 0;
+  }
+
+  if (Array.isArray(rosterPlayers)) {
+    for (const p of rosterPlayers) addPlayer(p);
   }
   if (Array.isArray(interestedPlayers)) {
     for (const p of interestedPlayers) addPlayer(p);
@@ -5071,11 +5081,11 @@ function getPollPlayerNames(pollId, pollState, mePn) {
     for (const p of pollState.lastPlayers) addPlayer(p);
   }
 
-  const cleanRosterCount = roster.players ? roster.players.filter((p) => !ratings.isPlaceholder(p)).length : 0;
+  const cleanRosterCount = rosterPlayers.filter((p) => !ratings.isPlaceholder(p)).length;
   return {
     players,
     rosterCount: cleanRosterCount,
-    filledCount: roster.filledCount || 0,
+    filledCount,
     size: pollState.size || null
   };
 }
@@ -5162,6 +5172,7 @@ function findBestMatchingPollForLineup({ activePolls, chatId, lineup, messageTex
       matchCount,
       matchedNames,
       matchRatio,
+      pollPlayersCount: pollPlayers.length,
       isExactPlayerMatch,
       isExactTimeMatch,
       isExactBoth,
@@ -5181,22 +5192,39 @@ function findBestMatchingPollForLineup({ activePolls, chatId, lineup, messageTex
     };
   }
 
-  // Tier 2: Prefer poll with most player name matches to votes
-  scored.sort((a, b) => {
-    if (b.matchCount !== a.matchCount) return b.matchCount - a.matchCount;
-    if (b.isExactTimeMatch !== a.isExactTimeMatch) return (b.isExactTimeMatch ? 1 : 0) - (a.isExactTimeMatch ? 1 : 0);
-    if (b.matchRatio !== a.matchRatio) return b.matchRatio - a.matchRatio;
-    if (b.statusWeight !== a.statusWeight) return b.statusWeight - a.statusWeight;
-    return b.index - a.index;
+  // Tier 2: Qualifying match where (lineup message has no time in it or if there is time it is an exact time match to the poll)
+  // and player matches with poll should be at least half the players in the lineup.
+  const qualifyingMatches = scored.filter((s) => {
+    const isTimeEligible = !msgTime || s.isExactTimeMatch;
+    const isHalfLineupMatch = lineupPlayers.length > 0 && s.matchCount >= (lineupPlayers.length / 2);
+    return Boolean(isTimeEligible && isHalfLineupMatch);
   });
 
-  const best = scored[0];
+  if (qualifyingMatches.length > 0) {
+    qualifyingMatches.sort((a, b) => {
+      // 1. Prefer exact time match over unspecified time
+      if (b.isExactTimeMatch !== a.isExactTimeMatch) return (b.isExactTimeMatch ? 1 : 0) - (a.isExactTimeMatch ? 1 : 0);
+      // 2. Prefer more matching players
+      if (b.matchCount !== a.matchCount) return b.matchCount - a.matchCount;
+      // 3. Prefer higher match ratio
+      if (b.matchRatio !== a.matchRatio) return b.matchRatio - a.matchRatio;
+      // 4. Prefer active/filled status weight
+      if (b.statusWeight !== a.statusWeight) return b.statusWeight - a.statusWeight;
+      return b.index - a.index;
+    });
+    const best = qualifyingMatches[0];
+    return {
+      targetPollId: best.pollId,
+      targetPollState: best.pollState,
+      matchInfo: `qualifying_match (${best.matchCount}/${lineupPlayers.length} lineup players, time: ${msgTime ? (best.isExactTimeMatch ? 'exact' : 'mismatch') : 'unspecified'})`
+    };
+  }
+
+  // If no exact both and no qualifying match, do NOT blindly resolve the newest poll
   return {
-    targetPollId: best.pollId,
-    targetPollState: best.pollState,
-    matchInfo: best.matchCount > 0
-      ? `player_votes_preference (${best.matchCount} player match(es): ${best.matchedNames.join(', ')})`
-      : 'fallback_most_recent'
+    targetPollId: null,
+    targetPollState: null,
+    matchInfo: 'none'
   };
 }
 
@@ -8283,23 +8311,31 @@ function pollStatusText(chatId = null, opts = {}) {
 
   if (targetId) {
     const targetLower = targetId.toLowerCase();
-    const matched = chatPolls.filter(([pollId, state]) => {
-      if (chatId && chatId.endsWith('@g.us') && state.remoteJid !== chatId) return false;
+    const isTargetManual = targetLower === 'manual' || targetLower === 'adhoc';
+    const isTargetRecurring = targetLower === 'recurring' || targetLower === 'scheduled';
+
+    const matchesPoll = (pollId, state) => {
       if (pollId.toLowerCase() === targetLower) return true;
       const sId = getPollScheduleId(state);
       if (sId && sId.toLowerCase() === targetLower) return true;
+      if (isTargetManual && state.isManual) return true;
+      if (isTargetRecurring && (state.isRecurring || Boolean(state.scheduleId))) return true;
+      const pName = (state.name || '').toLowerCase();
+      const pWhen = (state.when || '').toLowerCase();
+      if (pName.includes(targetLower) || pWhen.includes(targetLower)) return true;
+      if (state.creator?.name && state.creator.name.toLowerCase().includes(targetLower)) return true;
       return false;
+    };
+
+    const matched = chatPolls.filter(([pollId, state]) => {
+      if (chatId && chatId.endsWith('@g.us') && state.remoteJid !== chatId) return false;
+      return matchesPoll(pollId, state);
     });
 
     if (matched.length > 0) {
       chatPolls = matched;
     } else {
-      const globalMatched = [...activePolls.entries()].filter(([pollId, state]) => {
-        if (pollId.toLowerCase() === targetLower) return true;
-        const sId = getPollScheduleId(state);
-        if (sId && sId.toLowerCase() === targetLower) return true;
-        return false;
-      });
+      const globalMatched = [...activePolls.entries()].filter(([pollId, state]) => matchesPoll(pollId, state));
       if (globalMatched.length > 0) {
         chatPolls = globalMatched;
       } else {
