@@ -7580,6 +7580,171 @@ async function createMatchPoll(sock, remoteJid, size = null, when = null, dayWor
 }
 
 /**
+ * Extracts timestamp of a vote from voteBuffer.
+ */
+function getVoteTimestamp(pollState, voterJid) {
+  if (!pollState?.voteBuffer) return 0;
+  const norm = jidNormalizedUser(voterJid);
+  const canonicalId = namesStore.resolveCanonicalId(norm);
+  const entry = (norm && pollState.voteBuffer.get(norm)) ||
+                (canonicalId && pollState.voteBuffer.get(canonicalId)) ||
+                pollState.voteBuffer.get(voterJid);
+  if (!entry) return 0;
+  const rawTs = entry.senderTimestampMs || entry.timestamp || entry.pollUpdateMessageKey?.timestamp;
+  if (!rawTs) return 0;
+  if (typeof rawTs === 'number') return rawTs;
+  if (typeof rawTs === 'string') return parseInt(rawTs, 10) || 0;
+  if (typeof rawTs?.toNumber === 'function') return rawTs.toNumber();
+  if (typeof rawTs === 'bigint') return Number(rawTs);
+  return Number(rawTs) || 0;
+}
+
+/**
+ * Returns arrival index in voteBuffer Map as a tie-breaker.
+ */
+function getVoteArrivalIndex(pollState, voterJid) {
+  if (!pollState?.voteBuffer) return 0;
+  const norm = jidNormalizedUser(voterJid);
+  const canonicalId = namesStore.resolveCanonicalId(norm);
+  let idx = 0;
+  for (const k of pollState.voteBuffer.keys()) {
+    if (k === norm || k === canonicalId || k === voterJid) return idx;
+    idx++;
+  }
+  return 999999;
+}
+
+/**
+ * Checks for slot conflicts in a match poll (multiple voters on the same slot).
+ * When Person #2 votes on a slot already taken by Person #1, tags Person #2 in chat,
+ * alerts them that the slot is taken by Person #1, shows available open slots,
+ * quotes the poll message, and populates mentions with Person #2's JID/LID.
+ */
+async function checkAndNotifySlotConflicts(sock, pollId, pollState, aggregated) {
+  if (!pollState || !aggregated || !Array.isArray(aggregated)) return false;
+
+  // Conflicts only apply to slot-based polls (not opt-in Yes/No)
+  const isOptIn = pollState.type === 'opt_in' || pollState.options?.some((o) => /^yes$/i.test(o.trim()));
+  if (isOptIn) return false;
+
+  const conflicts = aggregated.filter((o) => {
+    if (/^(no|out|can't play|cannot play)$/i.test(o.name.trim())) return false;
+    return Array.isArray(o.voters) && o.voters.length > 1;
+  });
+
+  if (conflicts.length === 0) {
+    if (pollState.lastConflictSignature !== null) {
+      pollState.lastConflictSignature = null;
+      persistPolls();
+    }
+    return false;
+  }
+
+  // Calculate signature to avoid spamming the exact same notification repeatedly
+  const signature = conflicts.map((c) => `${c.name}:${[...c.voters].sort().join(',')}`).join('|');
+  if (pollState.lastConflictSignature === signature) {
+    return true; // Already notified this exact conflict state
+  }
+  pollState.lastConflictSignature = signature;
+  persistPolls();
+
+  // Find available open slots
+  const openSlotOptions = aggregated.filter((o) => {
+    if (/^(no|out|can't play|cannot play)$/i.test(o.name.trim())) return false;
+    return !o.voters || o.voters.length === 0;
+  });
+  const openSlotNames = openSlotOptions.map((o) => o.name.trim());
+
+  let openSlotsText = '';
+  if (openSlotNames.length > 0) {
+    openSlotsText = `👉 Available open slot(s): *${openSlotNames.join('*, *')}*`;
+  } else {
+    openSlotsText = 'ℹ️ All other slots are currently taken.';
+  }
+
+  const alertLines = [];
+  const allMentions = [];
+
+  for (const conf of conflicts) {
+    const slotName = conf.name.trim();
+
+    // Sort voters: earliest timestamp / arrival first
+    const sortedVoters = [...conf.voters].sort((a, b) => {
+      const tA = getVoteTimestamp(pollState, a);
+      const tB = getVoteTimestamp(pollState, b);
+      if (tA && tB && tA !== tB) return tA - tB;
+      const idxA = getVoteArrivalIndex(pollState, a);
+      const idxB = getVoteArrivalIndex(pollState, b);
+      return idxA - idxB;
+    });
+
+    const firstVoterJid = sortedVoters[0];
+    const firstVoterName = nameFor(firstVoterJid);
+    const subsequentVoters = sortedVoters.slice(1);
+
+    for (const secondVoterJid of subsequentVoters) {
+      const norm = jidNormalizedUser(secondVoterJid);
+      const pn = namesStore.getPnByLid(norm) || (norm?.endsWith('@s.whatsapp.net') ? norm : null);
+      const lid = namesStore.resolveCanonicalId(norm) || (norm?.endsWith('@lid') ? norm : null);
+      const voterName = nameFor(secondVoterJid);
+
+      const phoneDigits = (pn || norm || lid || secondVoterJid).split('@')[0].replace(/\D/g, '');
+      const tagStr = phoneDigits ? `@${phoneDigits}` : `@${voterName}`;
+
+      if (pn) allMentions.push(pn);
+      if (lid) allMentions.push(lid);
+      if (norm) allMentions.push(norm);
+
+      alertLines.push(`⚠️ ${tagStr}, *${slotName}* is already taken by *${firstVoterName}*! Please switch your vote to an open slot.`);
+    }
+  }
+
+  if (openSlotsText) {
+    alertLines.push('');
+    alertLines.push(openSlotsText);
+  }
+
+  const fullAlertText = alertLines.join('\n');
+  const uniqueMentions = [...new Set(allMentions)];
+
+  let pollCreationMessage = messageStore.get(storeKey(pollState.remoteJid, pollId));
+  if (!pollCreationMessage) {
+    for (const key of messageStore.keys()) {
+      if (key.endsWith(`:${pollId}`)) {
+        pollCreationMessage = messageStore.get(key);
+        break;
+      }
+    }
+  }
+
+  const fromMe = !pollState.isManual;
+  const participant = pollState.creator?.jid;
+
+  const quotedMsg = {
+    key: {
+      remoteJid: pollState.remoteJid,
+      id: pollId,
+      fromMe: Boolean(fromMe),
+      ...(participant ? { participant } : {})
+    },
+    ...(pollCreationMessage ? { message: pollCreationMessage } : {})
+  };
+
+  console.log(`[poll] Sending slot conflict alert in ${pollState.remoteJid} for poll ${pollId} (tagging ${uniqueMentions.length} mention(s)): \n${fullAlertText}`);
+  try {
+    messageHistory.recordMessage(pollState.remoteJid, 'tenbot', fullAlertText, Date.now(), true);
+    await sock.sendMessage(pollState.remoteJid, {
+      text: fullAlertText,
+      mentions: uniqueMentions
+    }, { quoted: quotedMsg });
+  } catch (err) {
+    console.error(`[poll] Failed to send slot conflict alert for poll ${pollId}:`, err.message);
+  }
+
+  return true;
+}
+
+/**
  * Handles an incoming poll vote (from either event path): decrypts it if
  * needed, merges it into our running tally for that poll, and if every slot
  * now has exactly one voter (for fixed-slot polls), posts matchups.
@@ -7731,8 +7896,9 @@ async function processPollVoteEvent(sock, pollMessageKey, rawPollUpdates) {
     let noCount = 0;
     let filledCount = 0;
     let totalOptionsCount = pollState.options ? pollState.options.length : 0;
+    let aggregated = [];
     try {
-      const aggregated = getAggregateVotesInPollMessage(
+      aggregated = getAggregateVotesInPollMessage(
         { message: pollCreationMessage, pollUpdates: merged },
         mePn
       );
@@ -7745,6 +7911,13 @@ async function processPollVoteEvent(sock, pollMessageKey, rawPollUpdates) {
       filledCount = votingOptions.filter((o) => o.voters.length > 0).length;
       if (totalOptionsCount === 0) totalOptionsCount = votingOptions.length;
     } catch (e) { }
+
+    if (pollState.type !== 'opt_in' && !pollState.options?.some((o) => /^yes$/i.test(o.trim()))) {
+      const hasConflict = await checkAndNotifySlotConflicts(sock, pollId, pollState, aggregated);
+      if (hasConflict) {
+        return;
+      }
+    }
 
     // When all voting slots are filled and not already resolved, transition status to 'filled'
     if (pollState.status !== 'resolved' && pollState.status !== 'cancelled' && pollState.status !== 'stopped') {
@@ -7818,9 +7991,12 @@ async function processPollVoteEvent(sock, pollMessageKey, rawPollUpdates) {
     return;
   }
 
-  const conflicts = aggregated.filter((o) => o.voters.length > 1);
-  const options = pollState.options || [];
+  const hasConflict = await checkAndNotifySlotConflicts(sock, pollId, pollState, aggregated);
+  if (hasConflict) {
+    return; // don't generate matchups while there's a conflict
+  }
 
+  const options = pollState.options || [];
   const { players, excessPlayers, filledCount, totalSlotsCount, isAllFilled } = resolveFixedPollRoster(pollState, aggregated);
 
   // If slotLimit is set and there are excess players crossing the limit, emit warning message to chat
@@ -7841,24 +8017,8 @@ async function processPollVoteEvent(sock, pollMessageKey, rawPollUpdates) {
 
   console.log(
     `[poll] Poll ${pollId}: ${filledCount}/${totalSlotsCount} slot(s) filled (${pollState.size} players total), ` +
-    `${conflicts.length} conflicting slot(s), ${pollState.voteBuffer.size} raw vote(s) buffered.`
+    `0 conflicting slot(s), ${pollState.voteBuffer.size} raw vote(s) buffered.`
   );
-
-  if (conflicts.length > 0) {
-    const signature = conflicts.map((c) => `${c.name}:${c.voters.sort().join(',')}`).join('|');
-    if (pollState.lastConflictSignature !== signature) {
-      pollState.lastConflictSignature = signature;
-      persistPolls();
-      const lines = conflicts.map((c) => {
-        const names = c.voters.map((v) => nameFor(v)).join(', ');
-        return `${c.name}: ${names}`;
-      });
-      await sock.sendMessage(pollState.remoteJid, {
-        text: `⚠️ A couple of slots have more than one vote -- one person should switch to an open slot:\n${lines.join('\n')}`
-      });
-    }
-    return; // don't generate matchups while there's a conflict
-  }
 
   if (pollState.status !== 'active' && pollState.status !== 'filled') return;
 
