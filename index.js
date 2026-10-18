@@ -1134,6 +1134,11 @@ const CLAUDE_TOOLS = [
   },
 ];
 
+// Attach cache_control to the last tool so Anthropic caches all tool definitions as a single prefix block
+const CACHED_CLAUDE_TOOLS = CLAUDE_TOOLS.map((tool, idx) =>
+  idx === CLAUDE_TOOLS.length - 1 ? { ...tool, cache_control: { type: 'ephemeral' } } : tool
+);
+
 // How many past messages (per chat) to keep for conversational context
 const HISTORY_LIMIT = 10;
 
@@ -8890,13 +8895,24 @@ async function callClaude(sock, chatId, sender, promptText, msg) {
   const userMessage = { role: 'user', content: `${sender}: ${promptText}` };
   const messages = [...history, userMessage];
 
-  const systemWithContext = `${SYSTEM_PROMPT}\n\n${buildContextBlurb(chatId)}`;
+  // Structure system as content blocks: static SYSTEM_PROMPT is cached, while dynamic context blurb follows
+  const systemBlocks = [
+    {
+      type: 'text',
+      text: SYSTEM_PROMPT,
+      cache_control: { type: 'ephemeral' }
+    },
+    {
+      type: 'text',
+      text: buildContextBlurb(chatId)
+    }
+  ];
 
   const makeApiCall = async (msgs) => {
     return await anthropic.callAnthropicMessages({
       messages: msgs,
-      system: systemWithContext,
-      tools: CLAUDE_TOOLS,
+      system: systemBlocks,
+      tools: CACHED_CLAUDE_TOOLS,
       maxTokens: 400
     });
   };
