@@ -7,7 +7,7 @@ describe('claudeTools', () => {
     assert(Array.isArray(CLAUDE_TOOLS));
     assert(Array.isArray(CACHED_CLAUDE_TOOLS));
     assert.equal(CLAUDE_TOOLS.length, CACHED_CLAUDE_TOOLS.length);
-    assert.equal(CLAUDE_TOOLS.length, 35);
+    assert.equal(CLAUDE_TOOLS.length, 36);
   });
 
   it('should ensure each tool has name, description, and valid input_schema', () => {
@@ -47,6 +47,7 @@ describe('claudeTools', () => {
       'clear_all_polls',
       'cancel_poll',
       'rematch',
+      'parse_lineup',
       'stop_poll',
       'resume_poll',
       'pause_reminders',

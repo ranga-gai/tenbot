@@ -5,10 +5,25 @@ const {
   extractTimeFromLineupMessage,
   getPollMatchTime,
   findBestMatchingPollForLineup,
-  handleManualLineup
+  handleManualLineup,
+  executeLineupTool,
+  LINEUP_PARSER_TOOL
 } = require('../lib/commands/lineupCommands');
 
 describe('lineupCommands', () => {
+  describe('LINEUP_PARSER_TOOL', () => {
+    it('should be defined with valid tool name and schema', () => {
+      assert.equal(LINEUP_PARSER_TOOL.name, 'parse_lineup');
+      assert.equal(typeof LINEUP_PARSER_TOOL.description, 'string');
+      assert.ok(LINEUP_PARSER_TOOL.description.length > 0);
+      assert.equal(LINEUP_PARSER_TOOL.input_schema.type, 'object');
+      assert.ok(LINEUP_PARSER_TOOL.input_schema.properties.isLineup);
+      assert.ok(LINEUP_PARSER_TOOL.input_schema.properties.players);
+      assert.ok(LINEUP_PARSER_TOOL.input_schema.properties.sets);
+      assert.deepEqual(LINEUP_PARSER_TOOL.input_schema.required, ['isLineup']);
+    });
+  });
+
   describe('isSamePlayerName', () => {
     it('should match identical names case-insensitively', () => {
       assert.equal(isSamePlayerName('Roger Federer', 'roger federer'), true);
@@ -297,6 +312,110 @@ describe('lineupCommands', () => {
       const reactMsg = sentMessages.find((m) => m.payload?.react?.text === '🤖');
       assert.ok(reactMsg, 'Expected 🤖 bot emoji reaction to be sent');
       assert.equal(reactMsg.payload.react.key.id, 'lineup_msg_123');
+    });
+  });
+
+  describe('executeLineupTool', () => {
+    it('should parse deterministic lineup text and record to matching poll', async () => {
+      const targetPoll = {
+        remoteJid: 'test_chat@g.us',
+        name: 'Tennis 9am',
+        when: 'Today 9:00am',
+        size: 4,
+        status: 'active',
+        lastPlayers: ['Alice', 'Bob', 'Charlie', 'Dave']
+      };
+      const activePolls = new Map([['poll_9am', targetPoll]]);
+      let persisted = false;
+      const context = {
+        activePolls,
+        persistPolls: () => { persisted = true; },
+        messageStore: new Map()
+      };
+      const dummySock = {
+        user: { id: 'bot@s.whatsapp.net' },
+        sendMessage: async () => ({ key: { id: 'msg1' } })
+      };
+      const dummyMsg = {
+        key: { remoteJid: 'test_chat@g.us', id: 'tool_msg_1', fromMe: false }
+      };
+
+      const res = await executeLineupTool(
+        dummySock,
+        'parse_lineup',
+        { text: 'Court 1: Alice & Bob vs Charlie & Dave at 9:00am' },
+        'Alice',
+        'test_chat@g.us',
+        dummyMsg,
+        context
+      );
+
+      assert.match(res, /Successfully parsed and recorded lineup/);
+      assert.match(res, /Tennis 9am/);
+      assert.equal(targetPoll.status, 'resolved');
+      assert.deepEqual(targetPoll.lastPlayers, ['Alice', 'Bob', 'Charlie', 'Dave']);
+      assert.equal(persisted, true);
+    });
+
+    it('should handle pre-structured lineup input directly', async () => {
+      const targetPoll = {
+        remoteJid: 'test_chat@g.us',
+        when: 'Today 6:00pm',
+        size: 4,
+        status: 'active',
+        lastPlayers: ['Alice', 'Bob', 'Charlie', 'Dave']
+      };
+      const activePolls = new Map([['poll_6pm', targetPoll]]);
+      const context = {
+        activePolls,
+        persistPolls: () => {},
+        messageStore: new Map()
+      };
+
+      const res = await executeLineupTool(
+        null,
+        'parse_lineup',
+        {
+          pollId: 'poll_6pm',
+          lineup: {
+            type: 'doubles',
+            time: '6:00pm',
+            players: ['Alice', 'Charlie', 'Bob', 'Dave'],
+            sets: [{
+              set: 1,
+              courts: [{ court: 2, teamA: ['Alice', 'Charlie'], teamB: ['Bob', 'Dave'] }]
+            }]
+          }
+        },
+        'Alice',
+        'test_chat@g.us',
+        null,
+        context
+      );
+
+      assert.match(res, /Successfully parsed and recorded lineup/);
+      assert.equal(targetPoll.status, 'resolved');
+      assert.deepEqual(targetPoll.lastPlayers, ['Alice', 'Charlie', 'Bob', 'Dave']);
+    });
+
+    it('should return helpful error message when input cannot be parsed', async () => {
+      const context = {
+        activePolls: new Map(),
+        persistPolls: () => {},
+        messageStore: new Map()
+      };
+
+      const res = await executeLineupTool(
+        null,
+        'parse_lineup',
+        { text: 'Are we playing tennis today?' },
+        'Alice',
+        'test_chat@g.us',
+        null,
+        context
+      );
+
+      assert.match(res, /Could not parse a valid match lineup/);
     });
   });
 });

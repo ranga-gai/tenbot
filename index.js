@@ -67,6 +67,7 @@ const groupsConfig = require('./lib/groupsConfig');
 const courtsConfig = require('./lib/courtsConfig');
 const anthropic = require('./lib/anthropic');
 const pollTime = require('./lib/pollTime');
+const { parseLineup } = require('./lib/lineupParser');
 const { resolvePlayDateTime, getSanJoseNow, getSanJoseParts } = pollTime;
 
 // Claude Tools & Schemas (extracted to lib/claudeTools.js)
@@ -76,6 +77,8 @@ const { CLAUDE_TOOLS, CACHED_CLAUDE_TOOLS } = require('./lib/claudeTools');
 const {
   routeCommand,
   executeTool,
+  isAddressedToBot,
+  stripLeadingTrigger,
   groupCommands,
   courtCommands,
   playerCommands,
@@ -117,6 +120,7 @@ const SYSTEM_PROMPT =
   'When a user asks to generate matchups, create the draw, make teams, or rematch for ANY match poll (including manually created match polls, opt-in polls, or previously resolved polls), ' +
   'ALWAYS call the generate_matchups tool (or rematch tool). If the user asks to keep specific players on the same team or partner together (e.g. "keeping PlayerA and PlayerB in same team", "partner P1 with P2", "with X and Y together"), ALWAYS pass those players in fixedPairs as a 2D array of string pairs (e.g. fixedPairs: [["PlayerA", "PlayerB"]]) to generate_matchups or rematch. NEVER tell the user that a poll has ended, is closed, or is not active when they ask for matchups. ' +
   'If there are multiple polls or a specific poll is requested (e.g. "for 10am", "Tennis 8am"), pass pollId or pollName to generate_matchups. ' +
+  'When a user shares, posts, updates, or asks to parse or record match lineups, court assignments, teams, or rotations (e.g. "Court 1: Alice & Bob vs Charlie & David", "Set 1: Court 2 Mike / Sara vs John / Alex", "@P1 @P2 @P3 @P4 - Court 6 7pm"), ALWAYS call the parse_lineup tool. ' +
   'Results can be reported to you in plain words ("Mike & Sara ' +
   'beat John & Alex 6-4", or "we won" right after a draw) and are logged automatically before ' +
   "you see the message, so don't claim you can't record scores. " +
@@ -225,44 +229,8 @@ function recordName(jid, name, explicitPn = null) {
 }
 
 /**
- * Checks whether an incoming message is addressed to the bot.
+ * Extracts plain text from various Baileys message structures.
  */
-function isAddressedToBot(text, msg, botJids, triggerPrefix = TRIGGER_PREFIX) {
-  if (!triggerPrefix) return { addressed: true, promptText: text };
-
-  const mentionedJids = msg?.message?.extendedTextMessage?.contextInfo?.mentionedJid || [];
-  const isDirectlyMentioned = mentionedJids.some((jid) => botJids.includes(jidNormalizedUser(jid)));
-
-  const baseName = escapeRegex(triggerPrefix.replace(/^@/, ''));
-  const prefixRegex = new RegExp(`^@${baseName}[:,]?\\s*`, 'i');
-  const anywhereRegex = new RegExp(`@${baseName}[:,]?\\b`, 'ig');
-
-  if (prefixRegex.test(text)) {
-    const promptText = text.replace(prefixRegex, '').trim();
-    return { addressed: true, promptText };
-  }
-
-  if (isDirectlyMentioned || anywhereRegex.test(text)) {
-    let promptText = text.replace(anywhereRegex, '').trim();
-    for (const jid of botJids) {
-      const num = jid.split('@')[0];
-      if (num) {
-        promptText = promptText.replace(new RegExp(`@${escapeRegex(num)}[:,]?\\s*`, 'g'), '').trim();
-      }
-    }
-    promptText = promptText.replace(/^[,\s:]+/, '').replace(/\s{2,}/g, ' ').trim();
-    return { addressed: true, promptText };
-  }
-
-  return { addressed: false, promptText: text };
-}
-
-function stripLeadingTrigger(text) {
-  if (!TRIGGER_PREFIX) return text;
-  const baseName = escapeRegex(TRIGGER_PREFIX.replace(/^@/, ''));
-  return text.replace(new RegExp(`^@${baseName}[:,]?\\s*`, 'i'), '').trim();
-}
-
 function extractText(message) {
   if (!message) return null;
   const msg = message.ephemeralMessage?.message ||
@@ -423,7 +391,7 @@ async function callClaude(sock, chatId, sender, promptText, msg) {
       messages: msgs,
       system: systemBlocks,
       tools: CACHED_CLAUDE_TOOLS,
-      maxTokens: 400
+      maxTokens: 1000
     });
   };
 
@@ -451,6 +419,9 @@ async function callClaude(sock, chatId, sender, promptText, msg) {
   }
 
   const replyText = anthropic.extractTextFromResponse(data);
+  if (!replyText) {
+    console.warn(`⚠️ [callClaude] Empty text response from Claude. stop_reason=${data?.stop_reason}, blocks=${(data?.content || []).map((b) => b.type).join(',')}`);
+  }
   const updatedHistory = [
     ...messages,
     { role: 'assistant', content: replyText || '' }
@@ -461,18 +432,48 @@ async function callClaude(sock, chatId, sender, promptText, msg) {
 }
 
 /**
+ * Detects and handles published tennis match lineups/matchups in group chats.
+ * Executed after command routing for unaddressed group messages.
+ */
+async function handleGroupLineup(sock, text, chatId, sender, msg, context) {
+  if (!chatId || !chatId.endsWith('@g.us')) return null;
+
+  // Check if message has some keywords to indicate it maybe a matchup message
+  const hasLineupHint = /\b(?:lineups?|matchups?|rotations?|teams?)\b/i.test(text) ||
+      /\bcourts?\b|\bct\b|\bc\d+\b/i.test(text) ||
+      /\bsets?\b/i.test(text) ||
+      /\b(?:vs\.?|v\.?|versus)\b/i.test(text);
+
+  if (!hasLineupHint) return null;
+
+  const hasActivePollForLineup = context.activePolls && [...context.activePolls.values()].some(
+    (p) => p.remoteJid === chatId && (p.status === 'active' || p.status === 'filled' || p.status === 'stopped' || p.status === 'resolved')
+  );
+  if (!hasActivePollForLineup) return null;
+
+  // Try manual parsing first to check if message has matchups as it is cheaper
+  let manualLineup = parseLineup(text, playerCommands.knownPlayers(chatId, context.activePolls));
+
+  // Try LLM detection if manual parsing fails due to complexity of message
+  if (!manualLineup) {
+    console.log(`[lineup] Matchup hint detected in "${text}" (sender: ${sender}). Calling parseLineupWithLLM...`);
+    manualLineup = await lineupCommands.parseLineupWithLLM(text, chatId, context.activePolls);
+  }
+
+  if (manualLineup) {
+    await lineupCommands.handleManualLineup(sock, chatId, sender, manualLineup, msg, text, context);
+    return true;
+  }
+
+  return null;
+}
+
+/**
  * Central response router for incoming messages.
  */
 async function getResponse(sock, rawText, chatId, sender, msg) {
   const context = getPollContext();
 
-  // 1. Check structured commands via modular router
-  const handled = await routeCommand(sock, rawText, chatId, sender, msg, context);
-  if (handled !== null) {
-    return handled;
-  }
-
-  // 2. Check bot trigger (@tenbot or DM)
   const mePn = jidNormalizedUser(sock?.user?.id || sock?.authState?.creds?.me?.id || '');
   const meLid = jidNormalizedUser(sock?.user?.lid || sock?.authState?.creds?.me?.lid || '');
   const botJids = [mePn, meLid].filter(Boolean);
@@ -483,6 +484,22 @@ async function getResponse(sock, rawText, chatId, sender, msg) {
     ? { addressed: true, promptText: stripLeadingTrigger(text) }
     : isAddressedToBot(text, msg, botJids);
 
+  // 1. Check structured commands via modular router
+  const commandText = addressed ? (promptText || text) : text;
+  const handled = await routeCommand(sock, commandText, chatId, sender, msg, context);
+  if (handled !== null) {
+    return handled;
+  }
+
+  // 2. Manual published matchup / lineup detection in group messages, if addressed use regular LLM detection below
+  if (!addressed) {
+    const lineupHandled = await handleGroupLineup(sock, text, chatId, sender, msg, context);
+    if (lineupHandled) {
+      return null;
+    }
+  }
+
+  // 3. If TRIGGER_PREFIX is set and message was not addressed to the bot, ignore
   if (TRIGGER_PREFIX && !addressed) {
     return null;
   }
@@ -547,54 +564,57 @@ async function handleMessage(sock, msg, groupName) {
 
   const reply = await getResponse(sock, text.trim(), remoteJid, sender, msg);
   if (reply) {
+    console.log(`[${groupName}] tenbot: ${reply}`);
     messageHistory.recordMessage(remoteJid, 'tenbot', reply, Date.now(), true);
     await sock.sendMessage(remoteJid, { text: reply });
   }
 }
 
-// Background sweeps
-pollCommands.cleanupExpiredPolls(getPollContext());
-setInterval(() => {
+// Background sweeps (only active when running directly as main application)
+if (require.main === module) {
   pollCommands.cleanupExpiredPolls(getPollContext());
-}, POLL_CLEANUP_INTERVAL_MINUTES * 60 * 1000);
-
-setInterval(() => {
-  if (botSock) {
-    pollCommands.checkAndSendPollReminders(botSock, getPollContext());
-    pollCommands.checkCourtReleases(botSock, getPollContext());
-  }
-}, POLL_REMINDER_CHECK_INTERVAL_MS);
-
-setInterval(() => {
-  if (botSock) {
-    recurringPollsModule.checkAndExecuteAdvanceBookings({
-      sock: botSock,
-      recurringPolls,
-      persistPolls,
-      preBookCourtsForMatch: (args) => pollCommands.preBookCourtsForMatch(args),
-      activePolls,
-      sendBookingNotifications: courtCommands.sendBookingNotifications
-    }).catch((err) => console.error('[advance-booking] Error in sweep:', err.message));
-
-    recurringPollsModule.checkAndPostRecurringPolls({
-      sock: botSock,
-      recurringPolls,
-      persistPolls,
-      createMatchPoll: (...args) => pollCommands.createMatchPoll(...args, getPollContext()),
-      getTargetGroupJid: groupCommands.getTargetGroupJid,
-      preBookCourtsForMatch: (args) => pollCommands.preBookCourtsForMatch(args),
-      activePolls,
-      sendBookingNotifications: courtCommands.sendBookingNotifications
-    }).catch((err) => console.error('[recurring-poll] Error in sweep:', err.message));
-  }
-}, RECURRING_POLL_CHECK_INTERVAL_MS);
-
-setTimeout(() => {
-  ratings.refreshPeriodicRatings().catch((err) => console.error('Error in periodic ratings sweep:', err));
   setInterval(() => {
+    pollCommands.cleanupExpiredPolls(getPollContext());
+  }, POLL_CLEANUP_INTERVAL_MINUTES * 60 * 1000);
+
+  setInterval(() => {
+    if (botSock) {
+      pollCommands.checkAndSendPollReminders(botSock, getPollContext());
+      pollCommands.checkCourtReleases(botSock, getPollContext());
+    }
+  }, POLL_REMINDER_CHECK_INTERVAL_MS);
+
+  setInterval(() => {
+    if (botSock) {
+      recurringPollsModule.checkAndExecuteAdvanceBookings({
+        sock: botSock,
+        recurringPolls,
+        persistPolls,
+        preBookCourtsForMatch: (args) => pollCommands.preBookCourtsForMatch(args),
+        activePolls,
+        sendBookingNotifications: courtCommands.sendBookingNotifications
+      }).catch((err) => console.error('[advance-booking] Error in sweep:', err.message));
+
+      recurringPollsModule.checkAndPostRecurringPolls({
+        sock: botSock,
+        recurringPolls,
+        persistPolls,
+        createMatchPoll: (...args) => pollCommands.createMatchPoll(...args, getPollContext()),
+        getTargetGroupJid: groupCommands.getTargetGroupJid,
+        preBookCourtsForMatch: (args) => pollCommands.preBookCourtsForMatch(args),
+        activePolls,
+        sendBookingNotifications: courtCommands.sendBookingNotifications
+      }).catch((err) => console.error('[recurring-poll] Error in sweep:', err.message));
+    }
+  }, RECURRING_POLL_CHECK_INTERVAL_MS);
+
+  setTimeout(() => {
     ratings.refreshPeriodicRatings().catch((err) => console.error('Error in periodic ratings sweep:', err));
-  }, RATINGS_REFRESH_CHECK_INTERVAL_MS);
-}, 20 * 1000);
+    setInterval(() => {
+      ratings.refreshPeriodicRatings().catch((err) => console.error('Error in periodic ratings sweep:', err));
+    }, RATINGS_REFRESH_CHECK_INTERVAL_MS);
+  }, 20 * 1000);
+}
 
 async function startBot() {
   const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
@@ -1068,5 +1088,7 @@ module.exports = {
   handleDirectPollCreation: (sock, chatId, sender, msg, parsed, opts) =>
     pollCommands.handleDirectPollCreation(sock, chatId, sender, msg, parsed, opts, getPollContext()),
   handleMessage,
-  resolveManualPollPlayers: pollCommands.resolveManualPollPlayers
+  resolveManualPollPlayers: pollCommands.resolveManualPollPlayers,
+  handleGroupLineup,
+  getResponse
 };
