@@ -13,6 +13,8 @@ const {
   getSlotNumberForOption,
   checkAndNotifyInvalidSlotVotes,
   handleOnDemandCourtBooking,
+  checkCourtReleasesForPoll,
+  checkCourtReleases,
   getPollVoters,
   sendPollReminder
 } = require('../lib/commands/pollCommands');
@@ -225,7 +227,30 @@ describe('pollCommands', () => {
       assert.equal(messagesSent.length, 0);
     });
 
-    it('should notify and tag voters voting beyond slotLimit with quoted poll', async () => {
+    it('should NOT warn voters if total vote count does not exceed slotLimit even if slot numbers are high', async () => {
+      const messagesSent = [];
+      const mockSock = {
+        sendMessage: async (jid, msg) => { messagesSent.push({ jid, msg }); }
+      };
+      const pollState = {
+        remoteJid: 'group1@g.us',
+        slotLimit: 8,
+        invalidSlotVotesNotified: []
+      };
+      // 4 votes total on slots 1, 8, 9, 10 -> total votes (4) <= 8 openings, so no warning!
+      const aggregated = [
+        { name: 'Player 1', voters: ['voter1@s.whatsapp.net'] },
+        { name: 'Player 8', voters: ['voter8@s.whatsapp.net'] },
+        { name: 'Player 9', voters: ['1234567890@s.whatsapp.net'] },
+        { name: 'Player 10', voters: ['9876543210@s.whatsapp.net'] }
+      ];
+
+      const notified = await checkAndNotifyInvalidSlotVotes(mockSock, 'poll123', pollState, aggregated, {});
+      assert.equal(notified, false);
+      assert.equal(messagesSent.length, 0);
+    });
+
+    it('should notify and tag voters only when total vote count exceeds slotLimit with quoted poll', async () => {
       const messagesSent = [];
       const mockSock = {
         sendMessage: async (jid, msg, opts) => {
@@ -238,8 +263,15 @@ describe('pollCommands', () => {
         slotLimit: 8,
         invalidSlotVotesNotified: []
       };
+      // 10 votes total for 8 slots -> 9th and 10th exceed available openings
       const aggregated = [
         { name: 'Player 1', voters: ['voter1@s.whatsapp.net'] },
+        { name: 'Player 2', voters: ['voter2@s.whatsapp.net'] },
+        { name: 'Player 3', voters: ['voter3@s.whatsapp.net'] },
+        { name: 'Player 4', voters: ['voter4@s.whatsapp.net'] },
+        { name: 'Player 5', voters: ['voter5@s.whatsapp.net'] },
+        { name: 'Player 6', voters: ['voter6@s.whatsapp.net'] },
+        { name: 'Player 7', voters: ['voter7@s.whatsapp.net'] },
         { name: 'Player 8', voters: ['voter8@s.whatsapp.net'] },
         { name: 'Player 9', voters: ['1234567890@s.whatsapp.net'] },
         { name: 'Player 10', voters: ['9876543210@s.whatsapp.net'] }
@@ -252,23 +284,22 @@ describe('pollCommands', () => {
       assert.equal(notified, true);
       assert.equal(messagesSent.length, 2);
 
-      // Verify Player 9 notification
+      // Verify 9th voter notification
       const msg9 = messagesSent[0];
       assert.equal(msg9.jid, 'group1@g.us');
       assert.match(msg9.msg.text, /@1234567890/);
-      assert.match(msg9.msg.text, /Player 9.*is no longer valid/);
-      assert.match(msg9.msg.text, /Only \*8 voting slots\* are valid/);
+      assert.match(msg9.msg.text, /all \*8 voting slots\* are already filled/);
       assert.ok(msg9.opts?.quoted?.key?.id === 'poll123');
 
-      // Verify Player 10 notification
+      // Verify 10th voter notification
       const msg10 = messagesSent[1];
       assert.match(msg10.msg.text, /@9876543210/);
-      assert.match(msg10.msg.text, /Player 10.*is no longer valid/);
+      assert.match(msg10.msg.text, /all \*8 voting slots\* are already filled/);
 
       // Verify tracking
       assert.deepEqual(pollState.invalidSlotVotesNotified, [
-        '1234567890@s.whatsapp.net:9',
-        '9876543210@s.whatsapp.net:10'
+        '1234567890@s.whatsapp.net:8',
+        '9876543210@s.whatsapp.net:8'
       ]);
 
       // Running a second time should not duplicate notifications
@@ -500,6 +531,8 @@ describe('pollCommands', () => {
         { name: 'Player 4', voters: ['v4@s.whatsapp.net'] },
         { name: 'Player 5', voters: ['v5@s.whatsapp.net'] },
         { name: 'Player 6', voters: ['v6@s.whatsapp.net'] },
+        { name: 'Player 7', voters: ['v7@s.whatsapp.net'] },
+        { name: 'Player 8', voters: ['v8@s.whatsapp.net'] },
         { name: 'Player 9', voters: ['1234567890@s.whatsapp.net'] }
       ];
 
@@ -520,9 +553,9 @@ describe('pollCommands', () => {
         assert.equal(courtFailMsg.msg.text, '⚠️ *Court 1* is no longer available. Only *8 voting slots* are valid for this match poll.');
 
         // Voter on Player 9 was tagged that slot is no longer valid
-        const invalidSlotMsg = messagesSent.find(m => m.msg?.text?.includes('Player 9'));
+        const invalidSlotMsg = messagesSent.find(m => m.msg?.text?.includes('1234567890'));
         assert.ok(invalidSlotMsg, 'Voter on invalid slot 9 was notified');
-        assert.match(invalidSlotMsg.msg.text, /@1234567890.*Player 9.*is no longer valid/);
+        assert.match(invalidSlotMsg.msg.text, /@1234567890.*all \*8 voting slots\* are already filled/);
       } finally {
         scvcc.bookCourt = originalBookCourt;
         scvcc.checkCourtAvailability = originalCheckAvail;
@@ -719,5 +752,598 @@ describe('pollCommands', () => {
       assert.equal(interestedPlayers[0], creatorName);
     });
 
+  });
+
+  describe('checkCourtReleasesForPoll', () => {
+    const crypto = require('crypto');
+    function makeOptHash(name) {
+      return crypto.createHash('sha256').update(name).digest();
+    }
+    const t0 = new Date('2026-10-20T08:00:00.000Z').getTime();
+    const playAt = new Date('2026-10-20T18:00:00.000Z').getTime(); // 10 hours = 600 mins
+    // 70% = t0 + 420 mins = 2026-10-20T15:00:00.000Z
+    // 70% warn = t0 + 415 mins = 2026-10-20T14:55:00.000Z
+    // 80% = t0 + 480 mins = 2026-10-20T16:00:00.000Z
+    // 80% warn = t0 + 475 mins = 2026-10-20T15:55:00.000Z
+    // 90% = t0 + 540 mins = 2026-10-20T17:00:00.000Z
+    // 90% warn = t0 + 535 mins = 2026-10-20T16:55:00.000Z
+
+    it('should send 5-min warning and cancel most recent court at 70% mark if 7 players for 3 courts (Example 1)', async () => {
+      const messagesSent = [];
+      const mockSock = {
+        sendMessage: async (jid, msg) => { messagesSent.push({ jid, msg }); }
+      };
+
+      const pollState = {
+        remoteJid: 'group1@g.us',
+        createdAt: new Date(t0).toISOString(),
+        playAt: new Date(playAt).toISOString(),
+        options: Array.from({ length: 12 }, (_, i) => `Player ${i + 1}`),
+        size: 12,
+        type: 'fixed',
+        status: 'active',
+        prebookedCourts: [
+          { court: 'Court 1', player: 'P1' },
+          { court: 'Court 2', player: 'P2' },
+          { court: 'Court 3', player: 'P3' }
+        ],
+        advanceBookedCourts: [
+          { court: 'Court 1', reservationId: 'res-1' },
+          { court: 'Court 2', reservationId: 'res-2' },
+          { court: 'Court 3', reservationId: 'res-3' }
+        ],
+        courtReleaseWarningsSent: [],
+        courtReleasesDone: [],
+        invalidSlotVotesNotified: []
+      };
+
+      // 7 votes
+      const voteBuffer = new Map();
+      for (let i = 1; i <= 7; i++) {
+        voteBuffer.set(`voter${i}@s.whatsapp.net`, {
+          pollUpdateMessageKey: { remoteJid: 'group1@g.us' },
+          pollUpdateMessageKey: { remoteJid: 'group1@g.us', participant: `voter${i}@s.whatsapp.net` },
+          vote: { selectedOptions: [makeOptHash(`Player ${i}`)] }
+        });
+      }
+      pollState.voteBuffer = voteBuffer;
+
+      const messageStore = new Map();
+      messageStore.set('group1@g.us:poll_ex1', {
+        pollCreationMessage: {
+          options: pollState.options.map((o) => ({ optionName: o }))
+        }
+      });
+
+      const context = { messageStore, persistPolls: () => {} };
+
+      // 1. At 5 mins before 70% (T0 + 415 mins)
+      const tWarn70 = t0 + 415 * 60 * 1000;
+      await checkCourtReleasesForPoll(mockSock, 'poll_ex1', pollState, context, tWarn70);
+
+      assert.equal(pollState.courtReleaseWarningsSent.includes(70), true);
+      assert.equal(pollState.prebookedCourts.length, 3, 'Court should not be cancelled at warning time');
+      const warnMsg = messagesSent.find((m) => m.msg.text.includes('Court 3') && m.msg.text.includes('5 mins'));
+      assert.ok(warnMsg, '5-min warning message should be sent for Court 3');
+
+      // 2. At 70% checkpoint (T0 + 420 mins)
+      const tCheck70 = t0 + 420 * 60 * 1000;
+      await checkCourtReleasesForPoll(mockSock, 'poll_ex1', pollState, context, tCheck70);
+
+      assert.equal(pollState.courtReleasesDone.includes(70), true);
+      assert.equal(pollState.prebookedCourts.length, 2, 'Court 3 should be cancelled');
+      assert.equal(pollState.prebookedCourts.map(c => c.court).includes('Court 3'), false);
+      assert.equal(pollState.slotLimit, 8);
+      assert.equal(pollState.size, 8);
+
+      const cancelMsg = messagesSent.find((m) => m.msg.text.includes('Court 3') && m.msg.text.includes('has been cancelled'));
+      assert.ok(cancelMsg, 'Cancellation message should be sent for Court 3');
+      assert.match(cancelMsg.msg.text, /8 voting slots/);
+    });
+
+    it('should not cancel court at 70% mark if players heed warning and fill slots before checkpoint', async () => {
+      const messagesSent = [];
+      const mockSock = {
+        sendMessage: async (jid, msg) => { messagesSent.push({ jid, msg }); }
+      };
+
+      const pollState = {
+        remoteJid: 'group1@g.us',
+        createdAt: new Date(t0).toISOString(),
+        playAt: new Date(playAt).toISOString(),
+        options: Array.from({ length: 12 }, (_, i) => `Player ${i + 1}`),
+        size: 12,
+        type: 'fixed',
+        status: 'active',
+        prebookedCourts: [
+          { court: 'Court 1', player: 'P1' },
+          { court: 'Court 2', player: 'P2' },
+          { court: 'Court 3', player: 'P3' }
+        ],
+        advanceBookedCourts: [
+          { court: 'Court 1', reservationId: 'res-1' },
+          { court: 'Court 2', reservationId: 'res-2' },
+          { court: 'Court 3', reservationId: 'res-3' }
+        ],
+        courtReleaseWarningsSent: [],
+        courtReleasesDone: [],
+        invalidSlotVotesNotified: []
+      };
+
+      // Initially 7 votes at warning time
+      const voteBuffer = new Map();
+      for (let i = 1; i <= 7; i++) {
+        voteBuffer.set(`voter${i}@s.whatsapp.net`, {
+          pollUpdateMessageKey: { remoteJid: 'group1@g.us' },
+          pollUpdateMessageKey: { remoteJid: 'group1@g.us', participant: `voter${i}@s.whatsapp.net` },
+          vote: { selectedOptions: [makeOptHash(`Player ${i}`)] }
+        });
+      }
+      pollState.voteBuffer = voteBuffer;
+
+      const messageStore = new Map();
+      messageStore.set('group1@g.us:poll_heed', {
+        pollCreationMessage: {
+          options: pollState.options.map((o) => ({ optionName: o }))
+        }
+      });
+      const context = { messageStore, persistPolls: () => {} };
+
+      // At warning time (T0 + 415 mins) -> sends warning
+      await checkCourtReleasesForPoll(mockSock, 'poll_heed', pollState, context, t0 + 415 * 60 * 1000);
+      assert.equal(pollState.courtReleaseWarningsSent.includes(70), true);
+
+      // Players heed warning! 2 more players vote -> 9 players now (needs 3 courts)
+      for (let i = 8; i <= 9; i++) {
+        voteBuffer.set(`voter${i}@s.whatsapp.net`, {
+          pollUpdateMessageKey: { remoteJid: 'group1@g.us' },
+          pollUpdateMessageKey: { remoteJid: 'group1@g.us', participant: `voter${i}@s.whatsapp.net` },
+          vote: { selectedOptions: [makeOptHash(`Player ${i}`)] }
+        });
+      }
+
+      // At checkpoint time (T0 + 420 mins)
+      messagesSent.length = 0;
+      await checkCourtReleasesForPoll(mockSock, 'poll_heed', pollState, context, t0 + 420 * 60 * 1000);
+
+      assert.equal(pollState.courtReleasesDone.includes(70), true);
+      assert.equal(pollState.prebookedCourts.length, 3, 'Court 3 should NOT be cancelled because 9 players need 3 courts');
+      const cancelMsg = messagesSent.find((m) => m.msg.text.includes('cancelled'));
+      assert.equal(cancelMsg, undefined, 'No cancellation message should be sent');
+    });
+
+    it('should release one court at 70% and another at 80% if 3 courts booked and 3 votes (Example 2)', async () => {
+      const messagesSent = [];
+      const mockSock = {
+        sendMessage: async (jid, msg) => { messagesSent.push({ jid, msg }); }
+      };
+
+      const pollState = {
+        remoteJid: 'group1@g.us',
+        createdAt: new Date(t0).toISOString(),
+        playAt: new Date(playAt).toISOString(),
+        options: Array.from({ length: 12 }, (_, i) => `Player ${i + 1}`),
+        size: 12,
+        type: 'fixed',
+        status: 'active',
+        prebookedCourts: [
+          { court: 'Court 1', player: 'P1' },
+          { court: 'Court 2', player: 'P2' },
+          { court: 'Court 3', player: 'P3' }
+        ],
+        advanceBookedCourts: [
+          { court: 'Court 1', reservationId: 'res-1' },
+          { court: 'Court 2', reservationId: 'res-2' },
+          { court: 'Court 3', reservationId: 'res-3' }
+        ],
+        courtReleaseWarningsSent: [],
+        courtReleasesDone: [],
+        invalidSlotVotesNotified: []
+      };
+
+      // 3 votes
+      const voteBuffer = new Map();
+      for (let i = 1; i <= 3; i++) {
+        voteBuffer.set(`voter${i}@s.whatsapp.net`, {
+          pollUpdateMessageKey: { remoteJid: 'group1@g.us' },
+          pollUpdateMessageKey: { remoteJid: 'group1@g.us', participant: `voter${i}@s.whatsapp.net` },
+          vote: { selectedOptions: [makeOptHash(`Player ${i}`)] }
+        });
+      }
+      pollState.voteBuffer = voteBuffer;
+
+      const messageStore = new Map();
+      messageStore.set('group1@g.us:poll_ex2', {
+        pollCreationMessage: {
+          options: pollState.options.map((o) => ({ optionName: o }))
+        }
+      });
+      const context = { messageStore, persistPolls: () => {} };
+
+      // At 70% checkpoint (T0 + 420 mins) -> cancels 1 court (Court 3)
+      await checkCourtReleasesForPoll(mockSock, 'poll_ex2', pollState, context, t0 + 420 * 60 * 1000);
+      assert.equal(pollState.prebookedCourts.length, 2);
+      assert.deepEqual(pollState.prebookedCourts.map(c => c.court), ['Court 1', 'Court 2']);
+      assert.equal(pollState.slotLimit, 8);
+
+      // At 80% warning (T0 + 475 mins) -> sends warning for Court 2
+      await checkCourtReleasesForPoll(mockSock, 'poll_ex2', pollState, context, t0 + 475 * 60 * 1000);
+      assert.equal(pollState.courtReleaseWarningsSent.includes(80), true);
+      const warn80 = messagesSent.find((m) => m.msg.text.includes('Court 2') && m.msg.text.includes('5 mins'));
+      assert.ok(warn80, 'Warning sent for Court 2 before 80% mark');
+
+      // At 80% checkpoint (T0 + 480 mins) -> cancels Court 2
+      await checkCourtReleasesForPoll(mockSock, 'poll_ex2', pollState, context, t0 + 480 * 60 * 1000);
+      assert.equal(pollState.prebookedCourts.length, 1);
+      assert.deepEqual(pollState.prebookedCourts.map(c => c.court), ['Court 1']);
+      assert.equal(pollState.slotLimit, 4);
+
+      // At 90% checkpoint (T0 + 540 mins) -> 3 players need 1 court, Court 1 stays!
+      await checkCourtReleasesForPoll(mockSock, 'poll_ex2', pollState, context, t0 + 540 * 60 * 1000);
+      assert.equal(pollState.prebookedCourts.length, 1);
+      assert.equal(pollState.prebookedCourts[0].court, 'Court 1');
+    });
+
+    it('should cancel court at 80% if 10 players at 70% dropped to 7 after that (Example 3)', async () => {
+      const messagesSent = [];
+      const mockSock = {
+        sendMessage: async (jid, msg) => { messagesSent.push({ jid, msg }); }
+      };
+
+      const pollState = {
+        remoteJid: 'group1@g.us',
+        createdAt: new Date(t0).toISOString(),
+        playAt: new Date(playAt).toISOString(),
+        options: Array.from({ length: 12 }, (_, i) => `Player ${i + 1}`),
+        size: 12,
+        type: 'fixed',
+        status: 'active',
+        prebookedCourts: [
+          { court: 'Court 1', player: 'P1' },
+          { court: 'Court 2', player: 'P2' },
+          { court: 'Court 3', player: 'P3' }
+        ],
+        advanceBookedCourts: [
+          { court: 'Court 1', reservationId: 'res-1' },
+          { court: 'Court 2', reservationId: 'res-2' },
+          { court: 'Court 3', reservationId: 'res-3' }
+        ],
+        courtReleaseWarningsSent: [],
+        courtReleasesDone: [],
+        invalidSlotVotesNotified: []
+      };
+
+      // 10 votes initially
+      const voteBuffer = new Map();
+      for (let i = 1; i <= 10; i++) {
+        voteBuffer.set(`voter${i}@s.whatsapp.net`, {
+          pollUpdateMessageKey: { remoteJid: 'group1@g.us' },
+          pollUpdateMessageKey: { remoteJid: 'group1@g.us', participant: `voter${i}@s.whatsapp.net` },
+          vote: { selectedOptions: [makeOptHash(`Player ${i}`)] }
+        });
+      }
+      pollState.voteBuffer = voteBuffer;
+
+      const messageStore = new Map();
+      messageStore.set('group1@g.us:poll_ex3', {
+        pollCreationMessage: {
+          options: pollState.options.map((o) => ({ optionName: o }))
+        }
+      });
+      const context = { messageStore, persistPolls: () => {} };
+
+      // At 70% mark (T0 + 420 mins) with 10 players -> no court cancelled
+      await checkCourtReleasesForPoll(mockSock, 'poll_ex3', pollState, context, t0 + 420 * 60 * 1000);
+      assert.equal(pollState.prebookedCourts.length, 3);
+      assert.equal(pollState.courtReleasesDone.includes(70), true);
+
+      // 3 players unvote -> now 7 players
+      voteBuffer.delete('voter8@s.whatsapp.net');
+      voteBuffer.delete('voter9@s.whatsapp.net');
+      voteBuffer.delete('voter10@s.whatsapp.net');
+
+      // At 80% warning (T0 + 475 mins) -> sends warning for Court 3
+      await checkCourtReleasesForPoll(mockSock, 'poll_ex3', pollState, context, t0 + 475 * 60 * 1000);
+      assert.equal(pollState.courtReleaseWarningsSent.includes(80), true);
+
+      // At 80% checkpoint (T0 + 480 mins) -> cancels Court 3
+      await checkCourtReleasesForPoll(mockSock, 'poll_ex3', pollState, context, t0 + 480 * 60 * 1000);
+      assert.equal(pollState.prebookedCourts.length, 2);
+      assert.equal(pollState.courtReleasesDone.includes(80), true);
+      assert.deepEqual(pollState.prebookedCourts.map(c => c.court), ['Court 1', 'Court 2']);
+      assert.equal(pollState.slotLimit, 8);
+    });
+
+    it('should cancel one court each at 70%, 80%, and 90% if 3 courts booked and 0 votes (Example 4)', async () => {
+      const messagesSent = [];
+      const mockSock = {
+        sendMessage: async (jid, msg) => { messagesSent.push({ jid, msg }); }
+      };
+
+      const pollState = {
+        remoteJid: 'group1@g.us',
+        createdAt: new Date(t0).toISOString(),
+        playAt: new Date(playAt).toISOString(),
+        options: Array.from({ length: 12 }, (_, i) => `Player ${i + 1}`),
+        size: 12,
+        type: 'fixed',
+        status: 'active',
+        prebookedCourts: [
+          { court: 'Court 1', player: 'P1' },
+          { court: 'Court 2', player: 'P2' },
+          { court: 'Court 3', player: 'P3' }
+        ],
+        advanceBookedCourts: [
+          { court: 'Court 1', reservationId: 'res-1' },
+          { court: 'Court 2', reservationId: 'res-2' },
+          { court: 'Court 3', reservationId: 'res-3' }
+        ],
+        courtReleaseWarningsSent: [],
+        courtReleasesDone: [],
+        invalidSlotVotesNotified: [],
+        voteBuffer: new Map()
+      };
+
+      const messageStore = new Map();
+      messageStore.set('group1@g.us:poll_ex4', {
+        pollCreationMessage: {
+          options: pollState.options.map((o) => ({ optionName: o }))
+        }
+      });
+      const context = { messageStore, persistPolls: () => {} };
+
+      // At 70% checkpoint -> cancels Court 3
+      await checkCourtReleasesForPoll(mockSock, 'poll_ex4', pollState, context, t0 + 420 * 60 * 1000);
+      assert.equal(pollState.prebookedCourts.length, 2);
+      assert.equal(pollState.prebookedCourts.map(c => c.court).includes('Court 3'), false);
+
+      // At 80% checkpoint -> cancels Court 2
+      await checkCourtReleasesForPoll(mockSock, 'poll_ex4', pollState, context, t0 + 480 * 60 * 1000);
+      assert.equal(pollState.prebookedCourts.length, 1);
+      assert.equal(pollState.prebookedCourts.map(c => c.court).includes('Court 2'), false);
+
+      // At 90% checkpoint -> cancels Court 1
+      await checkCourtReleasesForPoll(mockSock, 'poll_ex4', pollState, context, t0 + 540 * 60 * 1000);
+      assert.equal(pollState.prebookedCourts.length, 0);
+      assert.equal(pollState.status, 'stopped');
+      assert.equal(pollState.slotLimit, 0);
+    });
+
+    it('should ensure no extra courts remaining at 90% by cancelling multiple courts at once (Example 5)', async () => {
+      const messagesSent = [];
+      const mockSock = {
+        sendMessage: async (jid, msg) => { messagesSent.push({ jid, msg }); }
+      };
+
+      const pollState = {
+        remoteJid: 'group1@g.us',
+        createdAt: new Date(t0).toISOString(),
+        playAt: new Date(playAt).toISOString(),
+        options: Array.from({ length: 12 }, (_, i) => `Player ${i + 1}`),
+        size: 12,
+        type: 'fixed',
+        status: 'active',
+        prebookedCourts: [
+          { court: 'Court 1', player: 'P1' },
+          { court: 'Court 2', player: 'P2' },
+          { court: 'Court 3', player: 'P3' }
+        ],
+        advanceBookedCourts: [
+          { court: 'Court 1', reservationId: 'res-1' },
+          { court: 'Court 2', reservationId: 'res-2' },
+          { court: 'Court 3', reservationId: 'res-3' }
+        ],
+        courtReleaseWarningsSent: [70, 80],
+        courtReleasesDone: [70, 80],
+        invalidSlotVotesNotified: []
+      };
+
+      // Only 2 players voted (needs 1 court). 3 courts booked -> 2 extra courts!
+      const voteBuffer = new Map();
+      for (let i = 1; i <= 2; i++) {
+        voteBuffer.set(`voter${i}@s.whatsapp.net`, {
+          pollUpdateMessageKey: { remoteJid: 'group1@g.us' },
+          pollUpdateMessageKey: { remoteJid: 'group1@g.us', participant: `voter${i}@s.whatsapp.net` },
+          vote: { selectedOptions: [makeOptHash(`Player ${i}`)] }
+        });
+      }
+      pollState.voteBuffer = voteBuffer;
+
+      const messageStore = new Map();
+      messageStore.set('group1@g.us:poll_multi', {
+        pollCreationMessage: {
+          options: pollState.options.map((o) => ({ optionName: o }))
+        }
+      });
+      const context = { messageStore, persistPolls: () => {} };
+
+      // At 90% checkpoint (T0 + 540 mins) -> cancels both Court 3 and Court 2 at once!
+      await checkCourtReleasesForPoll(mockSock, 'poll_multi', pollState, context, t0 + 540 * 60 * 1000);
+      assert.equal(pollState.prebookedCourts.length, 1);
+      assert.deepEqual(pollState.prebookedCourts.map(c => c.court), ['Court 1']);
+      assert.equal(pollState.slotLimit, 4);
+
+      const cancelMsg = messagesSent.find((m) => m.msg.text.includes('Court 3 and Court 2') || (m.msg.text.includes('Court 3') && m.msg.text.includes('Court 2')));
+      assert.ok(cancelMsg, 'Cancellation message mentions multiple courts');
+    });
+  });
+
+  describe('Re-booking of released courts on-demand', () => {
+    const crypto = require('crypto');
+    function makeOptHash(name) {
+      return crypto.createHash('sha256').update(name).digest();
+    }
+
+    it('should NOT initiate re-booking when openings fall below 3 if player openings still exist (e.g. 7 votes for 8 spots)', async () => {
+      let bookCourtCalled = false;
+      const originalBookCourt = scvcc.bookCourt;
+      scvcc.bookCourt = async () => { bookCourtCalled = true; return { success: true }; };
+
+      const pollState = {
+        remoteJid: 'group1@g.us',
+        size: 8,
+        slotLimit: 8,
+        prebookedCourts: [{ court: 'Court 1' }, { court: 'Court 2' }],
+        releasedCourts: [{ court: 'Court 3' }],
+        onDemandBookingInProgress: false,
+        invalidSlotVotesNotified: [],
+        voteBuffer: new Map()
+      };
+
+      // 7 votes for 8 spots -> player openings = 1 (< 3), but openings still exist, so NO re-booking!
+      const aggregated = [];
+      for (let i = 1; i <= 7; i++) {
+        aggregated.push({ name: `Player ${i}`, voters: [`voter${i}@s.whatsapp.net`] });
+        pollState.voteBuffer.set(`voter${i}@s.whatsapp.net`, {
+          pollUpdateMessageKey: { remoteJid: 'group1@g.us', participant: `voter${i}@s.whatsapp.net` },
+          vote: { selectedOptions: [makeOptHash(`Player ${i}`)] }
+        });
+      }
+
+      const mockSock = { sendMessage: async () => {} };
+      try {
+        const { processPollVoteEvent } = require('../lib/commands/pollCommands');
+        const messageStore = new Map([['group1@g.us:poll_rebook_no', {
+          messageContextInfo: { messageSecret: Buffer.from('secret') },
+          pollCreationMessage: { options: Array.from({ length: 12 }, (_, i) => ({ optionName: `Player ${i+1}` })) }
+        }]]);
+        await processPollVoteEvent(mockSock, { id: 'poll_rebook_no', remoteJid: 'group1@g.us' }, [], {
+          activePolls: new Map([['poll_rebook_no', pollState]]),
+          messageStore,
+          persistPolls: () => {}
+        });
+
+        assert.equal(bookCourtCalled, false, 'Re-booking must NOT be initiated when free openings remain');
+      } finally {
+        scvcc.bookCourt = originalBookCourt;
+      }
+    });
+
+    it('should initiate rebooking when 9th voter arrives (no free openings) and succeed, updating capacity to 12', async () => {
+      let bookCourtCalled = false;
+      const originalBookCourt = scvcc.bookCourt;
+      const originalCheckAvail = scvcc.checkCourtAvailability;
+
+      scvcc.checkCourtAvailability = async () => ({
+        slots: [{ time: '10:00am', courts: [{ court: 'Court 3', status: 'available' }] }]
+      });
+      scvcc.bookCourt = async (params) => {
+        bookCourtCalled = true;
+        return {
+          success: true,
+          court: 'Court 3',
+          date: '10/20/2026',
+          time: '10:00am',
+          reservationId: 'res-rebook-3',
+          players: params.players
+        };
+      };
+
+      const messagesSent = [];
+      const mockSock = {
+        sendMessage: async (jid, msg, opts) => { messagesSent.push({ jid, msg, opts }); }
+      };
+
+      const pollState = {
+        remoteJid: 'group1@g.us',
+        size: 8,
+        slotLimit: 8,
+        prebookedCourts: [{ court: 'Court 1' }, { court: 'Court 2' }],
+        releasedCourts: [{ court: 'Court 3' }],
+        onDemandBookingInProgress: false,
+        invalidSlotVotesNotified: [],
+        voteBuffer: new Map()
+      };
+
+      // 9 votes (for 8 spots)
+      const aggregated = [];
+      for (let i = 1; i <= 9; i++) {
+        aggregated.push({ name: `Player ${i}`, voters: [`voter${i}@s.whatsapp.net`] });
+        pollState.voteBuffer.set(`voter${i}@s.whatsapp.net`, {
+          pollUpdateMessageKey: { remoteJid: 'group1@g.us', participant: `voter${i}@s.whatsapp.net` },
+          vote: { selectedOptions: [makeOptHash(`Player ${i}`)] },
+          senderTimestampMs: 1000 + i
+        });
+      }
+
+      try {
+        await handleOnDemandCourtBooking(mockSock, 'poll_rebook_yes', pollState, aggregated, {}, {
+          isRebooking: true,
+          targetCourt: pollState.releasedCourts[0],
+          triggeringVoterJid: 'voter9@s.whatsapp.net'
+        });
+
+        assert.equal(bookCourtCalled, true);
+        assert.equal(pollState.prebookedCourts.length, 3);
+        assert.equal(pollState.slotLimit, 12);
+        assert.equal(pollState.size, 12);
+        assert.equal(pollState.releasedCourts.length, 0);
+
+        const confirmMsg = messagesSent.find(m => m.msg.text && m.msg.text.includes('Court 3') && m.msg.text.includes('booked'));
+        assert.ok(confirmMsg, 'Confirmation message sent to group for Court 3');
+        assert.match(confirmMsg.msg.text, /\*12 players\* can now play/);
+      } finally {
+        scvcc.bookCourt = originalBookCourt;
+        scvcc.checkCourtAvailability = originalCheckAvail;
+      }
+    });
+
+    it('should quote the user with rejection message when re-booking fails on 9th voter', async () => {
+      const originalBookCourt = scvcc.bookCourt;
+      const originalCheckAvail = scvcc.checkCourtAvailability;
+
+      scvcc.checkCourtAvailability = async () => ({
+        slots: [{ time: '10:00am', courts: [{ court: 'Court 3', status: 'unavailable' }] }]
+      });
+      scvcc.bookCourt = async () => ({ success: false, message: 'Court unavailable' });
+
+      const messagesSent = [];
+      const mockSock = {
+        sendMessage: async (jid, msg, opts) => { messagesSent.push({ jid, msg, opts }); }
+      };
+
+      const pollState = {
+        remoteJid: 'group1@g.us',
+        size: 8,
+        slotLimit: 8,
+        prebookedCourts: [{ court: 'Court 1' }, { court: 'Court 2' }],
+        releasedCourts: [{ court: 'Court 3' }],
+        onDemandBookingInProgress: false,
+        invalidSlotVotesNotified: [],
+        voteBuffer: new Map()
+      };
+
+      const aggregated = [];
+      for (let i = 1; i <= 9; i++) {
+        aggregated.push({ name: `Player ${i}`, voters: [`voter${i}@s.whatsapp.net`] });
+        pollState.voteBuffer.set(`voter${i}@s.whatsapp.net`, {
+          pollUpdateMessageKey: { remoteJid: 'group1@g.us', participant: `voter${i}@s.whatsapp.net`, id: `voteMsg${i}` },
+          vote: { selectedOptions: [makeOptHash(`Player ${i}`)] },
+          senderTimestampMs: 1000 + i
+        });
+      }
+
+      try {
+        await handleOnDemandCourtBooking(mockSock, 'poll_rebook_fail', pollState, aggregated, {}, {
+          isRebooking: true,
+          targetCourt: pollState.releasedCourts[0],
+          triggeringVoterJid: 'voter9@s.whatsapp.net',
+          triggeringVoteMsgKey: { remoteJid: 'group1@g.us', id: 'voteMsg9' }
+        });
+
+        assert.equal(pollState.prebookedCourts.length, 2);
+        assert.equal(pollState.slotLimit, 8);
+        assert.equal(pollState.releasedCourts.length, 0);
+
+        const failQuoteMsg = messagesSent.find(m => m.msg.text && m.msg.text.includes('voter9') || (m.opts?.quoted?.key?.id === 'voteMsg9'));
+        assert.ok(failQuoteMsg, 'Failure message quoting voter 9 sent to group');
+        assert.match(failQuoteMsg.msg.text, /all \*8 voting slots\* are filled/);
+        assert.match(failQuoteMsg.msg.text, /Your vote will not be considered/);
+        assert.equal(failQuoteMsg.opts?.quoted?.key?.id, 'voteMsg9');
+      } finally {
+        scvcc.bookCourt = originalBookCourt;
+        scvcc.checkCourtAvailability = originalCheckAvail;
+      }
+    });
   });
 });

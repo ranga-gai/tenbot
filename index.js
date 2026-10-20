@@ -559,7 +559,10 @@ setInterval(() => {
 }, POLL_CLEANUP_INTERVAL_MINUTES * 60 * 1000);
 
 setInterval(() => {
-  if (botSock) pollCommands.checkAndSendPollReminders(botSock, getPollContext());
+  if (botSock) {
+    pollCommands.checkAndSendPollReminders(botSock, getPollContext());
+    pollCommands.checkCourtReleases(botSock, getPollContext());
+  }
 }, POLL_REMINDER_CHECK_INTERVAL_MS);
 
 setInterval(() => {
@@ -742,6 +745,7 @@ async function startBot() {
 
       const context = getPollContext();
       pollCommands.checkAndSendPollReminders(sock, context);
+      pollCommands.checkCourtReleases(sock, context);
       recurringPollsModule.checkAndExecuteAdvanceBookings({
         sock,
         recurringPolls,
@@ -895,7 +899,10 @@ async function startBot() {
             lastConflictSignature: null,
             voteBuffer: new Map(),
             lastPlayers: null,
-            sentReminders: manualSentReminders
+            sentReminders: manualSentReminders,
+            courtReleaseWarningsSent: [],
+            courtReleasesDone: [],
+            releasedCourts: []
           });
           latestPollIdByChat.set(remoteJid, pollId);
           persistPolls();
