@@ -280,7 +280,7 @@ describe('pollCommands', () => {
   });
 
   describe('handleOnDemandCourtBooking', () => {
-    it('should successfully book an on-demand court without notifying group chat, only DMs to bookingNotifications', async () => {
+    it('should successfully book an on-demand court, sending a simple one liner to group and DMs to bookingNotifications', async () => {
       const originalBookCourt = scvcc.bookCourt;
       const originalCheckAvail = scvcc.checkCourtAvailability;
 
@@ -333,9 +333,13 @@ describe('pollCommands', () => {
         assert.equal(pollState.unbookedCourts.length, 0);
         assert.equal(pollState.onDemandBookingInProgress, false);
 
-        // Verify NO booking notification was sent to group chat
+        // Verify simple one liner message sent to group chat
         const groupMsg = messagesSent.find((m) => m.jid === '120363403838804497@g.us');
-        assert.equal(groupMsg, undefined, 'Must not send booking notification to group chat on success');
+        assert.ok(groupMsg, 'Should send simple one liner message to group chat');
+        assert.equal(groupMsg.msg.text, '🎾 *Court 1* is booked! *12 players* can now play.');
+
+        // Verify detailed booking notification (with reservation details) was NOT sent to group chat
+        assert.equal(messagesSent.some((m) => m.jid === '120363403838804497@g.us' && m.msg?.text?.includes('booked successfully')), false);
 
         // Verify DMs were sent only to those in bookingNotifications
         const dmMessages = messagesSent.filter((m) => m.jid.endsWith('@lid'));
