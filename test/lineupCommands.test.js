@@ -4,7 +4,8 @@ const {
   isSamePlayerName,
   extractTimeFromLineupMessage,
   getPollMatchTime,
-  findBestMatchingPollForLineup
+  findBestMatchingPollForLineup,
+  handleManualLineup
 } = require('../lib/commands/lineupCommands');
 
 describe('lineupCommands', () => {
@@ -163,6 +164,139 @@ describe('lineupCommands', () => {
 
       assert.equal(res.targetPollId, null);
       assert.equal(res.matchInfo, 'none');
+    });
+    it('should match a resolved poll when updating matchups even if another poll is active in the same chat', () => {
+      const activePolls = new Map([
+        ['poll_resolved_today', {
+          remoteJid: 'test_chat@g.us',
+          when: 'Today 9:00am',
+          size: 4,
+          status: 'resolved',
+          lastPlayers: ['Alice', 'Bob', 'Charlie', 'Dave']
+        }],
+        ['poll_active_tomorrow', {
+          remoteJid: 'test_chat@g.us',
+          when: 'Tomorrow 9:00am',
+          size: 4,
+          status: 'active',
+          lastPlayers: ['Eve', 'Frank', 'Grace', 'Heidi']
+        }]
+      ]);
+
+      const updatedLineup = {
+        players: ['Alice', 'Charlie', 'Bob', 'Dave'],
+        time: '9:00am'
+      };
+
+      const res = findBestMatchingPollForLineup({
+        activePolls,
+        chatId: 'test_chat@g.us',
+        lineup: updatedLineup,
+        messageText: 'Updated 9:00am matchups: Alice & Charlie vs Bob & Dave',
+        mePn: 'bot@s.whatsapp.net'
+      });
+
+      assert.equal(res.targetPollId, 'poll_resolved_today');
+      assert.match(res.matchInfo, /exact_players_and_time/);
+    });
+
+    it('should match a resolved poll on player overlap when updating matchups without time', () => {
+      const activePolls = new Map([
+        ['poll_resolved', {
+          remoteJid: 'test_chat@g.us',
+          when: '6:00pm',
+          size: 4,
+          status: 'resolved',
+          lastPlayers: ['Alice', 'Bob', 'Charlie', 'Dave']
+        }],
+        ['poll_other_active', {
+          remoteJid: 'test_chat@g.us',
+          when: '8:00pm',
+          size: 4,
+          status: 'active',
+          lastPlayers: ['PlayerX', 'PlayerY', 'PlayerZ', 'PlayerW']
+        }]
+      ]);
+
+      const updatedLineup = {
+        players: ['Alice', 'Charlie', 'Bob', 'Dave'],
+        time: null
+      };
+
+      const res = findBestMatchingPollForLineup({
+        activePolls,
+        chatId: 'test_chat@g.us',
+        lineup: updatedLineup,
+        messageText: 'Updated matchups: Court 1: Alice & Charlie vs Bob & Dave',
+        mePn: 'bot@s.whatsapp.net'
+      });
+
+      assert.equal(res.targetPollId, 'poll_resolved');
+      assert.match(res.matchInfo, /qualifying_match/);
+    });
+  });
+
+  describe('handleManualLineup', () => {
+    it('should update lastPlayers, lastSchedule and send 🤖 reaction on a resolved poll', async () => {
+      const targetPoll = {
+        remoteJid: 'test_chat@g.us',
+        when: 'Today 9:00am',
+        size: 4,
+        status: 'resolved',
+        lastPlayers: ['Alice', 'Bob', 'Charlie', 'Dave'],
+        lastSchedule: null
+      };
+
+      const activePolls = new Map([['poll_resolved', targetPoll]]);
+      const sentMessages = [];
+      const dummySock = {
+        user: { id: 'bot@s.whatsapp.net' },
+        sendMessage: async (jid, payload) => {
+          sentMessages.push({ jid, payload });
+          return { key: { id: 'msg1' } };
+        }
+      };
+
+      const newLineup = {
+        type: 'doubles',
+        time: '9:00am',
+        players: ['Alice', 'Charlie', 'Bob', 'Dave'],
+        sets: [{
+          set: 1,
+          courts: [{ court: 1, teamA: ['Alice', 'Charlie'], teamB: ['Bob', 'Dave'] }]
+        }]
+      };
+
+      let persisted = false;
+      const context = {
+        activePolls,
+        persistPolls: () => { persisted = true; },
+        messageStore: new Map()
+      };
+
+      const dummyMsg = {
+        key: { remoteJid: 'test_chat@g.us', id: 'lineup_msg_123', fromMe: false }
+      };
+
+      await handleManualLineup(
+        dummySock,
+        'test_chat@g.us',
+        'Alice',
+        newLineup,
+        dummyMsg,
+        'Updated matchups: Court 1: Alice & Charlie vs Bob & Dave',
+        context
+      );
+
+      assert.equal(targetPoll.status, 'resolved');
+      assert.deepEqual(targetPoll.lastPlayers, ['Alice', 'Charlie', 'Bob', 'Dave']);
+      assert.deepEqual(targetPoll.lastSchedule, newLineup);
+      assert.equal(persisted, true);
+
+      // Verify bot emoji 🤖 reaction was sent
+      const reactMsg = sentMessages.find((m) => m.payload?.react?.text === '🤖');
+      assert.ok(reactMsg, 'Expected 🤖 bot emoji reaction to be sent');
+      assert.equal(reactMsg.payload.react.key.id, 'lineup_msg_123');
     });
   });
 });

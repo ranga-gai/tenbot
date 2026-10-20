@@ -909,6 +909,20 @@ async function startBot() {
             }]).catch(() => {});
           }
           console.log(`[poll] LLM verified & passively tracking manually-created match poll ${pollId} ("${pollName}", when: "${resolvedWhen}", type: ${pollType}, size: ${pollSize}) by ${creatorName} in ${remoteJid}`);
+
+          if (msg?.key && sock) {
+            try {
+              await sock.sendMessage(remoteJid, {
+                react: {
+                  text: '🤖',
+                  key: msg.key
+                }
+              });
+              console.log(`[poll] Added 🤖 reaction to tracked manual poll ${pollId} in ${remoteJid}`);
+            } catch (err) {
+              console.error('[poll] Failed to add 🤖 reaction to manual poll:', err.message);
+            }
+          }
         } else {
           messageStore.set(storeKey(remoteJid, pollId), msg.message);
         }

@@ -38,6 +38,51 @@ describe('commandRouter', () => {
       assert.match(notFreeRes, /Removed Alice from the availability list/);
     });
 
+    it('should detect and update matchups for an already resolved poll and send 🤖 reaction', async () => {
+      const targetPoll = {
+        remoteJid: 'chat@g.us',
+        when: 'Today 9:00am',
+        size: 4,
+        status: 'resolved',
+        lastPlayers: ['Alice', 'Bob', 'Charlie', 'Dave'],
+        lastSchedule: null
+      };
+
+      const sentMessages = [];
+      const dummySock = {
+        user: { id: 'bot@s.whatsapp.net' },
+        sendMessage: async (jid, payload) => {
+          sentMessages.push({ jid, payload });
+          return { key: { id: 'msg1' } };
+        }
+      };
+
+      const pollContext = {
+        ...dummyContext,
+        activePolls: new Map([['poll_resolved_1', targetPoll]])
+      };
+
+      const dummyMsg = {
+        key: { remoteJid: 'chat@g.us', id: 'upd_lineup_msg', fromMe: false }
+      };
+
+      const res = await routeCommand(
+        dummySock,
+        'Court 1: Alice & Charlie vs Bob & Dave',
+        'chat@g.us',
+        'Alice',
+        dummyMsg,
+        pollContext
+      );
+
+      assert.equal(res, null); // Handled manual lineup returns null (handled in chat with reaction)
+      assert.deepEqual(targetPoll.lastPlayers, ['Alice', 'Charlie', 'Bob', 'Dave']);
+      assert.ok(targetPoll.lastSchedule);
+      const reactMsg = sentMessages.find((m) => m.payload?.react?.text === '🤖');
+      assert.ok(reactMsg, 'Expected 🤖 bot emoji reaction to be sent for updated matchups');
+      assert.equal(reactMsg.payload.react.key.id, 'upd_lineup_msg');
+    });
+
     it('should return null for non-command messages so they fall through', async () => {
       const res = await routeCommand(null, 'hello everyone, who wants to hit today?', 'chat@g.us', 'Alice', {}, dummyContext);
       assert.equal(res, null);
