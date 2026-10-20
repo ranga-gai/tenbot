@@ -89,6 +89,7 @@ const { nameFor } = playerCommands;
 // ---- CONFIG ----
 
 const TRIGGER_PREFIX = '@tenbot';
+const GENERIC_NAMES = new Set(['someone', 'player', 'player 1', 'player 2', 'player 3', 'player 4', 'me']);
 const DEFAULT_LOCATION = 'San Jose, CA';
 const POLL_CLEANUP_INTERVAL_MINUTES = 15;
 const POLL_REMINDER_CHECK_INTERVAL_MS = 60 * 1000;

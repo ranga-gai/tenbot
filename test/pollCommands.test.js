@@ -12,7 +12,9 @@ const {
   buildPollReminderText,
   getSlotNumberForOption,
   checkAndNotifyInvalidSlotVotes,
-  handleOnDemandCourtBooking
+  handleOnDemandCourtBooking,
+  getPollVoters,
+  sendPollReminder
 } = require('../lib/commands/pollCommands');
 
 describe('pollCommands', () => {
@@ -539,5 +541,179 @@ describe('pollCommands', () => {
       assert.equal(playerOpenings, 2);
       assert.equal(playerOpenings < 3, true); // triggers on-demand court booking!
     });
+  });
+  describe('Yes/No opt-in poll reminder with creator Yes vote', () => {
+    const crypto = require('crypto');
+    const pollStore = require('../lib/pollStore');
+
+    const yesHash = crypto.createHash('sha256').update('Yes').digest();
+    const noHash = crypto.createHash('sha256').update('No').digest();
+
+    it('should accurately report 1 player in for creator Yes vote with pollCreationMessage present', async () => {
+      const pollId = 'poll_yesno_creator_1';
+      const remoteJid = '120363403838804497@g.us';
+      const creatorJid = '165777365799110@lid';
+      const creatorName = 'Conrad';
+
+      const pollCreationMessage = {
+        pollCreationMessage: {
+          name: '🎾 Conrad\'s poll: Tomorrow 9am (Vote Yes/No)',
+          options: [{ optionName: 'Yes' }, { optionName: 'No' }],
+          selectableOptionsCount: 1
+        }
+      };
+
+      const messageStore = new Map();
+      messageStore.set(`${remoteJid}:${pollId}`, pollCreationMessage);
+
+      const voteBuffer = new Map();
+      voteBuffer.set(creatorJid, {
+        pollUpdateMessageKey: { remoteJid, participant: creatorJid },
+        vote: { selectedOptions: [yesHash] }
+      });
+
+      const pollState = {
+        remoteJid,
+        name: '🎾 Conrad\'s poll: Tomorrow 9am (Vote Yes/No)',
+        options: ['Yes', 'No'],
+        type: 'opt_in',
+        size: null,
+        when: 'Tomorrow 9am',
+        playAt: new Date(Date.now() + 4 * 60 * 60 * 1000).toISOString(),
+        status: 'active',
+        isManual: false,
+        creator: { name: creatorName, jid: creatorJid },
+        voteBuffer
+      };
+
+      const { interestedPlayers, yesOption } = getPollVoters(pollId, pollState, 'bot@s.whatsapp.net', messageStore);
+      assert.equal(interestedPlayers.length, 1);
+      assert.equal(interestedPlayers[0], creatorName);
+      assert.equal(yesOption.voters.length, 1);
+
+      // Verify reminder message
+      let sentMsg = null;
+      const mockSock = {
+        sendMessage: async (jid, content) => {
+          sentMsg = content;
+          return { key: { id: 'reminder_1' } };
+        }
+      };
+
+      const success = await sendPollReminder(mockSock, pollId, pollState, true, { messageStore });
+      assert.equal(success, true);
+      assert.ok(sentMsg);
+      assert.match(sentMsg.text, /\*1 player\(s\)/i);
+      assert.match(sentMsg.text, /Conrad/);
+      assert.doesNotMatch(sentMsg.text, /\*0 player\(s\) in\*/i);
+    });
+
+    it('should correctly deserialize Uint8Array/Buffer in pollStore and not drop to 0 players', async () => {
+      const pollId = 'poll_yesno_creator_revive';
+      const remoteJid = '120363403838804497@g.us';
+      const creatorJid = '165777365799110@lid';
+      const creatorName = 'Conrad';
+
+      const pollCreationMessage = {
+        pollCreationMessage: {
+          name: '🎾 Tomorrow 10am (Vote Yes/No)',
+          options: [{ optionName: 'Yes' }, { optionName: 'No' }],
+          selectableOptionsCount: 1
+        }
+      };
+
+      const messageStore = new Map();
+      messageStore.set(`${remoteJid}:${pollId}`, pollCreationMessage);
+
+      const voteBuffer = new Map();
+      voteBuffer.set(creatorJid, {
+        pollUpdateMessageKey: { remoteJid, participant: creatorJid },
+        vote: { selectedOptions: [yesHash] }
+      });
+
+      const pollState = {
+        remoteJid,
+        name: '🎾 Tomorrow 10am (Vote Yes/No)',
+        options: ['Yes', 'No'],
+        type: 'opt_in',
+        size: null,
+        when: 'Tomorrow 10am',
+        playAt: new Date(Date.now() + 4 * 60 * 60 * 1000).toISOString(),
+        status: 'active',
+        isManual: true,
+        creator: { name: creatorName, jid: creatorJid },
+        voteBuffer
+      };
+
+      const activePolls = new Map([[pollId, pollState]]);
+      const latestPollIdByChat = new Map([[remoteJid, pollId]]);
+      const recurringPolls = new Map();
+
+      // Test serialize & deserialize through pollStore save & load
+      pollStore.save({ messageStore, activePolls, latestPollIdByChat, recurringPolls }, remoteJid);
+      const reloaded = pollStore.loadGroup(remoteJid);
+      const reloadedPoll = reloaded.activePolls.get(pollId);
+
+      const { interestedPlayers, yesOption } = getPollVoters(pollId, reloadedPoll, 'bot@s.whatsapp.net', reloaded.messageStore);
+      assert.equal(interestedPlayers.length, 1);
+      assert.equal(interestedPlayers[0], creatorName);
+      assert.equal(yesOption.voters.length, 1);
+
+      let sentMsg = null;
+      const mockSock = {
+        sendMessage: async (jid, content) => {
+          sentMsg = content;
+          return { key: { id: 'reminder_revive' } };
+        }
+      };
+
+      await sendPollReminder(mockSock, pollId, reloadedPoll, true, { messageStore: reloaded.messageStore });
+      assert.ok(sentMsg);
+      assert.match(sentMsg.text, /\*1 player\(s\)\*/i);
+      assert.match(sentMsg.text, /Conrad/);
+      assert.doesNotMatch(sentMsg.text, /\*0 player\(s\)\*/i);
+    });
+
+    it('should find pollCreationMessage via fallback key ending with :pollId', async () => {
+      const pollId = 'poll_yesno_fallback_key';
+      const creatorJid = '165777365799110@lid';
+      const creatorName = 'Conrad';
+
+      const pollCreationMessage = {
+        pollCreationMessage: {
+          name: 'Tomorrow 9am',
+          options: [{ optionName: 'Yes' }, { optionName: 'No' }],
+          selectableOptionsCount: 1
+        }
+      };
+
+      // Stored with different remoteJid prefix
+      const messageStore = new Map();
+      messageStore.set(`diffGroup@g.us:${pollId}`, pollCreationMessage);
+
+      const voteBuffer = new Map();
+      voteBuffer.set(creatorJid, {
+        pollUpdateMessageKey: { remoteJid: 'group1@g.us', participant: creatorJid },
+        vote: { selectedOptions: [yesHash] }
+      });
+
+      const pollState = {
+        remoteJid: 'group1@g.us',
+        options: ['Yes', 'No'],
+        type: 'opt_in',
+        size: null,
+        when: 'Tomorrow 9am',
+        playAt: new Date(Date.now() + 4 * 60 * 60 * 1000).toISOString(),
+        status: 'active',
+        isManual: false,
+        creator: { name: creatorName, jid: creatorJid },
+        voteBuffer
+      };
+
+      const { interestedPlayers } = getPollVoters(pollId, pollState, 'bot@s.whatsapp.net', messageStore);
+      assert.equal(interestedPlayers.length, 1);
+      assert.equal(interestedPlayers[0], creatorName);
+    });
+
   });
 });
