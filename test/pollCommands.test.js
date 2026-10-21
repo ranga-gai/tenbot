@@ -13,6 +13,7 @@ const {
   getSlotNumberForOption,
   checkAndNotifyInvalidSlotVotes,
   handleOnDemandCourtBooking,
+  preBookCourtsForMatch,
   checkCourtReleasesForPoll,
   checkCourtReleases,
   getPollVoters,
@@ -577,6 +578,78 @@ describe('pollCommands', () => {
       playerOpenings = bookedCapacity - filledCount; // 2
       assert.equal(playerOpenings, 2);
       assert.equal(playerOpenings < 3, true); // triggers on-demand court booking!
+    });
+  });
+
+  describe('preBookCourtsForMatch', () => {
+    it('should pass minAvailableMinutes: 90 to scvcc.bookCourt when pre-booking courts', async () => {
+      const originalBookCourt = scvcc.bookCourt;
+      let bookCalledParams = null;
+
+      scvcc.bookCourt = async (params) => {
+        bookCalledParams = params;
+        return {
+          success: true,
+          court: 'Court 1',
+          players: params.players,
+          date: params.date,
+          time: params.time,
+          reservationId: 'res-prebook-1',
+          message: 'Court 1 booked'
+        };
+      };
+
+      try {
+        const res = await preBookCourtsForMatch({
+          remoteJid: '120363403838804497@g.us',
+          targetDateMDY: '10/22/2026',
+          queryTime: '9:00 AM',
+          size: 4
+        });
+
+        assert.ok(bookCalledParams);
+        assert.equal(bookCalledParams.minAvailableMinutes, 90);
+        assert.equal(res.advanceBookedCourts.length, 1);
+        assert.equal(res.advanceBookedCourts[0].court, 'Court 1');
+      } finally {
+        scvcc.bookCourt = originalBookCourt;
+      }
+    });
+
+    it('should pass specific court and minAvailableMinutes: 90 when targetCourt is provided', async () => {
+      const originalBookCourt = scvcc.bookCourt;
+      let bookCalledParams = null;
+
+      scvcc.bookCourt = async (params) => {
+        bookCalledParams = params;
+        return {
+          success: true,
+          court: 'Court 3',
+          players: params.players,
+          date: params.date,
+          time: params.time,
+          reservationId: 'res-prebook-2',
+          message: 'Court 3 booked'
+        };
+      };
+
+      try {
+        const res = await preBookCourtsForMatch({
+          remoteJid: '120363403838804497@g.us',
+          targetDateMDY: '10/22/2026',
+          queryTime: '9:00 AM',
+          court: 'Court 3',
+          size: 4
+        });
+
+        assert.ok(bookCalledParams);
+        assert.equal(bookCalledParams.court, 'Court 3');
+        assert.equal(bookCalledParams.minAvailableMinutes, 90);
+        assert.equal(res.advanceBookedCourts.length, 1);
+        assert.equal(res.advanceBookedCourts[0].court, 'Court 3');
+      } finally {
+        scvcc.bookCourt = originalBookCourt;
+      }
     });
   });
   describe('Yes/No opt-in poll reminder with creator Yes vote', () => {

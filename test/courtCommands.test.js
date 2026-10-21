@@ -88,4 +88,116 @@ describe('courtCommands', () => {
       assert.equal(res, 'Unknown court tool nonexistent_court_tool');
     });
   });
+
+  describe('bookCourt availability filtering', () => {
+    it('should return failure when only courts with < 90m availability exist and minAvailableMinutes: 90 is specified', async () => {
+      const origCheck = scvcc.checkCourtAvailability;
+      scvcc.checkCourtAvailability = async () => ({
+        success: true,
+        slots: [{
+          time: '10:00 AM',
+          courts: [
+            { court: 'Court 1', status: 'available', availableMinutes: 30, resourceId: '1' },
+            { court: 'Court 2', status: 'available', availableMinutes: 60, resourceId: '2' }
+          ]
+        }]
+      });
+
+      try {
+        const res = await scvcc.bookCourt({ when: 'tomorrow', time: '10am', minAvailableMinutes: 90 });
+        assert.equal(res.success, false);
+        assert.match(res.message, /No courts are available at SCVCC/);
+      } finally {
+        scvcc.checkCourtAvailability = origCheck;
+      }
+    });
+
+    it('should select court with >= 90m availability when minAvailableMinutes: 90 is specified', async () => {
+      const origCheck = scvcc.checkCourtAvailability;
+      const origAuthFetch = scvcc.authFetch;
+      scvcc.checkCourtAvailability = async () => ({
+        success: true,
+        slots: [{
+          time: '10:00 AM',
+          courts: [
+            { court: 'Court 1', status: 'available', availableMinutes: 30, resourceId: '1' },
+            { court: 'Court 2', status: 'available', availableMinutes: 60, resourceId: '2' },
+            { court: 'Court 3', status: 'available', availableMinutes: 90, resourceId: '3' }
+          ]
+        }]
+      });
+
+      let capturedDialogUrl = null;
+      scvcc.authFetch = async (url) => {
+        capturedDialogUrl = url;
+        throw new Error('STOP_AFTER_SELECTION');
+      };
+
+      try {
+        await scvcc.bookCourt({ when: 'tomorrow', time: '10am', minAvailableMinutes: 90 });
+      } catch (err) {
+        if (err.message !== 'STOP_AFTER_SELECTION') throw err;
+      } finally {
+        scvcc.checkCourtAvailability = origCheck;
+        scvcc.authFetch = origAuthFetch;
+      }
+
+      assert.ok(capturedDialogUrl);
+      assert.ok(capturedDialogUrl.includes('resourceID=3'), 'Should have selected Court 3 with 90m availability');
+    });
+
+    it('should skip specifically requested court if it has < 90m and pick another court with >= 90m', async () => {
+      const origCheck = scvcc.checkCourtAvailability;
+      const origAuthFetch = scvcc.authFetch;
+      scvcc.checkCourtAvailability = async () => ({
+        success: true,
+        slots: [{
+          time: '10:00 AM',
+          courts: [
+            { court: 'Court 1', status: 'available', availableMinutes: 60, resourceId: '1' },
+            { court: 'Court 2', status: 'available', availableMinutes: 90, resourceId: '2' }
+          ]
+        }]
+      });
+
+      let capturedDialogUrl = null;
+      scvcc.authFetch = async (url) => {
+        capturedDialogUrl = url;
+        throw new Error('STOP_AFTER_SELECTION');
+      };
+
+      try {
+        await scvcc.bookCourt({ when: 'tomorrow', time: '10am', court: 'Court 1', minAvailableMinutes: 90 });
+      } catch (err) {
+        if (err.message !== 'STOP_AFTER_SELECTION') throw err;
+      } finally {
+        scvcc.checkCourtAvailability = origCheck;
+        scvcc.authFetch = origAuthFetch;
+      }
+
+      assert.ok(capturedDialogUrl);
+      assert.ok(capturedDialogUrl.includes('resourceID=2'), 'Should have selected Court 2 with 90m availability instead of Court 1');
+    });
+
+    it('should fail when specifically requested court has < 90m and no other court has >= 90m', async () => {
+      const origCheck = scvcc.checkCourtAvailability;
+      scvcc.checkCourtAvailability = async () => ({
+        success: true,
+        slots: [{
+          time: '10:00 AM',
+          courts: [
+            { court: 'Court 1', status: 'available', availableMinutes: 60, resourceId: '1' },
+            { court: 'Court 2', status: 'available', availableMinutes: 30, resourceId: '2' }
+          ]
+        }]
+      });
+
+      try {
+        const res = await scvcc.bookCourt({ when: 'tomorrow', time: '10am', court: 'Court 1', minAvailableMinutes: 90 });
+        assert.equal(res.success, false);
+      } finally {
+        scvcc.checkCourtAvailability = origCheck;
+      }
+    });
+  });
 });

@@ -1,5 +1,5 @@
 /**
- * Tennis Group Bot (Baileys edition)
+ * Tennis Group Bot
  * ----------------------------------
  * Listens for messages in a WhatsApp tennis group and coordinates:
  *   - Tennis match polls & voting (fixed spots, Yes/No opt-in)
