@@ -364,9 +364,8 @@ describe('recurringPolls', () => {
         assert.equal(entry.completed, true);
         assert.equal(entry.advanceBookedCourts.length, 1);
         assert.ok(entry.prebookedCourts.some(c => c.court === 'Court 2'));
-        assert.equal(notificationsSent.length, 1);
-        assert.ok(notificationsSent[0].msg.includes('Court 1'));
-        assert.ok(notificationsSent[0].msg.includes('Court 2'));
+        // No new court was booked by the bot during periodic checking, so NO summary notification is sent
+        assert.equal(notificationsSent.length, 0);
       } finally {
         scvcc.checkCourtAvailability = originalCheckAvail;
         scvcc.getCourtBookings = originalGetBookings;
@@ -374,7 +373,78 @@ describe('recurringPolls', () => {
       }
     });
 
-    it('should stop checking once the poll is created', async () => {
+    it('should not send summary booking notification during periodic checking if no new courts were booked by the bot', async () => {
+      const scheduleId = 'sched_no_new_courts_test';
+      const targetMatchDate = '2026-10-26';
+      const recurringPolls = new Map();
+      const sched = {
+        id: scheduleId,
+        remoteJid: '120363402559062529@g.us',
+        matchTime: '6:30PM',
+        matchHour: 18,
+        matchMinute: 30,
+        days: 'mon',
+        daysList: [1],
+        size: '8', // 2 courts
+        enabled: true,
+        bookingStrategy: 'advanced',
+        bookingSchedule: '-7days 7:00AM',
+        postTime: '8:15PM',
+        postDaysBefore: 1,
+        advanceBookings: {
+          [targetMatchDate]: {
+            advanceBookedCourts: [{ court: 'Court 1', players: ['P1', 'P2'] }],
+            prebookedCourts: [{ court: 'Court 1', player: 'P1' }],
+            firstAttemptAt: Date.now() - 3600000,
+            lastAttemptAt: Date.now() - 3600000,
+            completed: false,
+            targetCourtsCount: 2,
+            periodicChecks: []
+          }
+        }
+      };
+      recurringPolls.set(scheduleId, sched);
+
+      const notificationsSent = [];
+      const sendBookingNotifications = async (sock, remoteJid, msg) => {
+        notificationsSent.push({ remoteJid, msg });
+      };
+
+      // preBookCourtsForMatch returns no new courts booked
+      const preBookCourtsForMatch = async (args) => {
+        return {
+          advanceBookedCourts: args.existingAdvanceBookedCourts,
+          prebookedCourts: args.existingPrebookedCourts
+        };
+      };
+
+      const originalCheckAvail = scvcc.checkCourtAvailability;
+      const originalGetBookings = scvcc.getCourtBookings;
+      scvcc.checkCourtAvailability = async () => ({ slots: [] });
+      scvcc.getCourtBookings = async () => ({ bookings: [] });
+
+      try {
+        const monday930am = { year: 2026, month: 9, day: 19, weekday: 'mon', hour: 9, minute: 30 };
+        await checkAndExecuteAdvanceBookings({
+          sock: {},
+          recurringPolls,
+          persistPolls: () => {},
+          preBookCourtsForMatch,
+          customSanJoseParts: monday930am,
+          sendBookingNotifications
+        });
+
+        // Periodic check executed
+        assert.ok(sched.advanceBookings[targetMatchDate].periodicChecks.includes('2026-10-19:09:30'));
+        // No new court booked -> NO summary notification sent
+        assert.equal(notificationsSent.length, 0);
+      } finally {
+        scvcc.checkCourtAvailability = originalCheckAvail;
+        scvcc.getCourtBookings = originalGetBookings;
+      }
+    });
+
+        it('should stop checking once the poll is created', async () => {
       const scheduleId = 'sched_poll_created_test';
       const targetMatchDate = '2026-10-26';
       const recurringPolls = new Map();
