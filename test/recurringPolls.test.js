@@ -8,7 +8,8 @@ const {
   parseRecurringPollText,
   isPollCreatedForMatchDate,
   detectManualPlayerBookings,
-  checkAndExecuteAdvanceBookings
+  checkAndExecuteAdvanceBookings,
+  checkAndPostRecurringPolls
 } = require('../lib/recurringPolls');
 const scvcc = require('../lib/scvcc');
 
@@ -518,6 +519,106 @@ describe('recurringPolls', () => {
         scvcc.getCourtBookings = originalGetBookings;
         scvcc.detectPrebookedCourt = originalDetectPrebooked;
       }
+    });
+  });
+
+
+  describe('checkAndPostRecurringPolls retry and notification handling when no courts available', () => {
+    it('should retry a couple of times before sending a single failure notification and marking handled', async () => {
+      const scheduleId = 'sched_retry_test';
+      const targetMatchDate = '2026-10-22';
+      const recurringPolls = new Map();
+      const sched = {
+        id: scheduleId,
+        remoteJid: '120363402559062529@g.us',
+        matchTime: '7:00PM',
+        matchHour: 19,
+        matchMinute: 0,
+        days: 'thu',
+        daysList: [4],
+        size: '8',
+        enabled: true,
+        postTime: '8:15PM',
+        postHour: 20,
+        postMinute: 15,
+        postDaysBefore: 1
+      };
+      recurringPolls.set(scheduleId, sched);
+
+      const messagesSent = [];
+      const mockSock = {
+        sendMessage: async (jid, content) => {
+          messagesSent.push({ jid, text: content.text });
+          return {};
+        }
+      };
+
+      let createPollCalls = 0;
+      const createMatchPoll = async () => {
+        createPollCalls++;
+        return {
+          err: '⚠️ Cannot create poll for *Thursday 7pm*: No live or prebooked courts are available at SCVCC (all courts are reserved or blocked).',
+          noCourtsAvailable: true
+        };
+      };
+
+      const wednesday815pm = { year: 2026, month: 9, day: 21, weekday: 'wed', hour: 20, minute: 15 };
+
+      // Sweep 1: Initial attempt at 8:15pm
+      await checkAndPostRecurringPolls({
+        sock: mockSock,
+        recurringPolls,
+        persistPolls: () => {},
+        createMatchPoll,
+        getTargetGroupJid: async () => '120363402559062529@g.us',
+        customSanJoseParts: wednesday815pm
+      });
+
+      assert.equal(createPollCalls, 1);
+      assert.equal(messagesSent.length, 0); // No message sent on attempt 1
+      assert.equal(sched.postedMatchDates?.includes(targetMatchDate) || false, false);
+
+      // Sweep 2: Next sweep tick (Retry 1)
+      await checkAndPostRecurringPolls({
+        sock: mockSock,
+        recurringPolls,
+        persistPolls: () => {},
+        createMatchPoll,
+        getTargetGroupJid: async () => '120363402559062529@g.us',
+        customSanJoseParts: wednesday815pm
+      });
+
+      assert.equal(createPollCalls, 2);
+      assert.equal(messagesSent.length, 0); // Still no message sent on retry 1
+      assert.equal(sched.postedMatchDates?.includes(targetMatchDate) || false, false);
+
+      // Sweep 3: Next sweep tick (Retry 2 - retries exhausted)
+      await checkAndPostRecurringPolls({
+        sock: mockSock,
+        recurringPolls,
+        persistPolls: () => {},
+        createMatchPoll,
+        getTargetGroupJid: async () => '120363402559062529@g.us',
+        customSanJoseParts: wednesday815pm
+      });
+
+      assert.equal(createPollCalls, 3);
+      assert.equal(messagesSent.length, 1); // Exactly ONE notification sent!
+      assert.ok(messagesSent[0].text.includes('No live or prebooked courts are available'));
+      assert.equal(sched.postedMatchDates.includes(targetMatchDate), true); // Marked posted so it stops retrying!
+
+      // Sweep 4: Subsequent sweep tick
+      await checkAndPostRecurringPolls({
+        sock: mockSock,
+        recurringPolls,
+        persistPolls: () => {},
+        createMatchPoll,
+        getTargetGroupJid: async () => '120363402559062529@g.us',
+        customSanJoseParts: wednesday815pm
+      });
+
+      assert.equal(createPollCalls, 3); // No new call!
+      assert.equal(messagesSent.length, 1); // Still only 1 message sent!
     });
   });
 
