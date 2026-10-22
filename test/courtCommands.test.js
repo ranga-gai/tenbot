@@ -200,4 +200,58 @@ describe('courtCommands', () => {
       }
     });
   });
+  describe('getCourtBookings spanning multi-slot reservations', () => {
+    it('should show courts spanning across the entire duration in all 30m slots', async () => {
+      const origAuthFetch = scvcc.authFetch;
+      const testChatId = '120363403838804497@g.us';
+
+      const mockHtml = `
+        <tr>
+          <td><div class="tscell">6:30 PM</div></td>
+          <td rowspan="3">
+            <div class="ncCourtNum">Court 2</div>
+            <img title="Doubles" />
+            <div class="playerName" title="Immaneni, Pramod">Pramod Immaneni</div>
+          </td>
+        </tr>
+        <tr>
+          <td><div class="tscell">7:00 PM</div></td>
+          <td><div class="ncCourtNum">Court 1</div><div class="blockTitle">Blocked</div></td>
+        </tr>
+        <tr>
+          <td><div class="tscell">7:30 PM</div></td>
+          <td><div class="ncCourtNum">Court 1</div><div class="blockTitle">Blocked</div></td>
+        </tr>
+        <tr>
+          <td><div class="tscell">8:00 PM</div></td>
+          <td><div class="ncCourtNum">Court 1</div><div class="blockTitle">Blocked</div></td>
+        </tr>
+      `;
+
+      scvcc.authFetch = async () => ({
+        ok: true,
+        text: async () => mockHtml
+      });
+
+      try {
+        const res = await scvcc.getCourtBookings({ when: 'today', chatId: testChatId });
+        assert.ok(res.success);
+
+        const ct2At630 = res.bookings.find(b => b.court === 'Court 2' && b.time === '6:30 PM');
+        const ct2At700 = res.bookings.find(b => b.court === 'Court 2' && b.time === '7:00 PM');
+        const ct2At730 = res.bookings.find(b => b.court === 'Court 2' && b.time === '7:30 PM');
+        const ct2At800 = res.bookings.find(b => b.court === 'Court 2' && b.time === '8:00 PM');
+
+        assert.ok(ct2At630, 'Court 2 should be present at 6:30 PM');
+        assert.ok(ct2At700, 'Court 2 should be present at 7:00 PM');
+        assert.ok(ct2At730, 'Court 2 should be present at 7:30 PM');
+        assert.ok(!ct2At800, 'Court 2 should NOT be present at 8:00 PM');
+
+        assert.ok(res.message.includes('Court 2'));
+        assert.ok(res.message.includes('Booked: PI'));
+      } finally {
+        scvcc.authFetch = origAuthFetch;
+      }
+    });
+  });
 });
