@@ -25,6 +25,7 @@ describe('help', () => {
     assert.match(text, /Create Match Poll \(!poll\)/);
     assert.match(text, /Usage:/);
     assert.match(text, /Examples:/);
+    assert.match(text, /look-around/i);
   });
 
   it('should return detailed help for "!help courts"', () => {
@@ -37,6 +38,7 @@ describe('help', () => {
     const text = helpText('recurringpoll', false);
     assert.match(text, /Recurring Daily Polls \(!recurringpoll\)/);
     assert.match(text, /advance court pre-booking/i);
+    assert.match(text, /look-around/i);
   });
 
   it('should return detailed help for "!help score"', () => {

@@ -12,6 +12,8 @@ const {
   checkAndPostRecurringPolls
 } = require('../lib/recurringPolls');
 const scvcc = require('../lib/scvcc');
+const pollTime = require('../lib/pollTime');
+const pollCommands = require('../lib/commands/pollCommands');
 
 describe('recurringPolls', () => {
   describe('parseDaysOfWeek', () => {
@@ -619,6 +621,343 @@ describe('recurringPolls', () => {
 
       assert.equal(createPollCalls, 3); // No new call!
       assert.equal(messagesSent.length, 1); // Still only 1 message sent!
+    });
+  });
+
+  describe('look around period for court search and booking', () => {
+    it('should generate candidate start times in 30-min intervals across the look around window', () => {
+      assert.deepEqual(pollTime.getCandidateTimes('6:30pm', 60), ['6:30pm', '7pm', '7:30pm']);
+      assert.deepEqual(pollTime.getCandidateTimes('6:30pm', '1 hour'), ['6:30pm', '7pm', '7:30pm']);
+      assert.deepEqual(pollTime.getCandidateTimes('6:30pm', 30), ['6:30pm', '7pm']);
+      assert.deepEqual(pollTime.getCandidateTimes('6:30pm', 0), ['6:30pm']);
+      assert.deepEqual(pollTime.getCandidateTimes('7:00pm', 60), ['7pm', '7:30pm', '8pm']);
+    });
+
+    it('should extract lookAround flag from text in CLI and natural language formats', () => {
+      const r1 = extractCommonFlags('4 6:30pm weekdays with look around of 1 hour');
+      assert.equal(r1.flags.lookAround, 60);
+      assert.equal(r1.remainingText, '4 6:30pm weekdays');
+
+      const r2 = extractCommonFlags('4 6:30pm --look-around=1h');
+      assert.equal(r2.flags.lookAround, 60);
+
+      const r3 = extractCommonFlags('4 6:30pm look around: 30m');
+      assert.equal(r3.flags.lookAround, 30);
+
+      const r4 = extractCommonFlags('4 6:30pm', { 'look-around': '1 hour' });
+      assert.equal(r4.flags.lookAround, 60);
+    });
+
+    it('should search 6:30pm, 7pm, and 7:30pm for prebooked courts when look around of 1 hour is specified', async () => {
+      const originalCheckAvail = scvcc.checkCourtAvailability;
+      const originalGetBookings = scvcc.getCourtBookings;
+      const originalDetectPrebooked = scvcc.detectPrebookedCourt;
+      const queriedTimes = [];
+
+      try {
+        scvcc.checkCourtAvailability = async ({ time }) => {
+          queriedTimes.push(time);
+          return { slots: [] };
+        };
+        scvcc.getCourtBookings = async ({ time }) => {
+          if (time === '7pm') {
+            return {
+              bookings: [
+                { court: 'Court 2', durationMins: 90, players: ['Player B'] }
+              ]
+            };
+          }
+          return { bookings: [] };
+        };
+        scvcc.detectPrebookedCourt = (b) => {
+          if (b.court === 'Court 2') return { isPrebooked: true, player: 'B' };
+          return null;
+        };
+
+        const detected = await detectManualPlayerBookings({
+          remoteJid: '120363402559062529@g.us',
+          targetDateMDY: '10/26/2026',
+          queryTime: '6:30pm',
+          lookAround: 60
+        });
+
+        assert.deepEqual(queriedTimes, ['6:30pm', '7pm', '7:30pm']);
+        assert.equal(detected.length, 1);
+        assert.equal(detected[0].court, 'Court 2');
+        assert.equal(detected[0].time, '7pm');
+      } finally {
+        scvcc.checkCourtAvailability = originalCheckAvail;
+        scvcc.getCourtBookings = originalGetBookings;
+        scvcc.detectPrebookedCourt = originalDetectPrebooked;
+      }
+    });
+
+    it('should try 7pm followed by 7:30pm when prebooking courts if required number is not reached at 6:30pm', async () => {
+      const originalBookCourt = scvcc.bookCourt;
+      const bookingAttempts = [];
+
+      try {
+        scvcc.bookCourt = async ({ time, court }) => {
+          bookingAttempts.push({ time, court });
+          // At 6:30pm, 1 court succeeds, but 2nd court fails
+          if (time === '6:30pm') {
+            if (bookingAttempts.filter(b => b.time === '6:30pm').length === 1) {
+              return {
+                success: true,
+                court: 'Court 1',
+                time: '6:30pm',
+                duration: '90 Minutes',
+                players: ['Player 1', 'Player 2', 'Player 3', 'Player 4']
+              };
+            }
+            return { success: false, message: 'No courts available at 6:30pm' };
+          }
+          // At 7pm, 2nd court succeeds!
+          if (time === '7pm') {
+            return {
+              success: true,
+              court: 'Court 2',
+              time: '7pm',
+              duration: '90 Minutes',
+              players: ['Player 5', 'Player 6', 'Player 7', 'Player 8']
+            };
+          }
+          return { success: false, message: 'No courts available' };
+        };
+
+        const res = await pollCommands.preBookCourtsForMatch({
+          sock: { sendMessage: async () => ({}) },
+          remoteJid: '120363402559062529@g.us',
+          targetDateMDY: '10/26/2026',
+          queryTime: '6:30pm',
+          size: 8, // 2 courts required
+          isAuto: false,
+          lookAround: 60,
+          isAdvanceBooking: true,
+          retryDelayMs: 1
+        });
+
+        // Verifies 2 courts secured: Court 1 at 6:30pm, Court 2 at 7pm
+        assert.equal(res.advanceBookedCourts.length, 2);
+        assert.equal(res.advanceBookedCourts[0].court, 'Court 1');
+        assert.equal(res.advanceBookedCourts[0].time, '6:30pm');
+        assert.equal(res.advanceBookedCourts[1].court, 'Court 2');
+        assert.equal(res.advanceBookedCourts[1].time, '7pm');
+
+        // Verifies attempts were made at 6:30pm, and then proceeded to 7pm, and did NOT need 7:30pm
+        const bookedTimes = bookingAttempts.map(b => b.time);
+        assert.ok(bookedTimes.includes('6:30pm'));
+        assert.ok(bookedTimes.includes('7pm'));
+        assert.ok(!bookedTimes.includes('7:30pm'));
+      } finally {
+        scvcc.bookCourt = originalBookCourt;
+      }
+    });
+
+    it('should search prebooked courts across candidate times when creating a poll with checkCourts and lookAround', async () => {
+      const originalCheckAvail = scvcc.checkCourtAvailability;
+      const originalGetBookings = scvcc.getCourtBookings;
+      const originalDetectPrebooked = scvcc.detectPrebookedCourt;
+      const queriedTimes = [];
+
+      try {
+        scvcc.checkCourtAvailability = async ({ time }) => {
+          queriedTimes.push(time);
+          return { slots: [] };
+        };
+        scvcc.getCourtBookings = async ({ time }) => {
+          if (time === '7pm') {
+            return {
+              bookings: [
+                { court: 'Court 3', durationMins: 90, players: ['Player C'] }
+              ]
+            };
+          }
+          return { bookings: [] };
+        };
+        scvcc.detectPrebookedCourt = (b) => {
+          if (b.court === 'Court 3') return { isPrebooked: true, player: 'Player C' };
+          return null;
+        };
+
+        const activePolls = new Map();
+        const res = await pollCommands.createMatchPoll(
+          {
+            sendMessage: async (jid, content) => ({
+              key: { id: 'poll_lookaround_test', remoteJid: jid },
+              message: content
+            })
+          },
+          '120363402559062529@g.us',
+          4,
+          'Tomorrow 6:30pm',
+          null,
+          '6:30pm',
+          'Creator',
+          null,
+          true,
+          null,
+          false,
+          true,
+          false,
+          true, // checkCourts
+          false,
+          false,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          { activePolls, messageStore: new Map(), latestPollIdByChat: new Map(), persistPolls: () => {} },
+          60 // lookAround: 1 hour
+        );
+
+        assert.equal(res.err, null);
+        assert.deepEqual(queriedTimes, ['6:30pm', '7pm', '7:30pm']);
+        const storedPoll = activePolls.get('poll_lookaround_test');
+        assert.ok(storedPoll);
+        assert.equal(storedPoll.lookAround, 60);
+        assert.equal(storedPoll.lookAroundDisplay, '1 hour');
+        assert.ok(storedPoll.prebookedCourts.some(c => c.court === 'Court 3'));
+      } finally {
+        scvcc.checkCourtAvailability = originalCheckAvail;
+        scvcc.getCourtBookings = originalGetBookings;
+        scvcc.detectPrebookedCourt = originalDetectPrebooked;
+      }
+    });
+
+    it('should format poll title with time for courts booked at different times within look around window', async () => {
+      const originalCheckAvail = scvcc.checkCourtAvailability;
+      const originalGetBookings = scvcc.getCourtBookings;
+      const originalDetectPrebooked = scvcc.detectPrebookedCourt;
+
+      try {
+        scvcc.checkCourtAvailability = async () => ({ slots: [] });
+        scvcc.getCourtBookings = async ({ time }) => {
+          if (time === '6:30pm') {
+            return {
+              bookings: [
+                { court: 'Court 2', durationMins: 90, players: ['Player 2'] },
+                { court: 'Court 3', durationMins: 90, players: ['Player 3'] }
+              ]
+            };
+          }
+          if (time === '7pm') {
+            return {
+              bookings: [
+                { court: 'Court 6', durationMins: 90, players: ['Player 6'] }
+              ]
+            };
+          }
+          return { bookings: [] };
+        };
+        scvcc.detectPrebookedCourt = (b) => {
+          if (b.court === 'Court 2') return { isPrebooked: true, player: 'Player 2' };
+          if (b.court === 'Court 3') return { isPrebooked: true, player: 'Player 3' };
+          if (b.court === 'Court 6') return { isPrebooked: true, player: 'Player 6' };
+          return null;
+        };
+
+        const activePolls = new Map();
+        const res = await pollCommands.createMatchPoll(
+          {
+            sendMessage: async (jid, content) => ({
+              key: { id: 'poll_lookaround_title_test', remoteJid: jid },
+              message: content
+            })
+          },
+          '120363402559062529@g.us',
+          12,
+          'Tomorrow 6:30pm',
+          null,
+          '6:30pm',
+          'Creator',
+          null,
+          false,
+          null,
+          false,
+          true,
+          false,
+          true, // checkCourts
+          false,
+          false,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          { activePolls, messageStore: new Map(), latestPollIdByChat: new Map(), persistPolls: () => {} },
+          30 // lookAround: 30 mins
+        );
+
+        assert.equal(res.err, null);
+        const storedPoll = activePolls.get('poll_lookaround_title_test');
+        assert.ok(storedPoll);
+
+        const pollName = storedPoll.name;
+        // Verify Court 2 and Court 3 are mentioned as earlier (without time)
+        assert.ok(pollName.includes('Court 2 - Booked'), 'Expected "Court 2 - Booked" in poll title: ' + pollName);
+        assert.ok(pollName.includes('Court 3 - Booked'), 'Expected "Court 3 - Booked" in poll title: ' + pollName);
+        assert.ok(!pollName.includes('Court 2 (6:30pm)'), 'Court 2 should not have time: ' + pollName);
+        assert.ok(!pollName.includes('Court 3 (6:30pm)'), 'Court 3 should not have time: ' + pollName);
+
+        // Verify Court 6 mentions the time (7pm) since it differs from 6:30pm
+        assert.ok(pollName.includes('Court 6 (7pm) - Booked'), 'Expected "Court 6 (7pm) - Booked" in poll title: ' + pollName);
+
+        // Verify reading back prebooked courts from stored poll name works seamlessly
+        const readBackCourts = await pollCommands.getPrebookedCourtsForPoll({ name: pollName });
+        const courtNames = readBackCourts.map(c => c.court);
+        assert.ok(courtNames.includes('Court 2'));
+        assert.ok(courtNames.includes('Court 3'));
+        assert.ok(courtNames.includes('Court 6'));
+
+        // Also verify auto poll format
+        const autoPolls = new Map();
+        const autoRes = await pollCommands.createMatchPoll(
+          {
+            sendMessage: async (jid, content) => ({
+              key: { id: 'poll_auto_lookaround_test', remoteJid: jid },
+              message: content
+            })
+          },
+          '120363402559062529@g.us',
+          'auto',
+          'Tomorrow 6:30pm',
+          null,
+          '6:30pm',
+          'Creator',
+          null,
+          false,
+          null,
+          false,
+          true,
+          false,
+          true, // checkCourts
+          false,
+          false,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          { activePolls: autoPolls, messageStore: new Map(), latestPollIdByChat: new Map(), persistPolls: () => {} },
+          30 // lookAround: 30 mins
+        );
+
+        assert.equal(autoRes.err, null);
+        const autoPoll = autoPolls.get('poll_auto_lookaround_test');
+        assert.ok(autoPoll);
+        assert.ok(autoPoll.name.includes('Court 2 - Booked'));
+        assert.ok(autoPoll.name.includes('Court 3 - Booked'));
+        assert.ok(autoPoll.name.includes('Court 6 (7pm) - Booked'));
+      } finally {
+        scvcc.checkCourtAvailability = originalCheckAvail;
+        scvcc.getCourtBookings = originalGetBookings;
+        scvcc.detectPrebookedCourt = originalDetectPrebooked;
+      }
     });
   });
 
