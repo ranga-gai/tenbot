@@ -421,7 +421,7 @@ describe('courtCommands', () => {
       scvcc.getCourtWebcamClip = origGetClip;
     }
 
-    it("should capture and send a photo snapshot for !webcam by default without player links", async () => {
+    it("should return a photo snapshot object for !webcam by default without player links", async () => {
       const mockImageBuf = Buffer.from("fake-jpeg-image-bytes");
       scvcc.getCourtWebcamSnapshot = async () => ({
         success: true,
@@ -430,34 +430,22 @@ describe('courtCommands', () => {
       });
 
       try {
-        const sentMessages = [];
-        const mockSock = {
-          sendMessage: async (jid, content) => {
-            sentMessages.push({ jid, content });
-            return { key: { id: "msg-photo-1" } };
-          }
-        };
+        const res = await handleCourtCommand(null, "!webcam", testChatId, "Alice");
+        assert.ok(typeof res === "object" && res !== null, "Should return media object so routeCommand does not fall through");
+        assert.equal(res.image, mockImageBuf);
+        assert.match(res.caption, /SCVCC Tennis Court Webcam/);
+        assert.equal(res.caption.includes("player.php"), false, "Should NOT include player link");
+        assert.equal(res.caption.includes("Live Player"), false, "Should NOT include player link");
 
-        const res = await handleCourtCommand(mockSock, "!webcam", testChatId, "Alice");
-        assert.equal(sentMessages.length, 1);
-        assert.equal(sentMessages[0].jid, testChatId);
-        assert.equal(sentMessages[0].content.image, mockImageBuf);
-        assert.match(sentMessages[0].content.caption, /SCVCC Tennis Court Webcam/);
-        assert.equal(sentMessages[0].content.caption.includes("player.php"), false, "Should NOT include player link");
-        assert.equal(sentMessages[0].content.caption.includes("Live Player"), false, "Should NOT include player link");
-
-        // When sock is null, returns object with image and caption
-        const resNoSock = await handleCourtCommand(null, "!camera", testChatId, "Alice");
-        assert.ok(typeof resNoSock === "object");
-        assert.equal(resNoSock.image, mockImageBuf);
-        assert.match(resNoSock.caption, /SCVCC Tennis Court Webcam/);
-        assert.equal(resNoSock.caption.includes("player.php"), false);
+        const resCam = await handleCourtCommand(null, "!camera", testChatId, "Alice");
+        assert.ok(typeof resCam === "object" && resCam !== null);
+        assert.equal(resCam.image, mockImageBuf);
       } finally {
         restore();
       }
     });
 
-    it("should capture and send a 10s video clip when video option is requested (!webcam video)", async () => {
+    it("should return a 10s video clip object when video option is requested (!webcam video)", async () => {
       const mockVideoBuf = Buffer.from("fake-mp4-video-bytes");
       scvcc.getCourtWebcamClip = async (duration) => ({
         success: true,
@@ -467,29 +455,17 @@ describe('courtCommands', () => {
       });
 
       try {
-        const sentMessages = [];
-        const mockSock = {
-          sendMessage: async (jid, content) => {
-            sentMessages.push({ jid, content });
-            return { key: { id: "msg-video-1" } };
-          }
-        };
+        const res = await handleCourtCommand(null, "!webcam video", testChatId, "Alice");
+        assert.ok(typeof res === "object" && res !== null, "Should return media object so routeCommand does not fall through");
+        assert.equal(res.video, mockVideoBuf);
+        assert.equal(res.mimetype, "video/mp4");
+        assert.match(res.caption, /SCVCC Tennis Court Webcam \(10s clip\)/);
+        assert.equal(res.caption.includes("player.php"), false, "Should NOT include player link");
+        assert.equal(res.caption.includes("Live Player"), false, "Should NOT include player link");
 
-        const res = await handleCourtCommand(mockSock, "!webcam video", testChatId, "Alice");
-        assert.equal(sentMessages.length, 1);
-        assert.equal(sentMessages[0].jid, testChatId);
-        assert.equal(sentMessages[0].content.video, mockVideoBuf);
-        assert.equal(sentMessages[0].content.mimetype, "video/mp4");
-        assert.match(sentMessages[0].content.caption, /SCVCC Tennis Court Webcam \(10s clip\)/);
-        assert.equal(sentMessages[0].content.caption.includes("player.php"), false, "Should NOT include player link");
-        assert.equal(sentMessages[0].content.caption.includes("Live Player"), false, "Should NOT include player link");
-
-        // When sock is null, returns object with video and caption
-        const resNoSock = await handleCourtCommand(null, "!camera clip", testChatId, "Alice");
-        assert.ok(typeof resNoSock === "object");
-        assert.equal(resNoSock.video, mockVideoBuf);
-        assert.match(resNoSock.caption, /SCVCC Tennis Court Webcam \(10s clip\)/);
-        assert.equal(resNoSock.caption.includes("player.php"), false);
+        const resClip = await handleCourtCommand(null, "!camera clip", testChatId, "Alice");
+        assert.ok(typeof resClip === "object" && resClip !== null);
+        assert.equal(resClip.video, mockVideoBuf);
       } finally {
         restore();
       }
