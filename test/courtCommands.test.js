@@ -200,6 +200,7 @@ describe('courtCommands', () => {
       }
     });
   });
+
   describe('getCourtBookings spanning multi-slot reservations', () => {
     it('should show courts spanning across the entire duration in all 30m slots', async () => {
       const origAuthFetch = scvcc.authFetch;
@@ -251,6 +252,161 @@ describe('courtCommands', () => {
         assert.ok(res.message.includes('Booked: PI'));
       } finally {
         scvcc.authFetch = origAuthFetch;
+      }
+    });
+  });
+
+  describe('pause and resume court bookings', () => {
+    const groupsConfig = require('../lib/groupsConfig');
+    const origConfig = JSON.parse(JSON.stringify(groupsConfig.loadRawConfig() || {}));
+    const origIsSuper = groupsConfig.isSuperAdmin;
+    const testChatId = '120363403838804497@g.us';
+    const adminUser = '11111@s.whatsapp.net';
+    const regularUser = '22222@s.whatsapp.net';
+    const superUser = '99999@s.whatsapp.net';
+
+    const mockSock = {
+      groupMetadata: async (jid) => ({
+        id: jid,
+        subject: 'Bot-testing',
+        participants: [
+          { id: adminUser, admin: 'admin' },
+          { id: regularUser, admin: null }
+        ]
+      })
+    };
+
+    function setupMocks() {
+      groupsConfig.isSuperAdmin = (jid) => jid === superUser;
+    }
+
+    function teardownMocks() {
+      groupsConfig.isSuperAdmin = origIsSuper;
+      groupsConfig.saveRawConfig(origConfig);
+    }
+
+    it('should reject non-admin from pausing court bookings for a group', async () => {
+      setupMocks();
+      try {
+        const res = await handleCourtCommand(mockSock, '!pausecourtbookings', testChatId, 'Regular', regularUser);
+        assert.match(res, /Only group admins or the bot superadmin can pause court bookings/);
+      } finally {
+        teardownMocks();
+      }
+    });
+
+    it('should reject non-admin from resuming court bookings for a group', async () => {
+      setupMocks();
+      try {
+        const res = await handleCourtCommand(mockSock, '!resumecourtbookings', testChatId, 'Regular', regularUser);
+        assert.match(res, /Only group admins or the bot superadmin can resume court bookings/);
+      } finally {
+        teardownMocks();
+      }
+    });
+
+    it('should reject non-superadmin from pausing all groups', async () => {
+      setupMocks();
+      try {
+        const res = await handleCourtCommand(mockSock, '!pausecourtbookings all', testChatId, 'Admin', adminUser);
+        assert.match(res, /Only the bot superadmin can pause court bookings for all groups/);
+
+        const res2 = await handleCourtCommand(mockSock, '!pauseallcourtbookings', testChatId, 'Admin', adminUser);
+        assert.match(res2, /Only the bot superadmin can pause court bookings for all groups/);
+      } finally {
+        teardownMocks();
+      }
+    });
+
+    it('should reject non-superadmin from resuming all groups', async () => {
+      setupMocks();
+      try {
+        const res = await handleCourtCommand(mockSock, '!resumecourtbookings all', testChatId, 'Admin', adminUser);
+        assert.match(res, /Only the bot superadmin can resume court bookings for all groups/);
+
+        const res2 = await handleCourtCommand(mockSock, '!resumeallcourtbookings', testChatId, 'Admin', adminUser);
+        assert.match(res2, /Only the bot superadmin can resume court bookings for all groups/);
+      } finally {
+        teardownMocks();
+      }
+    });
+
+    it('should allow group admin to pause court bookings for current group', async () => {
+      setupMocks();
+      try {
+        const res = await handleCourtCommand(mockSock, '!pausecourtbookings', testChatId, 'Admin', adminUser);
+        assert.match(res, /Court bookings paused for/);
+        const cfg = groupsConfig.loadRawConfig();
+        assert.equal(cfg.groups[testChatId].courtBookingEnabled, false);
+      } finally {
+        teardownMocks();
+      }
+    });
+
+    it('should allow group admin to resume court bookings for current group', async () => {
+      setupMocks();
+      try {
+        const res = await handleCourtCommand(mockSock, '!resumecourtbookings', testChatId, 'Admin', adminUser);
+        assert.match(res, /Court bookings resumed for/);
+        const cfg = groupsConfig.loadRawConfig();
+        assert.equal(cfg.groups[testChatId].courtBookingEnabled, true);
+      } finally {
+        teardownMocks();
+      }
+    });
+
+    it('should allow superadmin to pause court bookings across all groups with a single command', async () => {
+      setupMocks();
+      try {
+        const res = await handleCourtCommand(mockSock, '!pauseallcourtbookings', testChatId, 'Super', superUser);
+        assert.match(res, /Court bookings paused for all groups/);
+        const cfg = groupsConfig.loadRawConfig();
+        assert.equal(cfg.defaults.courtBookingEnabled, false);
+        for (const g of Object.values(cfg.groups)) {
+          assert.equal(g.courtBookingEnabled, false);
+        }
+      } finally {
+        teardownMocks();
+      }
+    });
+
+    it('should allow superadmin to resume court bookings across all groups with a single command', async () => {
+      setupMocks();
+      try {
+        const res = await handleCourtCommand(mockSock, '!resumeallcourtbookings', testChatId, 'Super', superUser);
+        assert.match(res, /Court bookings resumed for all groups/);
+        const cfg = groupsConfig.loadRawConfig();
+        assert.equal(cfg.defaults.courtBookingEnabled, true);
+        for (const g of Object.values(cfg.groups)) {
+          assert.equal(g.courtBookingEnabled, true);
+        }
+      } finally {
+        teardownMocks();
+      }
+    });
+
+    it('should handle pause_court_bookings and resume_court_bookings tools', async () => {
+      setupMocks();
+      try {
+        // Group admin tool execution
+        const resAdminPause = await executeCourtTool(mockSock, 'pause_court_bookings', { group: testChatId }, 'Admin', testChatId, adminUser);
+        assert.match(resAdminPause, /Court bookings paused for/);
+
+        const resAdminResume = await executeCourtTool(mockSock, 'resume_court_bookings', { group: testChatId }, 'Admin', testChatId, adminUser);
+        assert.match(resAdminResume, /Court bookings resumed for/);
+
+        // Non-admin tool execution rejected
+        const resNonAdmin = await executeCourtTool(mockSock, 'pause_court_bookings', { group: testChatId }, 'Regular', testChatId, regularUser);
+        assert.match(resNonAdmin, /Only group admins or the bot superadmin can pause court bookings/);
+
+        // Superadmin all groups tool execution
+        const resSuperPause = await executeCourtTool(mockSock, 'pause_court_bookings', { all: true }, 'Super', testChatId, superUser);
+        assert.match(resSuperPause, /Court bookings paused for all groups/);
+
+        const resSuperResume = await executeCourtTool(mockSock, 'resume_court_bookings', { all: true }, 'Super', testChatId, superUser);
+        assert.match(resSuperResume, /Court bookings resumed for all groups/);
+      } finally {
+        teardownMocks();
       }
     });
   });

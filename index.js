@@ -386,19 +386,25 @@ async function callClaude(sock, chatId, sender, promptText, msg) {
   ];
 
   const context = getPollContext();
-  const makeApiCall = async (msgs) => {
+  const makeApiCall = async (msgs, toolsToUse = CACHED_CLAUDE_TOOLS) => {
     return await anthropic.callAnthropicMessages({
       messages: msgs,
       system: systemBlocks,
-      tools: CACHED_CLAUDE_TOOLS,
+      tools: toolsToUse,
       maxTokens: 1000
     });
   };
 
   let data = await makeApiCall(messages);
-  const toolUseBlocks = data.content?.filter((b) => b.type === 'tool_use') || [];
+  let currentMessages = [...messages];
+  const MAX_TOOL_ROUNDS = 5;
+  let rounds = 0;
 
-  if (toolUseBlocks.length > 0) {
+  while (rounds < MAX_TOOL_ROUNDS) {
+    const toolUseBlocks = data.content?.filter((b) => b.type === 'tool_use') || [];
+    if (toolUseBlocks.length === 0) break;
+
+    rounds++;
     const toolResults = [];
     for (const toolUse of toolUseBlocks) {
       const result = await executeTool(sock, chatId, sender, toolUse, msg, context);
@@ -409,24 +415,44 @@ async function callClaude(sock, chatId, sender, promptText, msg) {
       });
     }
 
-    const followUpMessages = [
-      ...messages,
+    currentMessages = [
+      ...currentMessages,
       { role: 'assistant', content: data.content },
       { role: 'user', content: toolResults }
     ];
 
-    data = await makeApiCall(followUpMessages);
+    data = await makeApiCall(currentMessages);
   }
 
-  const replyText = anthropic.extractTextFromResponse(data);
+  let replyText = anthropic.extractTextFromResponse(data);
+
+  // If Claude ended on another tool_use after exceeding MAX_TOOL_ROUNDS or returned no text,
+  // do one final completion call without tools so Claude synthesizes an answer for the user.
+  if (!replyText && data.content?.some((b) => b.type === 'tool_use')) {
+    try {
+      const finalPromptMessages = [
+        ...currentMessages,
+        { role: 'user', content: 'Please provide a clear and direct answer to the user based on the information retrieved.' }
+      ];
+      const finalData = await makeApiCall(finalPromptMessages, null);
+      replyText = anthropic.extractTextFromResponse(finalData);
+    } catch (finalErr) {
+      console.warn('⚠️ [callClaude] Final synthesis call failed:', finalErr.message);
+    }
+  }
+
   if (!replyText) {
     console.warn(`⚠️ [callClaude] Empty text response from Claude. stop_reason=${data?.stop_reason}, blocks=${(data?.content || []).map((b) => b.type).join(',')}`);
+    replyText = "Sorry, I couldn't process that request right now. Please try again in a moment or use specific commands like !courts, !poll, or !help.";
   }
-  const updatedHistory = [
-    ...messages,
-    { role: 'assistant', content: replyText || '' }
-  ].slice(-HISTORY_LIMIT * 2);
-  chatHistories.set(chatId, updatedHistory);
+
+  if (replyText) {
+    const updatedHistory = [
+      ...messages,
+      { role: 'assistant', content: replyText }
+    ].slice(-HISTORY_LIMIT * 2);
+    chatHistories.set(chatId, updatedHistory);
+  }
 
   return replyText;
 }
