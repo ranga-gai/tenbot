@@ -7,7 +7,7 @@ describe('claudeTools', () => {
     assert(Array.isArray(CLAUDE_TOOLS));
     assert(Array.isArray(CACHED_CLAUDE_TOOLS));
     assert.equal(CLAUDE_TOOLS.length, CACHED_CLAUDE_TOOLS.length);
-    assert.equal(CLAUDE_TOOLS.length, 38);
+    assert.equal(CLAUDE_TOOLS.length, 39);
   });
 
   it('should ensure each tool has name, description, and valid input_schema', () => {
@@ -69,6 +69,7 @@ describe('claudeTools', () => {
       'cancel_court_reservation',
       'pause_court_bookings',
       'resume_court_bookings',
+      'get_court_webcam',
       'list_groups',
       'add_group',
       'remove_group',

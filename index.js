@@ -590,9 +590,18 @@ async function handleMessage(sock, msg, groupName) {
 
   const reply = await getResponse(sock, text.trim(), remoteJid, sender, msg);
   if (reply) {
-    console.log(`[${groupName}] tenbot: ${reply}`);
-    messageHistory.recordMessage(remoteJid, 'tenbot', reply, Date.now(), true);
-    await sock.sendMessage(remoteJid, { text: reply });
+    if (typeof reply === 'object' && (reply.image || reply.video || reply.document)) {
+      const captionText = reply.caption || reply.text || '';
+      console.log(`[${groupName}] tenbot: [Media] ${captionText}`);
+      if (captionText) {
+        messageHistory.recordMessage(remoteJid, 'tenbot', captionText, Date.now(), true);
+      }
+      await sock.sendMessage(remoteJid, reply);
+    } else if (typeof reply === 'string') {
+      console.log(`[${groupName}] tenbot: ${reply}`);
+      messageHistory.recordMessage(remoteJid, 'tenbot', reply, Date.now(), true);
+      await sock.sendMessage(remoteJid, { text: reply });
+    }
   }
 }
 

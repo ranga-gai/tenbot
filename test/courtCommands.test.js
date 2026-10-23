@@ -410,4 +410,145 @@ describe('courtCommands', () => {
       }
     });
   });
+
+  describe("court webcam (!webcam)", () => {
+    const origGetWebcam = scvcc.getCourtWebcamSnapshot;
+    const origGetClip = scvcc.getCourtWebcamClip;
+    const testChatId = "120363403838804497@g.us";
+
+    function restore() {
+      scvcc.getCourtWebcamSnapshot = origGetWebcam;
+      scvcc.getCourtWebcamClip = origGetClip;
+    }
+
+    it("should capture and send a photo snapshot for !webcam by default without player links", async () => {
+      const mockImageBuf = Buffer.from("fake-jpeg-image-bytes");
+      scvcc.getCourtWebcamSnapshot = async () => ({
+        success: true,
+        imageBuffer: mockImageBuf,
+        playerUrl: "https://g1.ipcamlive.com/player/player.php?alias=5ca7b2391ca5e&autoplay=1"
+      });
+
+      try {
+        const sentMessages = [];
+        const mockSock = {
+          sendMessage: async (jid, content) => {
+            sentMessages.push({ jid, content });
+            return { key: { id: "msg-photo-1" } };
+          }
+        };
+
+        const res = await handleCourtCommand(mockSock, "!webcam", testChatId, "Alice");
+        assert.equal(sentMessages.length, 1);
+        assert.equal(sentMessages[0].jid, testChatId);
+        assert.equal(sentMessages[0].content.image, mockImageBuf);
+        assert.match(sentMessages[0].content.caption, /SCVCC Tennis Court Webcam/);
+        assert.equal(sentMessages[0].content.caption.includes("player.php"), false, "Should NOT include player link");
+        assert.equal(sentMessages[0].content.caption.includes("Live Player"), false, "Should NOT include player link");
+
+        // When sock is null, returns object with image and caption
+        const resNoSock = await handleCourtCommand(null, "!camera", testChatId, "Alice");
+        assert.ok(typeof resNoSock === "object");
+        assert.equal(resNoSock.image, mockImageBuf);
+        assert.match(resNoSock.caption, /SCVCC Tennis Court Webcam/);
+        assert.equal(resNoSock.caption.includes("player.php"), false);
+      } finally {
+        restore();
+      }
+    });
+
+    it("should capture and send a 10s video clip when video option is requested (!webcam video)", async () => {
+      const mockVideoBuf = Buffer.from("fake-mp4-video-bytes");
+      scvcc.getCourtWebcamClip = async (duration) => ({
+        success: true,
+        videoBuffer: mockVideoBuf,
+        duration: 10,
+        playerUrl: "https://g1.ipcamlive.com/player/player.php?alias=5ca7b2391ca5e&autoplay=1"
+      });
+
+      try {
+        const sentMessages = [];
+        const mockSock = {
+          sendMessage: async (jid, content) => {
+            sentMessages.push({ jid, content });
+            return { key: { id: "msg-video-1" } };
+          }
+        };
+
+        const res = await handleCourtCommand(mockSock, "!webcam video", testChatId, "Alice");
+        assert.equal(sentMessages.length, 1);
+        assert.equal(sentMessages[0].jid, testChatId);
+        assert.equal(sentMessages[0].content.video, mockVideoBuf);
+        assert.equal(sentMessages[0].content.mimetype, "video/mp4");
+        assert.match(sentMessages[0].content.caption, /SCVCC Tennis Court Webcam \(10s clip\)/);
+        assert.equal(sentMessages[0].content.caption.includes("player.php"), false, "Should NOT include player link");
+        assert.equal(sentMessages[0].content.caption.includes("Live Player"), false, "Should NOT include player link");
+
+        // When sock is null, returns object with video and caption
+        const resNoSock = await handleCourtCommand(null, "!camera clip", testChatId, "Alice");
+        assert.ok(typeof resNoSock === "object");
+        assert.equal(resNoSock.video, mockVideoBuf);
+        assert.match(resNoSock.caption, /SCVCC Tennis Court Webcam \(10s clip\)/);
+        assert.equal(resNoSock.caption.includes("player.php"), false);
+      } finally {
+        restore();
+      }
+    });
+
+    it("should reject webcam command when court booking is disabled for group", async () => {
+      const groupsConfig = require("../lib/groupsConfig");
+      const origIsCourtBookingEnabled = groupsConfig.isCourtBookingEnabled;
+      groupsConfig.isCourtBookingEnabled = () => false;
+      try {
+        const res = await handleCourtCommand(null, "!webcam", testChatId, "Alice");
+        assert.match(res, /Court webcam and booking functionality is not enabled/);
+      } finally {
+        groupsConfig.isCourtBookingEnabled = origIsCourtBookingEnabled;
+      }
+    });
+
+    it("should handle get_court_webcam tool execution defaulting to photo and sending video when requested", async () => {
+      const mockImageBuf = Buffer.from("tool-image-bytes");
+      const mockVideoBuf = Buffer.from("tool-video-bytes");
+      scvcc.getCourtWebcamSnapshot = async () => ({
+        success: true,
+        imageBuffer: mockImageBuf,
+        playerUrl: "https://g1.ipcamlive.com/player/player.php?alias=5ca7b2391ca5e&autoplay=1"
+      });
+      scvcc.getCourtWebcamClip = async (duration) => ({
+        success: true,
+        videoBuffer: mockVideoBuf,
+        duration: 10,
+        playerUrl: "https://g1.ipcamlive.com/player/player.php?alias=5ca7b2391ca5e&autoplay=1"
+      });
+
+      try {
+        const sentMessages = [];
+        const mockSock = {
+          sendMessage: async (jid, content) => {
+            sentMessages.push({ jid, content });
+            return { key: { id: "msg-tool-" + sentMessages.length } };
+          }
+        };
+
+        // Default tool call -> photo snapshot
+        const toolResDefault = await executeCourtTool(mockSock, "get_court_webcam", {}, "Alice", testChatId);
+        assert.match(toolResDefault, /Live court webcam photo snapshot has been sent to the chat/);
+        assert.equal(toolResDefault.includes("player.php"), false, "Should NOT include player link in tool output");
+        assert.equal(sentMessages.length, 1);
+        assert.equal(sentMessages[0].content.image, mockImageBuf);
+        assert.equal(sentMessages[0].content.caption.includes("player.php"), false);
+
+        // format: video tool call -> 10s video clip
+        const toolResVideo = await executeCourtTool(mockSock, "get_court_webcam", { format: "video" }, "Alice", testChatId);
+        assert.match(toolResVideo, /Live 10-second court webcam video clip has been sent to the chat/);
+        assert.equal(toolResVideo.includes("player.php"), false, "Should NOT include player link in tool output");
+        assert.equal(sentMessages.length, 2);
+        assert.equal(sentMessages[1].content.video, mockVideoBuf);
+        assert.equal(sentMessages[1].content.caption.includes("player.php"), false);
+      } finally {
+        restore();
+      }
+    });
+  });
 });
