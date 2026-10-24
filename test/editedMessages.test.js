@@ -253,7 +253,7 @@ describe('editedMessages', () => {
             key: { id: 'orig_unaddressed_1', remoteJid: testChatId },
             type: 14,
             editedMessage: {
-              conversation: '@tenbot ping'
+              conversation: '@tenbot !ping'
             }
           }
         }
@@ -275,7 +275,7 @@ describe('editedMessages', () => {
             type: 14,
             editedMessage: {
               extendedTextMessage: {
-                text: '@Tenbot ping',
+                text: '@Tenbot !ping',
                 contextInfo: {
                   mentionedJid: ['14084099336@s.whatsapp.net']
                 }
