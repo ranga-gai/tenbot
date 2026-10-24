@@ -169,6 +169,7 @@ const chatHistories = new Map();
 
 // Active WhatsApp socket reference
 let botSock = null;
+      ratings.setBotSocket(null);
 
 // Poll-related state and voter mappings persisted per group
 const {
@@ -669,6 +670,7 @@ async function startBot() {
     }
   });
   botSock = sock;
+  ratings.setBotSocket(sock);
 
   const meName = sock.user?.name || state.creds?.me?.name;
   const meId = sock.user?.id || state.creds?.me?.id;
