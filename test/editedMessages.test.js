@@ -170,28 +170,32 @@ describe('editedMessages', () => {
 
   describe('messageHistory.recordEditedMessage', () => {
     it('should update an existing message by id in chat-history', () => {
+      const uniqueChat = 'test_chat_record_1@g.us';
+      messageHistory.clear(uniqueChat);
       const now = Date.now();
-      messageHistory.recordMessage(testChatId, 'Alice', 'Original message text', now - 5000, false, 'msg_edit_1');
-      let history = messageHistory.getRecentMessages(testChatId);
+      messageHistory.recordMessage(uniqueChat, 'Alice', 'Original message text', now - 5000, false, 'msg_edit_1');
+      let history = messageHistory.getRecentMessages(uniqueChat);
       assert.equal(history.length, 1);
       assert.equal(history[0].text, 'Original message text');
 
-      messageHistory.recordEditedMessage(testChatId, 'msg_edit_1', 'Alice', 'Edited message text', now, false);
-      history = messageHistory.getRecentMessages(testChatId);
+      messageHistory.recordEditedMessage(uniqueChat, 'msg_edit_1', 'Alice', 'Edited message text', now, false);
+      history = messageHistory.getRecentMessages(uniqueChat);
       assert.equal(history.length, 1);
       assert.equal(history[0].text, 'Edited message text');
       assert.equal(history[0].edited, true);
     });
 
     it('should fallback to updating latest recent message from sender if id not found', () => {
+      const uniqueChat = 'test_chat_record_2@g.us';
+      messageHistory.clear(uniqueChat);
       const now = Date.now();
-      messageHistory.recordMessage(testChatId, 'Bob', 'First message', now - 5000, false);
-      let history = messageHistory.getRecentMessages(testChatId);
+      messageHistory.recordMessage(uniqueChat, 'Bob', 'First message', now - 5000, false);
+      let history = messageHistory.getRecentMessages(uniqueChat);
       assert.equal(history.length, 1);
       assert.equal(history[0].text, 'First message');
 
-      messageHistory.recordEditedMessage(testChatId, 'unknown_id', 'Bob', 'Edited second message', now, false);
-      history = messageHistory.getRecentMessages(testChatId);
+      messageHistory.recordEditedMessage(uniqueChat, 'unknown_id', 'Bob', 'Edited second message', now, false);
+      history = messageHistory.getRecentMessages(uniqueChat);
       assert.equal(history.length, 1);
       assert.equal(history[0].text, 'Edited second message');
       assert.equal(history[0].edited, true);

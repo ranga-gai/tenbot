@@ -201,7 +201,200 @@ describe('courtCommands', () => {
     });
   });
 
-  describe('getCourtBookings spanning multi-slot reservations', () => {
+  describe('calculateAvailabilityDuration and supervisor override 90m enforcement', () => {
+    it('should terminate availability duration if subsequent slot has a block title (e.g. clinic)', () => {
+      const mockGrid = [
+        {
+          time: '6:30 PM',
+          courts: [
+            { court: 'Court 5', status: 'unavailable', blockTitle: null, prebookedPlayers: [] }
+          ]
+        },
+        {
+          time: '7:00 PM',
+          courts: [
+            { court: 'Court 5', status: 'booked', blockTitle: '3.0+ Live Ball Clinic', prebookedPlayers: [] }
+          ]
+        },
+        {
+          time: '7:30 PM',
+          courts: [
+            { court: 'Court 5', status: 'booked', blockTitle: '3.0+ Live Ball Clinic', prebookedPlayers: [] }
+          ]
+        }
+      ];
+
+      // With allowOverride: false -> 0m because starting slot is unavailable
+      const normalRes = scvcc.calculateAvailabilityDuration(mockGrid, 0, 'Court 5', { allowOverride: false });
+      assert.equal(normalRes.minutes, 0);
+
+      // With allowOverride: true -> only 30m because 7:00 PM has clinic block title
+      const overrideRes = scvcc.calculateAvailabilityDuration(mockGrid, 0, 'Court 5', { allowOverride: true });
+      assert.equal(overrideRes.minutes, 30);
+      assert.equal(overrideRes.durationLabel, '30 minutes');
+    });
+
+    it('should terminate availability duration if subsequent slot has players assigned', () => {
+      const mockGrid = [
+        {
+          time: '6:30 PM',
+          courts: [
+            { court: 'Court 5', status: 'unavailable', blockTitle: null, prebookedPlayers: [] }
+          ]
+        },
+        {
+          time: '7:00 PM',
+          courts: [
+            { court: 'Court 5', status: 'booked', blockTitle: null, prebookedPlayers: ['John Doe'] }
+          ]
+        }
+      ];
+
+      const overrideRes = scvcc.calculateAvailabilityDuration(mockGrid, 0, 'Court 5', { allowOverride: true });
+      assert.equal(overrideRes.minutes, 30);
+    });
+
+    it('should return 90 minutes when 3 consecutive slots are unblocked with no title and no players', () => {
+      const mockGrid = [
+        {
+          time: '6:30 PM',
+          courts: [
+            { court: 'Court 5', status: 'unavailable', blockTitle: null, prebookedPlayers: [] }
+          ]
+        },
+        {
+          time: '7:00 PM',
+          courts: [
+            { court: 'Court 5', status: 'unavailable', blockTitle: null, prebookedPlayers: [] }
+          ]
+        },
+        {
+          time: '7:30 PM',
+          courts: [
+            { court: 'Court 5', status: 'unavailable', blockTitle: null, prebookedPlayers: [] }
+          ]
+        }
+      ];
+
+      const overrideRes = scvcc.calculateAvailabilityDuration(mockGrid, 0, 'Court 5', { allowOverride: true });
+      assert.equal(overrideRes.minutes, 90);
+      assert.equal(overrideRes.durationLabel, '90 minutes');
+    });
+
+    it('bookCourt should reject specifically requested court if only 30m is available before clinic and minAvailableMinutes is 90', async () => {
+      const origCheck = scvcc.checkCourtAvailability;
+      scvcc.checkCourtAvailability = async () => ({
+        success: true,
+        slots: [{
+          time: '6:30 PM',
+          courts: [
+            {
+              court: 'Court 5',
+              status: 'unavailable',
+              availableMinutes: 0,
+              overrideAvailableMinutes: 30, // only 30m before clinic
+              blockTitle: null,
+              prebookedPlayers: [],
+              resourceId: '5'
+            }
+          ]
+        }]
+      });
+
+      try {
+        const res = await scvcc.bookCourt({
+          when: 'tomorrow',
+          time: '6:30pm',
+          court: 'Court 5',
+          minAvailableMinutes: 90
+        });
+        assert.equal(res.success, false);
+        assert.match(res.message, /No courts are available at SCVCC/);
+      } finally {
+        scvcc.checkCourtAvailability = origCheck;
+      }
+    });
+
+    it('bookCourt should book via supervisor override when court has 90m unblocked with no title and no players', async () => {
+      const origCheck = scvcc.checkCourtAvailability;
+      const origAuthFetch = scvcc.authFetch;
+      scvcc.checkCourtAvailability = async () => ({
+        success: true,
+        slots: [{
+          time: '6:30 PM',
+          courts: [
+            {
+              court: 'Court 5',
+              status: 'unavailable',
+              availableMinutes: 0,
+              overrideAvailableMinutes: 90, // full 90m unblocked
+              blockTitle: null,
+              prebookedPlayers: [],
+              resourceId: '5'
+            }
+          ]
+        }]
+      });
+
+      let capturedDialogUrl = null;
+      scvcc.authFetch = async (url) => {
+        capturedDialogUrl = url;
+        throw new Error('STOP_AFTER_SELECTION');
+      };
+
+      try {
+        await scvcc.bookCourt({
+          when: 'tomorrow',
+          time: '6:30pm',
+          court: 'Court 5',
+          minAvailableMinutes: 90
+        });
+      } catch (err) {
+        if (err.message !== 'STOP_AFTER_SELECTION') throw err;
+      } finally {
+        scvcc.checkCourtAvailability = origCheck;
+        scvcc.authFetch = origAuthFetch;
+      }
+
+      assert.ok(capturedDialogUrl);
+      assert.ok(capturedDialogUrl.includes('resourceID=5'), 'Should select Court 5 when 90m unblocked is available');
+    });
+
+    it('bookCourt should never use supervisor override if slot has a block title (booked by somebody else)', async () => {
+      const origCheck = scvcc.checkCourtAvailability;
+      scvcc.checkCourtAvailability = async () => ({
+        success: true,
+        slots: [{
+          time: '6:30 PM',
+          courts: [
+            {
+              court: 'Court 5',
+              status: 'unavailable',
+              availableMinutes: 0,
+              overrideAvailableMinutes: 0,
+              blockTitle: 'Tennis Clinic',
+              prebookedPlayers: [],
+              resourceId: '5'
+            }
+          ]
+        }]
+      });
+
+      try {
+        const res = await scvcc.bookCourt({
+          when: 'tomorrow',
+          time: '6:30pm',
+          court: 'Court 5',
+          minAvailableMinutes: 90
+        });
+        assert.equal(res.success, false);
+      } finally {
+        scvcc.checkCourtAvailability = origCheck;
+      }
+    });
+  });
+
+    describe('getCourtBookings spanning multi-slot reservations', () => {
     it('should show courts spanning across the entire duration in all 30m slots', async () => {
       const origAuthFetch = scvcc.authFetch;
       const testChatId = '120363403838804497@g.us';

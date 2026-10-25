@@ -2,6 +2,7 @@ process.env.NODE_ENV = 'test';
 const { describe, it } = require('node:test');
 const assert = require('node:assert/strict');
 const scvcc = require('../lib/scvcc');
+const groupsConfig = require('../lib/groupsConfig');
 const {
   isValidPlayerCount,
   getNextValidPlayerCount,
@@ -26,7 +27,8 @@ const {
   getPollDayWord,
   checkAndSendPollReminders,
   handleTriggerReminder,
-  pollStatusText
+  pollStatusText,
+  createMatchPoll
 } = require('../lib/commands/pollCommands');
 
 describe('pollCommands', () => {
@@ -546,6 +548,9 @@ describe('pollCommands', () => {
         { name: 'Player 9', voters: ['1234567890@s.whatsapp.net'] }
       ];
 
+      const origGetBookingNotifs = groupsConfig.getBookingNotifications;
+      groupsConfig.getBookingNotifications = () => ['admin1@s.whatsapp.net'];
+
       try {
         await handleOnDemandCourtBooking(mockSock, 'poll102', pollState, aggregated, {});
 
@@ -557,10 +562,14 @@ describe('pollCommands', () => {
         assert.equal(pollState.size, 8);
         assert.equal(pollState.onDemandBookingInProgress, false);
 
-        // Group was notified Court 1 is unavailable and only 8 voting slots valid
-        const courtFailMsg = messagesSent.find(m => m.msg?.text?.includes('Court 1') && m.msg?.text?.includes('8 voting slots'));
-        assert.ok(courtFailMsg, 'Group was notified of court unavailability with valid slots count');
-        assert.equal(courtFailMsg.msg.text, '⚠️ *Court 1* is no longer available. Only *8 voting slots* are valid for this match poll.');
+        // Message must NOT be posted to the group chat
+        const courtFailMsgInGroup = messagesSent.find(m => m.jid === 'group1@g.us' && m.msg?.text?.includes('Court 1') && m.msg?.text?.includes('8 voting slots'));
+        assert.equal(courtFailMsgInGroup, undefined, 'Court unavailable message must NOT be sent to the group chat');
+
+        // Message MUST be sent to bookingNotifications list
+        const notifMsg = messagesSent.find(m => m.jid === 'admin1@s.whatsapp.net' && m.msg?.text?.includes('Court 1') && m.msg?.text?.includes('8 voting slots'));
+        assert.ok(notifMsg, 'Recipient in bookingNotifications list was notified');
+        assert.equal(notifMsg.msg.text, '⚠️ *Court 1* is no longer available. Only *8 voting slots* are valid for this match poll.');
 
         // Voter on Player 9 was tagged that slot is no longer valid
         const invalidSlotMsg = messagesSent.find(m => m.msg?.text?.includes('1234567890'));
@@ -569,6 +578,7 @@ describe('pollCommands', () => {
       } finally {
         scvcc.bookCourt = originalBookCourt;
         scvcc.checkCourtAvailability = originalCheckAvail;
+        groupsConfig.getBookingNotifications = origGetBookingNotifs;
       }
     });
     it('should correctly calculate player openings when 2 courts are prebooked', () => {
@@ -1709,6 +1719,171 @@ describe('pollCommands', () => {
         assert.match(status, /Play time: unknown/i);
         assert.match(status, /Reminders: Scheduled for day before match at 12:00 PM/i);
       });
+    });
+  });
+
+  describe('createMatchPoll court availability filtering with 90m requirement', () => {
+    it('should NOT list court as available or create voting slots for it if subsequent slot has clinic (< 90m available)', async () => {
+      const origCheck = scvcc.checkCourtAvailability;
+      const origBookings = scvcc.getCourtBookings;
+
+      // Mock 6:30 PM availability: Court 2 & 3 prebooked, Court 5 has only 30m before clinic
+      scvcc.checkCourtAvailability = async () => ({
+        success: true,
+        slots: [{
+          time: '6:30 PM',
+          courts: [
+            { court: 'Court 2', status: 'prebooked', prebookedBy: 'Pramod Immaneni', prebookedFullName: 'Pramod Immaneni', durationMins: 90 },
+            { court: 'Court 3', status: 'prebooked', prebookedBy: 'Conrad Rodricks', prebookedFullName: 'Conrad Rodricks', durationMins: 90 },
+            {
+              court: 'Court 5',
+              status: 'unavailable',
+              availableMinutes: 0,
+              overrideAvailableMinutes: 30, // only 30m before clinic at 7pm!
+              blockTitle: null,
+              prebookedPlayers: []
+            }
+          ]
+        }]
+      });
+
+      scvcc.getCourtBookings = async () => ({
+        success: true,
+        bookings: [
+          { court: 'Court 2', time: '6:30 PM', durationMins: 90, isPrebooked: true, prebookedBy: 'Pramod Immaneni' },
+          { court: 'Court 3', time: '6:30 PM', durationMins: 90, isPrebooked: true, prebookedBy: 'Conrad Rodricks' },
+          { court: 'Court 5', time: '7:00 PM', durationMins: 60, type: '3.0+ Live Ball Clinic', blockTitle: '3.0+ Live Ball Clinic' }
+        ]
+      });
+
+      let sentPoll = null;
+      const mockSock = {
+        sendMessage: async (jid, content) => {
+          sentPoll = content;
+          return { key: { id: 'poll_clinic_test', remoteJid: jid }, message: content };
+        }
+      };
+
+      const activePolls = new Map();
+      try {
+        const res = await createMatchPoll(
+          mockSock,
+          '120363403838804497@g.us',
+          'auto',
+          'Tomorrow 6:30pm',
+          null,
+          '6:30pm',
+          null, // creatorName
+          null,
+          false,
+          null,
+          false,
+          false, // isCommand
+          false,
+          true,  // checkCourts
+          false,
+          false,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          { activePolls, messageStore: new Map(), latestPollIdByChat: new Map(), persistPolls: () => {} }
+        );
+
+        assert.equal(res.err, null);
+        const storedPoll = activePolls.get('poll_clinic_test');
+        assert.ok(storedPoll);
+        // Only Courts 2 & 3 (8 capacity), Court 5 must NOT be included because it only has 30m available!
+        assert.equal(storedPoll.size, 8, 'Poll size must be 8 slots, Court 5 with 30m must NOT expand to 12 slots');
+        assert.equal(storedPoll.options.length, 8, 'Options count must be 8');
+        assert.equal(sentPoll.poll.name.includes('Court 5 - Available'), false, 'Poll title must NOT say Court 5 is available');
+        assert.ok(!storedPoll.unbookedCourts || storedPoll.unbookedCourts.length === 0, 'unbookedCourts must NOT include Court 5');
+      } finally {
+        scvcc.checkCourtAvailability = origCheck;
+        scvcc.getCourtBookings = origBookings;
+      }
+    });
+
+    it('should list court as available and create voting slots if court has full 90m unblocked (override eligible)', async () => {
+      const origCheck = scvcc.checkCourtAvailability;
+      const origBookings = scvcc.getCourtBookings;
+
+      scvcc.checkCourtAvailability = async () => ({
+        success: true,
+        slots: [{
+          time: '6:30 PM',
+          courts: [
+            { court: 'Court 2', status: 'prebooked', prebookedBy: 'Pramod Immaneni', prebookedFullName: 'Pramod Immaneni', durationMins: 90 },
+            { court: 'Court 3', status: 'prebooked', prebookedBy: 'Conrad Rodricks', prebookedFullName: 'Conrad Rodricks', durationMins: 90 },
+            {
+              court: 'Court 5',
+              status: 'unavailable',
+              availableMinutes: 0,
+              overrideAvailableMinutes: 90, // full 90m unblocked
+              blockTitle: null,
+              prebookedPlayers: []
+            }
+          ]
+        }]
+      });
+
+      scvcc.getCourtBookings = async () => ({
+        success: true,
+        bookings: [
+          { court: 'Court 2', time: '6:30 PM', durationMins: 90, isPrebooked: true, prebookedBy: 'Pramod Immaneni' },
+          { court: 'Court 3', time: '6:30 PM', durationMins: 90, isPrebooked: true, prebookedBy: 'Conrad Rodricks' }
+        ]
+      });
+
+      let sentPoll = null;
+      const mockSock = {
+        sendMessage: async (jid, content) => {
+          sentPoll = content;
+          return { key: { id: 'poll_override_test', remoteJid: jid }, message: content };
+        }
+      };
+
+      const activePolls = new Map();
+      try {
+        const res = await createMatchPoll(
+          mockSock,
+          '120363403838804497@g.us',
+          'auto',
+          'Tomorrow 6:30pm',
+          null,
+          '6:30pm',
+          null,
+          null,
+          false,
+          null,
+          false,
+          false,
+          false,
+          true,  // checkCourts
+          false,
+          false,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          { activePolls, messageStore: new Map(), latestPollIdByChat: new Map(), persistPolls: () => {} }
+        );
+
+        assert.equal(res.err, null);
+        const storedPoll = activePolls.get('poll_override_test');
+        assert.ok(storedPoll);
+        assert.equal(storedPoll.size, 12, 'Poll size must be 12 slots when Court 5 has 90m unblocked');
+        assert.equal(sentPoll.poll.name.includes('Court 5 - Available'), true, 'Poll title should say Court 5 is available');
+        assert.equal(storedPoll.unbookedCourts.length, 1);
+        assert.equal(storedPoll.unbookedCourts[0].court, 'Court 5');
+      } finally {
+        scvcc.checkCourtAvailability = origCheck;
+        scvcc.getCourtBookings = origBookings;
+      }
     });
   });
 });
