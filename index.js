@@ -1210,19 +1210,21 @@ async function startBot() {
           messageStore.set(storeKey(remoteJid, pollId), msg.message);
 
           const hasExplicitDayInPollTitle = /\b(today|tonight|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tue|wed|thu|fri|sat|sun)\b/i.test(pollName);
+          const hasTimeSpecified = Boolean(interpretation.timeWord) || pollCommands.hasTimeSpecifiedInTitle(pollName);
           const effectiveDayWord = interpretation.dayWord || null;
-          const playAt = resolvePlayDateTime(effectiveDayWord, interpretation.timeWord);
+          const effectiveTimeWord = hasTimeSpecified ? (interpretation.timeWord || null) : null;
+          const playAt = hasTimeSpecified ? resolvePlayDateTime(effectiveDayWord, effectiveTimeWord) : null;
           const sjNow = getSanJoseNow();
-          const playParts = getSanJoseParts(playAt);
+          const playParts = playAt ? getSanJoseParts(playAt) : null;
           const nowParts = getSanJoseParts(sjNow);
-          const isTomorrow = playParts.day !== nowParts.day || playParts.month !== nowParts.month;
+          const isTomorrow = playParts ? (playParts.day !== nowParts.day || playParts.month !== nowParts.month) : false;
 
           let resolvedWhen = interpretation.when || pollName;
           if (isTomorrow && !hasExplicitDayInPollTitle) {
             if (resolvedWhen && !/\b(today|tomorrow|tonight|monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tue|wed|thu|fri|sat|sun)\b/i.test(resolvedWhen)) {
               resolvedWhen = `Tomorrow ${resolvedWhen}`;
-            } else if (interpretation.timeWord && !/\b(today|tomorrow|tonight|monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tue|wed|thu|fri|sat|sun)\b/i.test(resolvedWhen)) {
-              resolvedWhen = `Tomorrow ${interpretation.timeWord}`;
+            } else if (effectiveTimeWord && !/\b(today|tomorrow|tonight|monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tue|wed|thu|fri|sat|sun)\b/i.test(resolvedWhen)) {
+              resolvedWhen = `Tomorrow ${effectiveTimeWord}`;
             } else if (!resolvedWhen) {
               resolvedWhen = 'Tomorrow';
             }
@@ -1230,8 +1232,10 @@ async function startBot() {
 
           const pollType = interpretation.type || (options.some((opt) => /^yes$/i.test(opt.trim())) ? 'opt_in' : 'manual');
           const pollSize = interpretation.size !== undefined && interpretation.size !== null ? interpretation.size : (pollType === 'opt_in' ? null : (options.length > 0 ? options.length : null));
-          const initialManualHours = (playAt.getTime() - Date.now()) / (60 * 60 * 1000);
-          const manualSentReminders = [1, 2, 4, 8, 16, 24, 32, 64].filter((h) => h > initialManualHours && h > 1);
+          const initialManualHours = playAt ? ((playAt.getTime() - Date.now()) / (60 * 60 * 1000)) : 0;
+          const manualSentReminders = playAt
+            ? [1, 2, 4, 8, 16, 24, 32, 64].filter((h) => h > initialManualHours && h > 1)
+            : (effectiveDayWord ? [] : [1, 2, 4, 8, 16, 24, 32, 64]);
 
           activePolls.set(pollId, {
             remoteJid,
@@ -1240,7 +1244,9 @@ async function startBot() {
             size: pollSize,
             type: pollType,
             when: resolvedWhen,
-            playAt: playAt.toISOString(),
+            dayWord: effectiveDayWord,
+            playAt: playAt ? playAt.toISOString() : null,
+            hasTimeInTitle: hasTimeSpecified,
             createdAt: new Date().toISOString(),
             status: 'active',
             isManual: true,
@@ -1452,6 +1458,7 @@ module.exports = {
   tryDecryptMessageEdit,
   extractText,
   resolveManualPollPlayers: pollCommands.resolveManualPollPlayers,
+  hasTimeSpecifiedInTitle: pollCommands.hasTimeSpecifiedInTitle,
   handleGroupLineup,
   getResponse
 };

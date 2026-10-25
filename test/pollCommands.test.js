@@ -17,7 +17,16 @@ const {
   checkCourtReleasesForPoll,
   checkCourtReleases,
   getPollVoters,
-  sendPollReminder
+  sendPollReminder,
+  hasTimeSpecifiedInTitle,
+  buildUntimedPollReminderText,
+  pollTitleIndicatesGame,
+  getDayBefore12pmReminderTime,
+  getDayBefore6pmReminderTime,
+  getPollDayWord,
+  checkAndSendPollReminders,
+  handleTriggerReminder,
+  pollStatusText
 } = require('../lib/commands/pollCommands');
 
 describe('pollCommands', () => {
@@ -1417,6 +1426,289 @@ describe('pollCommands', () => {
         scvcc.bookCourt = originalBookCourt;
         scvcc.checkCourtAvailability = originalCheckAvail;
       }
+    });
+  });
+  describe("manual poll with no time specified", () => {
+    describe("hasTimeSpecifiedInTitle", () => {
+      it("should return true when time is specified in the title or poll object", () => {
+        assert.equal(hasTimeSpecifiedInTitle("Tennis 7pm"), true);
+        assert.equal(hasTimeSpecifiedInTitle("Tennis tomorrow 9:30am"), true);
+        assert.equal(hasTimeSpecifiedInTitle("Sunday 6:00"), true);
+        assert.equal(hasTimeSpecifiedInTitle("Saturday morning tennis"), true);
+        assert.equal(hasTimeSpecifiedInTitle("Tennis @ 8am"), true);
+        assert.equal(hasTimeSpecifiedInTitle("Tennis at 7"), true);
+        assert.equal(hasTimeSpecifiedInTitle("Tennis 6 PM"), true);
+        assert.equal(hasTimeSpecifiedInTitle("Tennis 19:00"), true);
+        assert.equal(hasTimeSpecifiedInTitle({ name: "Match 8:30am" }), true);
+        assert.equal(hasTimeSpecifiedInTitle({ hasTimeInTitle: true }), true);
+      });
+
+      it("should return false when no time is specified in the title or poll object", () => {
+        assert.equal(hasTimeSpecifiedInTitle("Tennis Saturday"), false);
+        assert.equal(hasTimeSpecifiedInTitle("Tennis Sunday"), false);
+        assert.equal(hasTimeSpecifiedInTitle("Tennis Tomorrow"), false);
+        assert.equal(hasTimeSpecifiedInTitle("Tennis Today"), false);
+        assert.equal(hasTimeSpecifiedInTitle("Tennis"), false);
+        assert.equal(hasTimeSpecifiedInTitle("Match Poll"), false);
+        assert.equal(hasTimeSpecifiedInTitle("Tennis @ SCVCC"), false);
+        assert.equal(hasTimeSpecifiedInTitle("Sunday tennis at SCVCC"), false);
+        assert.equal(hasTimeSpecifiedInTitle("Tennis 4 spots"), false);
+        assert.equal(hasTimeSpecifiedInTitle("Court 2 Tennis"), false);
+        assert.equal(hasTimeSpecifiedInTitle("Tennis 10/24"), false);
+        assert.equal(hasTimeSpecifiedInTitle("Singles this weekend"), false);
+        assert.equal(hasTimeSpecifiedInTitle({ name: "Tennis Sunday", playAt: null }), false);
+        assert.equal(hasTimeSpecifiedInTitle({ hasTimeInTitle: false }), false);
+        assert.equal(hasTimeSpecifiedInTitle({ playAt: null }), false);
+        assert.equal(hasTimeSpecifiedInTitle({ playAt: "unknown" }), false);
+      });
+    });
+
+    describe("reminders for manual polls without time", () => {
+      it("should return false and send no reminder if no day and no time are specified", async () => {
+        const messagesSent = [];
+        const mockSock = {
+          user: { id: "1234567890@s.whatsapp.net" },
+          sendMessage: async (jid, msg) => { messagesSent.push({ jid, msg }); }
+        };
+
+        const manualPollNoDayNoTime = {
+          name: "Tennis 4 spots",
+          isManual: true,
+          status: "active",
+          remoteJid: "group1@g.us",
+          when: null,
+          playAt: null,
+          options: ["Player 1", "Player 2", "Player 3", "Player 4"],
+          type: "manual",
+          voteBuffer: new Map()
+        };
+
+        const sent = await sendPollReminder(mockSock, "poll_noday", manualPollNoDayNoTime, false, {
+          messageStore: new Map()
+        });
+        assert.equal(sent, false);
+        assert.equal(messagesSent.length, 0);
+      });
+
+      it("should use neutral terms and avoid tennis/match wording when manual poll title does not indicate a game", () => {
+        assert.equal(pollTitleIndicatesGame("Tennis Sunday"), true);
+        assert.equal(pollTitleIndicatesGame("Sunday Match"), true);
+        assert.equal(pollTitleIndicatesGame("Game tomorrow"), true);
+        assert.equal(pollTitleIndicatesGame("Doubles Saturday"), true);
+        assert.equal(pollTitleIndicatesGame("Court 2"), true);
+        assert.equal(pollTitleIndicatesGame("🎾 Sunday"), true);
+        assert.equal(pollTitleIndicatesGame("Sunday"), false);
+        assert.equal(pollTitleIndicatesGame("Sunday 6pm"), false);
+        assert.equal(pollTitleIndicatesGame("Tomorrow"), false);
+        assert.equal(pollTitleIndicatesGame("Tomorrow 7pm"), false);
+        assert.equal(pollTitleIndicatesGame("Weekend"), false);
+
+        // Untimed neutral reminder (Opt-in)
+        const neutralOptIn = { name: "Sunday", isManual: true, when: "Sunday", playAt: null };
+        const neutralOptInText = buildUntimedPollReminderText(neutralOptIn, 0, 0, "Alice, Bob", true, 2);
+        assert.match(neutralOptInText, /Poll Reminder for Tomorrow!/);
+        assert.match(neutralOptInText, /for tomorrow/);
+        assert.equal(/tennis/i.test(neutralOptInText), false, "Must not contain tennis");
+        assert.equal(/match/i.test(neutralOptInText), false, "Must not contain match");
+        assert.equal(/court/i.test(neutralOptInText), false, "Must not contain court");
+        assert.equal(neutralOptInText.includes("🎾"), false, "Must not contain tennis emoji");
+
+        // Untimed neutral reminder (Fixed spots)
+        const neutralFixed = { name: "Sunday", isManual: true, when: "Sunday", playAt: null };
+        const neutralFixedText = buildUntimedPollReminderText(neutralFixed, 2, 4, "Alice, Bob", false, 0);
+        assert.match(neutralFixedText, /Poll Reminder for Tomorrow!/);
+        assert.match(neutralFixedText, /The poll for tomorrow still has/);
+        assert.equal(/tennis/i.test(neutralFixedText), false, "Must not contain tennis");
+        assert.equal(/match/i.test(neutralFixedText), false, "Must not contain match");
+        assert.equal(/court/i.test(neutralFixedText), false, "Must not contain court");
+        assert.equal(neutralFixedText.includes("🎾"), false, "Must not contain tennis emoji");
+
+        // Timed neutral reminder (Fixed spots)
+        const neutralTimed = { name: "Sunday 6pm", isManual: true, when: "Sunday 6pm", playAt: "2026-10-25T01:00:00.000Z" };
+        const neutralTimedText = buildPollReminderText(8, neutralTimed, 2, 4, "Alice, Bob", false, 0, 8);
+        assert.match(neutralTimedText, /Hours to Go!/);
+        assert.equal(/tennis/i.test(neutralTimedText), false, "Must not contain tennis");
+        assert.equal(/match/i.test(neutralTimedText), false, "Must not contain match");
+        assert.equal(/court/i.test(neutralTimedText), false, "Must not contain court");
+        assert.equal(neutralTimedText.includes("🎾"), false, "Must not contain tennis emoji");
+
+        // Timed neutral reminder (Opt-in)
+        const neutralTimedOptIn = { name: "Sunday 6pm", isManual: true, when: "Sunday 6pm", playAt: "2026-10-25T01:00:00.000Z" };
+        const neutralTimedOptInText = buildPollReminderText(8, neutralTimedOptIn, 0, 0, "Alice, Bob", true, 2, 8);
+        assert.match(neutralTimedOptInText, /Hours to Go!/);
+        assert.equal(/tennis/i.test(neutralTimedOptInText), false, "Must not contain tennis");
+        assert.equal(/match/i.test(neutralTimedOptInText), false, "Must not contain match");
+        assert.equal(/court/i.test(neutralTimedOptInText), false, "Must not contain court");
+        assert.equal(neutralTimedOptInText.includes("🎾"), false, "Must not contain tennis emoji");
+      });
+
+      it("should format untimed reminder text mentioning tomorrow and not mentioning hours to event", () => {
+        const optInPoll = { name: "Tennis Sunday", isManual: true, when: "Sunday", playAt: null };
+        const optInText = buildUntimedPollReminderText(optInPoll, 0, 0, "Alice, Bob", true, 2);
+        assert.match(optInText, /Match Alert for Tomorrow!/);
+        assert.match(optInText, /tomorrow's match/);
+        assert.equal(/\b\d+\s*(?:hours|hrs|minutes|mins)\b/i.test(optInText), false, "Must not mention hours or minutes to event");
+
+        const fixedPoll = { name: "Tennis Sunday", isManual: true, when: "Sunday", playAt: null };
+        const fixedText = buildUntimedPollReminderText(fixedPoll, 2, 4, "Alice, Bob", false, 0);
+        assert.match(fixedText, /Match Alert for Tomorrow!/);
+        assert.match(fixedText, /The match poll for tomorrow still has/);
+        assert.match(fixedText, /\*2 open spots\* \(2\/4 needed\)/);
+        assert.equal(/\b\d+\s*(?:hours|hrs|minutes|mins)\b/i.test(fixedText), false, "Must not mention hours or minutes to event");
+      });
+
+      it("should calculate reminder time at 12:00 PM afternoon on the day before the match", () => {
+        // Base: Saturday 2026-10-24 9:00 AM (Pacific)
+        const saturdayMorning = new Date("2026-10-24T16:00:00.000Z"); // 9:00 AM PDT
+        const pollState = {
+          name: "Tennis Sunday",
+          dayWord: "Sunday",
+          when: "Sunday",
+          createdAt: saturdayMorning.toISOString(),
+          isManual: true,
+          playAt: null
+        };
+
+        const info = getDayBefore12pmReminderTime(pollState, saturdayMorning);
+        assert.ok(info);
+        // Reminder should be Saturday 2026-10-24 at 12:00 PM San Jose time (PDT = UTC-7 -> 2026-10-24T19:00:00Z)
+        assert.equal(info.reminderDate.toISOString(), "2026-10-24T19:00:00.000Z");
+      });
+
+      it("should send day-before 12pm reminder when day is provided and now is 12pm on the day before", async () => {
+        const messagesSent = [];
+        const mockSock = {
+          user: { id: "1234567890@s.whatsapp.net" },
+          sendMessage: async (jid, msg, opts) => { messagesSent.push({ jid, msg, opts }); }
+        };
+
+        // Poll created at 9am on Saturday Oct 24 for Sunday
+        const createdTime = new Date("2026-10-24T16:00:00.000Z").toISOString();
+        const activePolls = new Map();
+        activePolls.set("poll_sun", {
+          name: "Tennis Sunday",
+          isManual: true,
+          status: "active",
+          remoteJid: "group1@g.us",
+          dayWord: "Sunday",
+          when: "Sunday",
+          playAt: null,
+          createdAt: createdTime,
+          options: ["Player 1", "Player 2", "Player 3", "Player 4"],
+          size: 4,
+          type: "manual",
+          sentReminders: [],
+          voteBuffer: new Map()
+        });
+
+        const messageStore = new Map();
+        messageStore.set("group1@g.us:poll_sun", {
+          pollCreationMessage: { name: "Tennis Sunday", options: [{ optionName: "Player 1" }] }
+        });
+
+        // Saturday Oct 24, 12:05 PM PDT (19:05Z on Oct 24)
+        const sat1205pm = new Date("2026-10-24T19:05:00.000Z").getTime();
+
+        await checkAndSendPollReminders(mockSock, {
+          activePolls,
+          persistPolls: () => {},
+          messageStore
+        }, sat1205pm);
+
+        assert.equal(messagesSent.length, 1);
+        assert.match(messagesSent[0].msg.text, /Match Alert for Tomorrow!/);
+        assert.match(messagesSent[0].msg.text, /The match poll for tomorrow still has/);
+        assert.equal(/\b\d+\s*(?:hours|hrs)\b/i.test(messagesSent[0].msg.text), false);
+        assert.ok(activePolls.get("poll_sun").sentReminders.includes("day_before_12pm"));
+
+        // Sweeping again should not send duplicates
+        messagesSent.length = 0;
+        await checkAndSendPollReminders(mockSock, {
+          activePolls,
+          persistPolls: () => {},
+          messageStore
+        }, sat1205pm);
+        assert.equal(messagesSent.length, 0);
+      });
+
+      it("should not send day-before reminder if now is before 12pm on the day before", async () => {
+        const messagesSent = [];
+        const mockSock = {
+          user: { id: "1234567890@s.whatsapp.net" },
+          sendMessage: async (jid, msg) => { messagesSent.push({ jid, msg }); }
+        };
+
+        const activePolls = new Map();
+        activePolls.set("poll_sun", {
+          name: "Tennis Sunday",
+          isManual: true,
+          status: "active",
+          remoteJid: "group1@g.us",
+          dayWord: "Sunday",
+          when: "Sunday",
+          playAt: null,
+          createdAt: new Date("2026-10-24T16:00:00.000Z").toISOString(), // 9am Sat
+          options: ["Player 1", "Player 2", "Player 3", "Player 4"],
+          size: 4,
+          type: "manual",
+          sentReminders: [],
+          voteBuffer: new Map()
+        });
+
+        // Time: Saturday Oct 24, 10:00 AM PDT (before 12pm)
+        const sat10am = new Date("2026-10-24T17:00:00.000Z").getTime();
+
+        await checkAndSendPollReminders(mockSock, {
+          activePolls,
+          persistPolls: () => {},
+          messageStore: new Map()
+        }, sat10am);
+
+        assert.equal(messagesSent.length, 0, "Should not send reminder before 12pm on day before");
+      });
+
+      it("should return explanation when user explicitly triggers reminder for manual poll with no day and no time", async () => {
+        const activePolls = new Map();
+        activePolls.set("poll_noday", {
+          name: "Tennis 4 spots",
+          isManual: true,
+          status: "active",
+          remoteJid: "group1@g.us",
+          when: null,
+          playAt: null,
+          options: ["Player 1", "Player 2"],
+          type: "manual",
+          voteBuffer: new Map()
+        });
+
+        const res = await handleTriggerReminder(null, "group1@g.us", "Alice", "poll_noday", {
+          activePolls,
+          recurringPolls: new Map(),
+          persistPolls: () => {}
+        });
+
+        assert.match(res, /no match time or day was specified/i);
+      });
+
+      it("should show Scheduled for day before match at 6:00 PM in pollStatusText for manual poll with day", () => {
+        const pollState = {
+          name: "Tennis Sunday",
+          isManual: true,
+          status: "active",
+          remoteJid: "group1@g.us",
+          when: "Sunday",
+          dayWord: "Sunday",
+          playAt: null,
+          options: ["Yes", "No"],
+          type: "opt_in",
+          voteBuffer: new Map()
+        };
+
+        const activePolls = new Map([["p_status_test", pollState]]);
+        const status = pollStatusText("group1@g.us", { targetId: "p_status_test" }, { activePolls, recurringPolls: new Map(), messageStore: new Map() });
+        assert.match(status, /Play time: unknown/i);
+        assert.match(status, /Reminders: Scheduled for day before match at 12:00 PM/i);
+      });
     });
   });
 });
