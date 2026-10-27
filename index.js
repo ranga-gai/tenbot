@@ -892,6 +892,7 @@ if (require.main === module) {
     if (botSock) {
       pollCommands.checkAndSendPollReminders(botSock, getPollContext());
       pollCommands.checkCourtReleases(botSock, getPollContext());
+      pollCommands.checkPendingLineupGenerations(botSock, getPollContext());
     }
   }, POLL_REMINDER_CHECK_INTERVAL_MS);
 

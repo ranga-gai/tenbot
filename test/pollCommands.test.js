@@ -33,8 +33,14 @@ const {
   checkAndNotifySlotConflicts,
   interpretManualPollWithLLM,
   parseModifyInstanceCommand,
-  handleModifyPollInstance
+  handleModifyPollInstance,
+  formatLineupGenDesc,
+  shouldAutoGenerateLineupOnFill,
+  checkPendingLineupGenerations,
+  buildLineupReminderText,
+  migratePollMatchupOptions
 } = require('../lib/commands/pollCommands');
+const { extractCommonFlags } = require('../lib/recurringPolls');
 
 describe('pollCommands', () => {
   describe('isValidPlayerCount', () => {
@@ -2116,6 +2122,563 @@ describe('pollCommands', () => {
       pollState.slotCheck = false;
       const status2 = pollStatusText("group1@g.us", { targetId: "p_status_slotcheck" }, { activePolls, recurringPolls: new Map(), messageStore: new Map() });
       assert.match(status2, /Slot check: Disabled/i);
+    });
+  });
+
+  describe("lineupGeneration configuration option for polls", () => {
+    it("should default lineupGeneration to 'filled' and lineupLeadTime to 30 on automatic match polls", async () => {
+      const activePolls = new Map();
+      const mockSock = {
+        sendMessage: async () => ({ key: { id: "msg_lineup_test" } })
+      };
+      const context = {
+        activePolls,
+        recurringPolls: new Map(),
+        persistPolls: () => {},
+        latestPollIdByChat: new Map()
+      };
+      const res = await createMatchPoll(
+        mockSock,
+        "group1@g.us",
+        4,
+        "Tomorrow 7pm",
+        "tomorrow",
+        "7pm",
+        "Alice",
+        "alice@s.whatsapp.net",
+        true,
+        null,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        context
+      );
+      assert.equal(res.lineupGeneration, "filled");
+      assert.equal(res.lineupLeadTime, 30);
+
+      const stored = activePolls.get(res.pollId);
+      assert.equal(stored.lineupGeneration, "filled");
+      assert.equal(stored.lineupLeadTime, 30);
+      assert.equal(stored.manualLineupPosted, false);
+    });
+
+    it("should set lineupGeneration to 'none' when noMatchups is true", async () => {
+      const activePolls = new Map();
+      const mockSock = {
+        sendMessage: async () => ({ key: { id: "msg_lineup_none" } })
+      };
+      const context = {
+        activePolls,
+        recurringPolls: new Map(),
+        persistPolls: () => {},
+        latestPollIdByChat: new Map()
+      };
+      const res = await createMatchPoll(
+        mockSock,
+        "group1@g.us",
+        4,
+        "Tomorrow 7pm",
+        "tomorrow",
+        "7pm",
+        "Alice",
+        "alice@s.whatsapp.net",
+        true,
+        null,
+        false,
+        false,
+        true, // noMatchups
+        false,
+        false,
+        false,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        context
+      );
+      assert.equal(res.lineupGeneration, "none");
+      const stored = activePolls.get(res.pollId);
+      assert.equal(stored.lineupGeneration, "none");
+    });
+
+    it("should support explicit lineupGeneration: 'fallback' and custom lineupLeadTime", async () => {
+      const activePolls = new Map();
+      const mockSock = {
+        sendMessage: async () => ({ key: { id: "msg_lineup_bpt" } })
+      };
+      const context = {
+        activePolls,
+        recurringPolls: new Map(),
+        persistPolls: () => {},
+        latestPollIdByChat: new Map()
+      };
+      const res = await createMatchPoll(
+        mockSock,
+        "group1@g.us",
+        4,
+        "Tomorrow 7pm",
+        "tomorrow",
+        "7pm",
+        "Alice",
+        "alice@s.whatsapp.net",
+        true,
+        null,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        context,
+        { lineupGeneration: "fallback", lineupLeadTime: 90 }
+      );
+      assert.equal(res.lineupGeneration, "fallback");
+      assert.equal(res.lineupLeadTime, 90);
+      const stored = activePolls.get(res.pollId);
+      assert.equal(stored.lineupGeneration, "fallback");
+      assert.equal(stored.lineupLeadTime, 90);
+    });
+
+    it("should correctly evaluate shouldAutoGenerateLineupOnFill across the three modes", () => {
+      const playAt = new Date("2026-10-28T19:00:00Z");
+      const basePoll = {
+        playAt: playAt.toISOString(),
+        manualLineupPosted: false
+      };
+
+      // 1. filled always returns true
+      assert.equal(shouldAutoGenerateLineupOnFill({ ...basePoll, lineupGeneration: "filled" }), true);
+
+      // 2. none always returns false
+      assert.equal(shouldAutoGenerateLineupOnFill({ ...basePoll, lineupGeneration: "none" }), false);
+
+      // 3. fallback with 30 mins lead time
+      const bptPoll = { ...basePoll, lineupGeneration: "fallback", lineupLeadTime: 30 };
+
+      // 45 mins before play time: should NOT auto-generate yet
+      const fortyFiveMinsBefore = new Date(playAt.getTime() - 45 * 60000).getTime();
+      assert.equal(shouldAutoGenerateLineupOnFill(bptPoll, fortyFiveMinsBefore), false);
+
+      // 15 mins before play time (within lead time): SHOULD auto-generate if no manual lineup
+      const fifteenMinsBefore = new Date(playAt.getTime() - 15 * 60000).getTime();
+      assert.equal(shouldAutoGenerateLineupOnFill(bptPoll, fifteenMinsBefore), true);
+
+      // 15 mins before play time, but manual lineup was posted: should NOT auto-generate
+      assert.equal(shouldAutoGenerateLineupOnFill({ ...bptPoll, manualLineupPosted: true }, fifteenMinsBefore), false);
+    });
+
+    it("checkPendingLineupGenerations should trigger matchups when deadline reached and no manual lineup posted", async () => {
+      const playAt = new Date(Date.now() + 15 * 60 * 1000); // 15 mins from now
+      let messageSent = null;
+      const mockSock = {
+        sendMessage: async (jid, content) => {
+          messageSent = { jid, content };
+          return { key: { id: "lineup_msg" } };
+        }
+      };
+
+      const pollState = {
+        status: "filled",
+        remoteJid: "group1@g.us",
+        when: "Today 6pm",
+        playAt: playAt.toISOString(),
+        lineupGeneration: "fallback",
+        lineupLeadTime: 30, // 30 mins before play time (now is 15 mins before, so deadline passed)
+        manualLineupPosted: false,
+        size: 4,
+        type: "fixed",
+        options: ["Player 2", "Player 3", "Player 4"],
+        creator: { name: "Alice", jid: "alice@s.whatsapp.net" },
+        lastPlayers: ["Alice", "Bob", "Charlie", "David"],
+        voteBuffer: new Map()
+      };
+
+      const activePolls = new Map([["p_pending_bpt", pollState]]);
+      const context = {
+        activePolls,
+        recurringPolls: new Map(),
+        persistPolls: () => {},
+        latestPollIdByChat: new Map([["group1@g.us", "p_pending_bpt"]])
+      };
+
+      await checkPendingLineupGenerations(mockSock, context, Date.now());
+
+      assert.equal(pollState.status, "resolved");
+      assert.ok(messageSent, "Matchups message should be sent to WhatsApp group");
+      assert.match(messageSent.content.text, /Matchups|Court|Doubles|Teams/i);
+    });
+
+    describe("lineup reminders at lead time", () => {
+      it("should send a lineup reminder at lead time if mode is filled and lineup is available", async () => {
+        const playAt = new Date(Date.now() + 20 * 60 * 1000); // 20 mins from now
+        let messageSent = null;
+        const mockSock = {
+          sendMessage: async (jid, content, opts) => {
+            messageSent = { jid, content, opts };
+            return { key: { id: "rem_lineup_msg" } };
+          }
+        };
+
+        const pollState = {
+          status: "resolved",
+          remoteJid: "group1@g.us",
+          when: "Today 6pm",
+          playAt: playAt.toISOString(),
+          lineupGeneration: "filled",
+          lineupLeadTime: 30, // 30 mins lead time
+          lineupReminderSent: false,
+          lastSchedule: {
+            type: "doubles",
+            sets: [{
+              set: 1,
+              courts: [
+                { court: 1, teamA: ["Alice", "Bob"], teamB: ["Charlie", "David"] },
+                { court: 2, teamA: ["Eve", "Frank"], teamB: ["Grace", "Heidi"] }
+              ]
+            }]
+          }
+        };
+
+        const activePolls = new Map([["p_filled_rem", pollState]]);
+        const context = {
+          activePolls,
+          persistPolls: () => {}
+        };
+
+        // 1. If now is 40 mins before play time (before deadline of 30 mins): should NOT send reminder
+        const fortyMinsBefore = new Date(playAt.getTime() - 40 * 60 * 1000).getTime();
+        await checkPendingLineupGenerations(mockSock, context, fortyMinsBefore);
+        assert.equal(messageSent, null, "Should not send reminder before lead time");
+        assert.equal(pollState.lineupReminderSent, false);
+
+        // 2. If now is 20 mins before play time (within lead time): SHOULD send reminder
+        const twentyMinsBefore = new Date(playAt.getTime() - 20 * 60 * 1000).getTime();
+        await checkPendingLineupGenerations(mockSock, context, twentyMinsBefore);
+        assert.ok(messageSent, "Should send lineup reminder at lead time");
+        assert.match(messageSent.content.text, /Match Reminder/i);
+        assert.match(messageSent.content.text, /Alice & Bob vs Charlie & David/i);
+        assert.equal(pollState.lineupReminderSent, true);
+
+        // 3. Subsequent sweep should not send duplicate
+        messageSent = null;
+        await checkPendingLineupGenerations(mockSock, context, twentyMinsBefore + 5000);
+        assert.equal(messageSent, null, "Should not send duplicate reminder");
+      });
+
+      it("should send a lineup reminder for mode none if a manual lineup was published", async () => {
+        const playAt = new Date(Date.now() + 15 * 60 * 1000); // 15 mins from now
+        let messageSent = null;
+        const mockSock = {
+          sendMessage: async (jid, content) => {
+            messageSent = { jid, content };
+            return { key: { id: "rem_manual_lineup" } };
+          }
+        };
+
+        // Poll without manual lineup: should NOT send reminder
+        const pollNoManual = {
+          status: "filled",
+          remoteJid: "group1@g.us",
+          when: "Today 7pm",
+          playAt: playAt.toISOString(),
+          lineupGeneration: "none",
+          lineupLeadTime: 30,
+          manualLineupPosted: false
+        };
+
+        // Poll with manual lineup: SHOULD send reminder
+        const pollWithManual = {
+          status: "resolved",
+          remoteJid: "group1@g.us",
+          when: "Today 7pm",
+          playAt: playAt.toISOString(),
+          lineupGeneration: "none",
+          lineupLeadTime: 30,
+          manualLineupPosted: true,
+          lineupReminderSent: false,
+          lastSchedule: {
+            type: "singles",
+            sets: [{
+              set: 1,
+              courts: [{ court: 1, teamA: ["Alice"], teamB: ["Bob"] }]
+            }]
+          }
+        };
+
+        const activePolls = new Map([
+          ["p_no_manual", pollNoManual],
+          ["p_with_manual", pollWithManual]
+        ]);
+        const context = {
+          activePolls,
+          persistPolls: () => {}
+        };
+
+        await checkPendingLineupGenerations(mockSock, context, Date.now());
+        assert.ok(messageSent, "Should send reminder for poll with manual lineup");
+        assert.match(messageSent.content.text, /Alice vs Bob/i);
+        assert.equal(pollWithManual.lineupReminderSent, true);
+        assert.equal(pollNoManual.lineupReminderSent, undefined);
+      });
+
+      it("should NOT send lineup reminder if mode is fallback", async () => {
+        const playAt = new Date(Date.now() + 15 * 60 * 1000);
+        let messageSent = null;
+        const mockSock = {
+          sendMessage: async (jid, content) => {
+            messageSent = { jid, content };
+            return { key: { id: "msg" } };
+          }
+        };
+
+        const pollFallback = {
+          status: "resolved",
+          remoteJid: "group1@g.us",
+          when: "Today 8pm",
+          playAt: playAt.toISOString(),
+          lineupGeneration: "fallback",
+          lineupLeadTime: 30,
+          manualLineupPosted: true,
+          lastSchedule: {
+            type: "singles",
+            sets: [{
+              set: 1,
+              courts: [{ court: 1, teamA: ["Alice"], teamB: ["Bob"] }]
+            }]
+          }
+        };
+
+        const activePolls = new Map([["p_fallback", pollFallback]]);
+        const context = { activePolls, persistPolls: () => {} };
+
+        await checkPendingLineupGenerations(mockSock, context, Date.now());
+        assert.equal(messageSent, null, "Fallback mode should not send lineup reminder via checkPendingLineupGenerations");
+      });
+    });
+
+    it("checkPendingLineupGenerations should NOT trigger matchups if manual lineup was posted", async () => {
+      const playAt = new Date(Date.now() + 15 * 60 * 1000);
+      let messageSent = null;
+      const mockSock = {
+        sendMessage: async (jid, content) => {
+          messageSent = { jid, content };
+          return { key: { id: "lineup_msg" } };
+        }
+      };
+
+      const pollState = {
+        status: "resolved", // Already resolved by manual lineup
+        remoteJid: "group1@g.us",
+        when: "Today 6pm",
+        playAt: playAt.toISOString(),
+        lineupGeneration: "fallback",
+        lineupLeadTime: 30,
+        manualLineupPosted: true, // Manual lineup was posted
+        size: 4,
+        type: "fixed",
+        lastPlayers: ["Alice", "Bob", "Charlie", "David"]
+      };
+
+      const activePolls = new Map([["p_manual_posted", pollState]]);
+      const context = {
+        activePolls,
+        recurringPolls: new Map(),
+        persistPolls: () => {},
+        latestPollIdByChat: new Map([["group1@g.us", "p_manual_posted"]])
+      };
+
+      await checkPendingLineupGenerations(mockSock, context, Date.now());
+      assert.equal(messageSent, null, "Should not generate automatic matchups if manual lineup was posted");
+    });
+
+    it("should allow modifying lineupGeneration and lineupLeadTime with !modifyinstance / !modifypoll command", async () => {
+      const pollState = {
+        name: "Match Tomorrow 7pm",
+        when: "Tomorrow 7pm",
+        size: 4,
+        type: "fixed",
+        status: "active",
+        isManual: true,
+        lineupGeneration: "filled",
+        lineupLeadTime: 30,
+        remoteJid: "group1@g.us",
+        creator: { name: "Bob", jid: "bob@s.whatsapp.net" },
+        voteBuffer: new Map()
+      };
+      const activePolls = new Map([["p_mod_lineup", pollState]]);
+      const context = { activePolls, recurringPolls: new Map(), persistPolls: () => {} };
+
+      // Change to fallback with 90m lead time
+      const cmd1 = parseModifyInstanceCommand("!modifypoll p_mod_lineup --lineup-generation=fallback --lineup-lead-time=90m");
+      assert.equal(cmd1.updates.lineupGeneration, "fallback");
+      assert.equal(cmd1.updates.lineupLeadTime, 90);
+
+      const res1 = await handleModifyPollInstance(null, "group1@g.us", "Bob", "bob@s.whatsapp.net", cmd1.targetId, cmd1.updates, context);
+      assert.match(res1, /Lineup generation:.*Before play time/i);
+      assert.equal(pollState.lineupGeneration, "fallback");
+      assert.equal(pollState.lineupLeadTime, 90);
+
+      // Change to none
+      const cmd2 = parseModifyInstanceCommand("!modifyinstance p_mod_lineup --no-lineups");
+      assert.equal(cmd2.updates.lineupGeneration, "none");
+
+      const res2 = await handleModifyPollInstance(null, "group1@g.us", "Bob", "bob@s.whatsapp.net", cmd2.targetId, cmd2.updates, context);
+      assert.match(res2, /Lineup generation:.*None/i);
+      assert.equal(pollState.lineupGeneration, "none");
+    });
+
+    it("should display lineup generation status in pollStatusText", () => {
+      const pollState = {
+        name: "Tennis Match",
+        isManual: false,
+        status: "active",
+        remoteJid: "group1@g.us",
+        when: "Tomorrow 7pm",
+        playAt: new Date(Date.now() + 3600000).toISOString(),
+        options: ["Player 2", "Player 3", "Player 4"],
+        size: 4,
+        type: "fixed",
+        lineupGeneration: "fallback",
+        lineupLeadTime: 30,
+        voteBuffer: new Map()
+      };
+      const activePolls = new Map([["p_status_lineup", pollState]]);
+      const status1 = pollStatusText("group1@g.us", { targetId: "p_status_lineup" }, { activePolls, recurringPolls: new Map(), messageStore: new Map() });
+      assert.match(status1, /Lineup Generation: Fallback if no manual lineups posted/i);
+
+      pollState.lineupGeneration = "filled";
+      const status2 = pollStatusText("group1@g.us", { targetId: "p_status_lineup" }, { activePolls, recurringPolls: new Map(), messageStore: new Map() });
+      assert.match(status2, /Lineup Generation: Filled/i);
+
+      pollState.lineupGeneration = "none";
+      const status3 = pollStatusText("group1@g.us", { targetId: "p_status_lineup" }, { activePolls, recurringPolls: new Map(), messageStore: new Map() });
+      assert.match(status3, /Lineup Generation: None/i);
+    });
+
+    it("should parse lineup generation flags in recurring schedule and format correctly", async () => {
+      const flags1 = extractCommonFlags("7pm everyday --lineups-fallback --lineup-lead-time=90m");
+      assert.equal(flags1.flags.lineupGeneration, "fallback");
+      assert.equal(flags1.flags.lineupLeadTime, 90);
+
+      const flags2 = extractCommonFlags("7pm everyday --no-lineups");
+      assert.equal(flags2.flags.lineupGeneration, "none");
+
+      const flags3 = extractCommonFlags("7pm everyday --lineups-filled");
+      assert.equal(flags3.flags.lineupGeneration, "filled");
+    });
+
+    describe("startup migration of older matchup flags", () => {
+      it("should migrate active polls and recurring polls with older matchups flags to newer options", () => {
+        const legacyActivePoll1 = {
+          id: "p_legacy_nomatch",
+          when: "Tomorrow 7pm",
+          noMatchups: true
+        };
+        const legacyActivePoll2 = {
+          id: "p_legacy_automatch",
+          when: "Tomorrow 8pm",
+          autoMatchups: true,
+          noMatchups: false
+        };
+        const modernActivePoll = {
+          id: "p_modern",
+          when: "Tomorrow 9pm",
+          lineupGeneration: "fallback",
+          lineupLeadTime: 90,
+          lineupLeadTimeDisplay: "90 mins",
+          manualLineupPosted: false,
+          lineupReminderSent: false
+        };
+
+        const legacySched1 = {
+          id: "rec_legacy_nomatch",
+          matchTime: "7pm",
+          noMatchups: true
+        };
+        const legacySched2 = {
+          id: "rec_legacy_automatch",
+          matchTime: "8pm",
+          autoMatchups: true
+        };
+        const modernSched = {
+          id: "rec_modern",
+          matchTime: "9pm",
+          lineupGeneration: "fallback",
+          lineupLeadTime: 60
+        };
+
+        const activePolls = new Map([
+          ["p_legacy_nomatch", legacyActivePoll1],
+          ["p_legacy_automatch", legacyActivePoll2],
+          ["p_modern", modernActivePoll]
+        ]);
+        const recurringPolls = new Map([
+          ["rec_legacy_nomatch", legacySched1],
+          ["rec_legacy_automatch", legacySched2],
+          ["rec_modern", modernSched]
+        ]);
+
+        const count1 = migratePollMatchupOptions({ activePolls, recurringPolls });
+        assert.equal(count1, 4, "Should migrate 2 active polls and 2 recurring schedules");
+
+        // Verify legacyActivePoll1
+        assert.equal(legacyActivePoll1.lineupGeneration, "none");
+        assert.equal(legacyActivePoll1.lineupLeadTime, 30);
+        assert.equal(legacyActivePoll1.lineupLeadTimeDisplay, "30 mins");
+        assert.equal(legacyActivePoll1.manualLineupPosted, false);
+        assert.equal(legacyActivePoll1.noMatchups, true);
+        assert.equal(legacyActivePoll1.autoMatchups, false);
+
+        // Verify legacyActivePoll2
+        assert.equal(legacyActivePoll2.lineupGeneration, "filled");
+        assert.equal(legacyActivePoll2.lineupLeadTime, 30);
+        assert.equal(legacyActivePoll2.lineupLeadTimeDisplay, "30 mins");
+        assert.equal(legacyActivePoll2.manualLineupPosted, false);
+        assert.equal(legacyActivePoll2.noMatchups, false);
+        assert.equal(legacyActivePoll2.autoMatchups, true);
+
+        // Verify legacySched1
+        assert.equal(legacySched1.lineupGeneration, "none");
+        assert.equal(legacySched1.lineupLeadTime, 30);
+        assert.equal(legacySched1.noMatchups, true);
+        assert.equal(legacySched1.autoMatchups, false);
+
+        // Verify legacySched2
+        assert.equal(legacySched2.lineupGeneration, "filled");
+        assert.equal(legacySched2.lineupLeadTime, 30);
+        assert.equal(legacySched2.noMatchups, false);
+        assert.equal(legacySched2.autoMatchups, true);
+
+        // Verify modern items were preserved without changes
+        assert.equal(modernActivePoll.lineupGeneration, "fallback");
+        assert.equal(modernActivePoll.lineupLeadTime, 90);
+        assert.equal(modernSched.lineupGeneration, "fallback");
+        assert.equal(modernSched.lineupLeadTime, 60);
+
+        // Verify idempotency
+        const count2 = migratePollMatchupOptions({ activePolls, recurringPolls });
+        assert.equal(count2, 0, "Second migration pass should perform 0 changes");
+      });
     });
   });
 });
