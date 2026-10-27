@@ -28,7 +28,11 @@ const {
   checkAndSendPollReminders,
   handleTriggerReminder,
   pollStatusText,
-  createMatchPoll
+  createMatchPoll,
+  checkAndNotifySlotConflicts,
+  interpretManualPollWithLLM,
+  parseModifyInstanceCommand,
+  handleModifyPollInstance
 } = require('../lib/commands/pollCommands');
 
 describe('pollCommands', () => {
@@ -1884,6 +1888,198 @@ describe('pollCommands', () => {
         scvcc.checkCourtAvailability = origCheck;
         scvcc.getCourtBookings = origBookings;
       }
+    });
+  });
+
+  describe("slotCheck configuration option for polls", () => {
+    it("should default slotCheck to true for automatic polls with separate vote per player", async () => {
+      let sentContent = null;
+      const mockSock = {
+        sendMessage: async (jid, content) => {
+          sentContent = content;
+          return { key: { id: "poll_slotcheck_auto", remoteJid: jid }, message: content };
+        }
+      };
+      const activePolls = new Map();
+      const res = await createMatchPoll(
+        mockSock,
+        "group1@g.us",
+        4,
+        "Tomorrow 7pm",
+        null,
+        "7pm",
+        "Alice",
+        "alice@s.whatsapp.net",
+        true,
+        null,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        { activePolls, messageStore: new Map(), latestPollIdByChat: new Map(), persistPolls: () => {} }
+      );
+      assert.equal(res.slotCheck, true);
+      const stored = activePolls.get("poll_slotcheck_auto");
+      assert.equal(stored.slotCheck, true);
+    });
+
+    it("should default slotCheck to false for automatic opt-in polls", async () => {
+      const mockSock = {
+        sendMessage: async (jid, content) => ({ key: { id: "poll_slotcheck_optin", remoteJid: jid }, message: content })
+      };
+      const activePolls = new Map();
+      const res = await createMatchPoll(
+        mockSock,
+        "group1@g.us",
+        null, // opt-in
+        "Tomorrow 7pm",
+        null,
+        "7pm",
+        "Alice",
+        "alice@s.whatsapp.net",
+        false,
+        null,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        { activePolls, messageStore: new Map(), latestPollIdByChat: new Map(), persistPolls: () => {} }
+      );
+      assert.equal(res.slotCheck, false);
+      const stored = activePolls.get("poll_slotcheck_optin");
+      assert.equal(stored.slotCheck, false);
+    });
+
+    it("should not complain about multiple votes on the same slot when slotCheck is false", async () => {
+      const pollState = {
+        name: "Test Poll",
+        slotCheck: false,
+        type: "fixed",
+        options: ["Player 1", "Player 2", "Player 3", "Player 4"],
+        remoteJid: "group1@g.us",
+        voteBuffer: new Map()
+      };
+      const aggregated = [
+        { name: "Player 2", voters: ["user1@s.whatsapp.net", "user2@s.whatsapp.net"] }
+      ];
+      let warningSent = false;
+      const mockSock = {
+        sendMessage: async () => { warningSent = true; }
+      };
+      const res = await checkAndNotifySlotConflicts(mockSock, "p1", pollState, aggregated, {});
+      assert.equal(res, false);
+      assert.equal(warningSent, false, "Must not complain when slotCheck is disabled");
+    });
+
+    it("should warn about multiple votes on the same slot when slotCheck is true", async () => {
+      const pollState = {
+        name: "Test Poll",
+        slotCheck: true,
+        type: "fixed",
+        options: ["Player 1", "Player 2", "Player 3", "Player 4"],
+        remoteJid: "group1@g.us",
+        voteBuffer: new Map([
+          ["user1@s.whatsapp.net", { senderTimestampMs: 1000 }],
+          ["user2@s.whatsapp.net", { senderTimestampMs: 2000 }]
+        ])
+      };
+      const aggregated = [
+        { name: "Player 2", voters: ["user1@s.whatsapp.net", "user2@s.whatsapp.net"] },
+        { name: "Player 3", voters: [] }
+      ];
+      let sentMessage = null;
+      const mockSock = {
+        sendMessage: async (jid, content) => { sentMessage = content; }
+      };
+      const res = await checkAndNotifySlotConflicts(mockSock, "p1", pollState, aggregated, { messageStore: new Map() });
+      assert.equal(res, true);
+      assert.ok(sentMessage);
+      assert.match(sentMessage.text, /Player 2.*already taken/i);
+    });
+
+    it("should enable slotCheck in LLM interpretation for manual poll with separate vote per player slots", async () => {
+      const interp = await interpretManualPollWithLLM("Tennis Tomorrow 7pm", ["Player 1", "Player 2", "Player 3", "Player 4"], "Alice");
+      assert.equal(interp.slotCheck, true);
+    });
+
+    it("should disable slotCheck in LLM interpretation for manual poll with Yes/No or non-player slots", async () => {
+      const interpYesNo = await interpretManualPollWithLLM("Tennis Tomorrow 7pm", ["Yes", "No"], "Alice");
+      assert.equal(interpYesNo.slotCheck, false);
+
+      const interpTopics = await interpretManualPollWithLLM("Tennis Tomorrow 7pm", ["Morning 9am", "Evening 6pm"], "Alice");
+      assert.equal(interpTopics.slotCheck, false);
+    });
+
+    it("should allow modifying slotCheck with !modifyinstance / !modifypoll command", async () => {
+      const pollState = {
+        name: "Match Tomorrow 7pm",
+        when: "Tomorrow 7pm",
+        size: 4,
+        type: "fixed",
+        status: "active",
+        isManual: true,
+        slotCheck: true,
+        remoteJid: "group1@g.us",
+        creator: { name: "Bob", jid: "bob@s.whatsapp.net" },
+        voteBuffer: new Map()
+      };
+      const activePolls = new Map([["p_mod_test", pollState]]);
+      const context = { activePolls, recurringPolls: new Map(), persistPolls: () => {} };
+
+      // Disable slotCheck on the poll
+      const cmd1 = parseModifyInstanceCommand("!modifypoll p_mod_test --no-slotcheck");
+      assert.equal(cmd1.updates.slotCheck, false);
+
+      const res1 = await handleModifyPollInstance(null, "group1@g.us", "Bob", "bob@s.whatsapp.net", cmd1.targetId, cmd1.updates, context);
+      assert.match(res1, /Updated slot check for poll.*Disabled/i);
+      assert.equal(pollState.slotCheck, false);
+
+      // Re-enable slotCheck on the poll
+      const cmd2 = parseModifyInstanceCommand("!modifyinstance p_mod_test --slotcheck");
+      assert.equal(cmd2.updates.slotCheck, true);
+
+      const res2 = await handleModifyPollInstance(null, "group1@g.us", "Bob", "bob@s.whatsapp.net", cmd2.targetId, cmd2.updates, context);
+      assert.match(res2, /Updated slot check for poll.*Enabled/i);
+      assert.equal(pollState.slotCheck, true);
+    });
+
+    it("should display slot check status in pollStatusText", () => {
+      const pollState = {
+        name: "Tennis Match",
+        isManual: false,
+        status: "active",
+        remoteJid: "group1@g.us",
+        when: "Tomorrow 7pm",
+        playAt: new Date(Date.now() + 3600000).toISOString(),
+        options: ["Player 2", "Player 3", "Player 4"],
+        size: 4,
+        type: "fixed",
+        slotCheck: true,
+        voteBuffer: new Map()
+      };
+      const activePolls = new Map([["p_status_slotcheck", pollState]]);
+      const status1 = pollStatusText("group1@g.us", { targetId: "p_status_slotcheck" }, { activePolls, recurringPolls: new Map(), messageStore: new Map() });
+      assert.match(status1, /Slot check: Enabled/i);
+
+      pollState.slotCheck = false;
+      const status2 = pollStatusText("group1@g.us", { targetId: "p_status_slotcheck" }, { activePolls, recurringPolls: new Map(), messageStore: new Map() });
+      assert.match(status2, /Slot check: Disabled/i);
     });
   });
 });

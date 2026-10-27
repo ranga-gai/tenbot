@@ -1250,6 +1250,7 @@ async function startBot() {
             createdAt: new Date().toISOString(),
             status: 'active',
             isManual: true,
+            slotCheck: Boolean(interpretation.slotCheck),
             creator: { name: creatorName, jid: creatorJid },
             lastConflictSignature: null,
             voteBuffer: new Map(),
