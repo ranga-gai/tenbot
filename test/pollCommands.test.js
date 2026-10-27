@@ -11,6 +11,7 @@ const {
   parsePollCreationText,
   resolveManualPollPlayers,
   buildPollReminderText,
+  formatReminderHours,
   getSlotNumberForOption,
   checkAndNotifyInvalidSlotVotes,
   handleOnDemandCourtBooking,
@@ -206,6 +207,41 @@ describe('pollCommands', () => {
       const text = buildPollReminderText(4, pollState, 0, 0, 'Alice, Bob', true, 2, 4);
       assert.match(text, /Tomorrow 9am/);
       assert.match(text, /2 player\(s\)/i);
+    });
+
+    it('should round to nearest half hour e.g. 10 and half hours to go for 8am reminder for 6:30pm game', () => {
+      const pollState = { when: 'Today 6:30pm', name: 'Tennis 6:30pm' };
+      // 8am to 6:30pm is 10.5 hours remaining
+      const text = buildPollReminderText(16, pollState, 1, 4, 'Alice, Bob, Charlie', false, 0, 10.5);
+      assert.match(text, /10 and half Hours to Match Time!/i);
+
+      // Neutral poll
+      const neutralPoll = { when: 'Today 6:30pm', name: '6:30pm', isManual: true };
+      const neutralText = buildPollReminderText(16, neutralPoll, 1, 4, 'Alice, Bob, Charlie', false, 0, 10.5);
+      assert.match(neutralText, /10 and half Hours to Go!/i);
+    });
+
+    it('should round to nearest whole hour e.g. 8 hours to go for 10:30am reminder for 6:30pm game', () => {
+      const pollState = { when: 'Today 6:30pm', name: 'Tennis 6:30pm' };
+      // 10:30am to 6:30pm is 8.0 hours remaining
+      const text = buildPollReminderText(8, pollState, 1, 4, 'Alice, Bob, Charlie', false, 0, 8.0);
+      assert.match(text, /8 Hours to Match Time!/i);
+
+      // Neutral poll
+      const neutralPoll = { when: 'Today 6:30pm', name: '6:30pm', isManual: true };
+      const neutralText = buildPollReminderText(8, neutralPoll, 1, 4, 'Alice, Bob, Charlie', false, 0, 8.0);
+      assert.match(neutralText, /8 Hours to Go!/i);
+    });
+
+    it('should format formatReminderHours correctly for whole and half hours', () => {
+      assert.equal(formatReminderHours(10.5), '10 and half');
+      assert.equal(formatReminderHours(10.5, true), '10 AND HALF');
+      assert.equal(formatReminderHours(8.0), '8');
+      assert.equal(formatReminderHours(8.0, true), '8');
+      assert.equal(formatReminderHours(2.5), '2 and half');
+      assert.equal(formatReminderHours(2.5, true), '2 AND HALF');
+      assert.equal(formatReminderHours(10.45), '10 and half');
+      assert.equal(formatReminderHours(7.98), '8');
     });
   });
 
