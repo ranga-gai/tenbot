@@ -2575,6 +2575,74 @@ describe('pollCommands', () => {
       assert.match(status3, /Lineup Generation: None/i);
     });
 
+    it("should include generated lineup or manual lineup in pollStatusText output", () => {
+      const generatedSchedule = {
+        type: "doubles",
+        sets: [
+          {
+            set: 1,
+            courts: [
+              { court: "Court 1", teamA: ["Alice", "Bob"], teamB: ["Charlie", "Dave"] }
+            ]
+          },
+          {
+            set: 2,
+            courts: [
+              { court: "Court 1", teamA: ["Alice", "Charlie"], teamB: ["Bob", "Dave"] }
+            ]
+          }
+        ]
+      };
+
+      const pollStateGenerated = {
+        name: "Tennis Match",
+        isManual: false,
+        status: "resolved",
+        remoteJid: "group1@g.us",
+        when: "Tomorrow 7pm",
+        size: 4,
+        type: "fixed",
+        voteBuffer: new Map(),
+        lastSchedule: generatedSchedule,
+        manualLineupPosted: false
+      };
+
+      const activePolls = new Map([["p_gen", pollStateGenerated]]);
+      const statusGenerated = pollStatusText("group1@g.us", { targetId: "p_gen" }, { activePolls, recurringPolls: new Map(), messageStore: new Map() });
+      assert.match(statusGenerated, /Lineup:[\s\S]*Set 1:[\s\S]*Alice & Bob vs Charlie & Dave/);
+      assert.match(statusGenerated, /Set 2:[\s\S]*Alice & Charlie vs Bob & Dave/);
+
+      const manualSchedule = {
+        type: "singles",
+        sets: [
+          {
+            set: 1,
+            courts: [
+              { court: "Court 2", teamA: ["Eve"], teamB: ["Frank"] }
+            ]
+          }
+        ]
+      };
+
+      const pollStateManual = {
+        name: "Tennis Singles",
+        isManual: false,
+        status: "resolved",
+        remoteJid: "group1@g.us",
+        when: "Tomorrow 8pm",
+        size: 2,
+        type: "fixed",
+        voteBuffer: new Map(),
+        lastSchedule: manualSchedule,
+        manualLineupPosted: true,
+        manualLineupText: "Court 2 (Singles): Eve vs Frank"
+      };
+
+      activePolls.set("p_manual", pollStateManual);
+      const statusManual = pollStatusText("group1@g.us", { targetId: "p_manual" }, { activePolls, recurringPolls: new Map(), messageStore: new Map() });
+      assert.match(statusManual, /Lineup \(manual\):[\s\S]*Court 2 \(Singles\):[\s\S]*Eve vs Frank/);
+    });
+
     it("should parse lineup generation flags in recurring schedule and format correctly", async () => {
       const flags1 = extractCommonFlags("7pm everyday --lineups-fallback --lineup-lead-time=90m");
       assert.equal(flags1.flags.lineupGeneration, "fallback");
