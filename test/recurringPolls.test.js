@@ -14,6 +14,7 @@ const {
 const scvcc = require('../lib/scvcc');
 const pollTime = require('../lib/pollTime');
 const pollCommands = require('../lib/commands/pollCommands');
+const recurringPollsModule = require('../lib/recurringPolls');
 
 describe('recurringPolls', () => {
   describe('parseDaysOfWeek', () => {
@@ -76,6 +77,22 @@ describe('recurringPolls', () => {
       assert.equal(flags['--pre-allocate-slots'], false);
       assert.equal(flags['pre-allocate-slots'], false);
     });
+
+    it('should extract --reminders and --no-reminders flags', () => {
+      const res1 = extractCommonFlags('auto 7pm mon-thu --reminders');
+      assert.equal(res1.flags.reminders, true);
+      assert.match(res1.remainingText, /auto 7pm mon-thu/);
+
+      const res2 = extractCommonFlags('auto 7pm mon-thu --no-reminders');
+      assert.equal(res2.flags.reminders, false);
+      assert.match(res2.remainingText, /auto 7pm mon-thu/);
+
+      const res3 = extractCommonFlags('auto 7pm mon-thu --reminders=off');
+      assert.equal(res3.flags.reminders, false);
+
+      const res4 = extractCommonFlags('auto 7pm mon-thu --reminders=on');
+      assert.equal(res4.flags.reminders, true);
+    });
   });
 
   describe('extractSkipArgs', () => {
@@ -115,6 +132,16 @@ describe('recurringPolls', () => {
       assert.equal(parsed.includePrebookedSpots, true);
       assert.equal(parsed['--pre-allocate-slots'], true);
       assert.equal(parsed['pre-allocate-slots'], true);
+    });
+
+    it('should default reminders to true in recurring poll command, or false if --no-reminders is passed', () => {
+      const parsedDefault = parseRecurringPollText('!recurringpoll auto 7pm mon-thu');
+      assert.ok(parsedDefault);
+      assert.equal(parsedDefault.reminders, true);
+
+      const parsedNoRemind = parseRecurringPollText('!recurringpoll auto 7pm mon-thu --no-reminders');
+      assert.ok(parsedNoRemind);
+      assert.equal(parsedNoRemind.reminders, false);
     });
 
     it('should parse modify recurring poll command', () => {
@@ -983,6 +1010,59 @@ describe('recurringPolls', () => {
         scvcc.getCourtBookings = originalGetBookings;
         scvcc.detectPrebookedCourt = originalDetectPrebooked;
       }
+    });
+  });
+
+  describe('recurring poll reminders option', () => {
+    it('should default reminders to true when scheduling recurring poll and reflect in card', async () => {
+      const recurringPolls = new Map();
+      const res = await recurringPollsModule.scheduleRecurringPoll({
+        recurringPolls,
+        persistPolls: () => {},
+        targetChatId: '120363402559062529@g.us',
+        sender: 'Alice',
+        senderJid: 'alice@s.whatsapp.net',
+        params: {
+          size: 4,
+          matchTime: '7pm',
+          days: 'mon-thu'
+        }
+      });
+      assert.ok(typeof res === 'string');
+      const sched = [...recurringPolls.values()][0];
+      assert.equal(sched.reminders, true);
+      assert.ok(res.includes('Reminders:* On'));
+    });
+
+    it('should allow setting reminders to false and modify reminders on recurring schedule', async () => {
+      const recurringPolls = new Map();
+      await recurringPollsModule.scheduleRecurringPoll({
+        recurringPolls,
+        persistPolls: () => {},
+        targetChatId: '120363402559062529@g.us',
+        sender: 'Alice',
+        senderJid: 'alice@s.whatsapp.net',
+        params: {
+          size: 4,
+          matchTime: '7pm',
+          days: 'mon-thu',
+          reminders: false
+        }
+      });
+      const sched = [...recurringPolls.values()][0];
+      assert.equal(sched.reminders, false);
+      const card = recurringPollsModule.formatRecurringScheduleCard(sched);
+      assert.ok(card.includes('• *Reminders:* Off'));
+
+      const modRes = await recurringPollsModule.modifyRecurringPoll({
+        recurringPolls,
+        persistPolls: () => {},
+        sender: 'Alice',
+        scheduleId: sched.id,
+        updates: { reminders: true }
+      });
+      assert.equal(sched.reminders, true);
+      assert.ok(modRes.includes('Reminders for poll instances: *On*'));
     });
   });
 

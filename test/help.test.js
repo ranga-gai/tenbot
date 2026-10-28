@@ -31,6 +31,9 @@ describe('help', () => {
     assert.match(text, /`--lineup-lead-time=<duration>` — Lead time before play time/);
     assert.match(text, /`--slot-check` \/ `--no-slot-check` — Enable or disable slot conflict checking/);
     assert.match(text, /`--pre-allocate-slots` — Include pre-allocated court slots/);
+    assert.match(text, /`--reminders` \/ `--no-reminders`/);
+    assert.match(text, /`--reminders` \/ `--no-reminders`/);
+    assert.match(text, /`--reminders` \/ `--no-reminders`/);
     assert.match(text, /`--court-booking-type=pre-book\|none` — Automatically pre-book courts/);
     assert.match(text, /`--look-around="<window>"` — Time window to search/);
     assert.match(text, /Examples:/);

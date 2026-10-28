@@ -38,8 +38,11 @@ const {
   shouldAutoGenerateLineupOnFill,
   checkPendingLineupGenerations,
   buildLineupReminderText,
-  migratePollMatchupOptions
+  migratePollMatchupOptions,
+  handlePauseReminders,
+  handleResumeReminders
 } = require('../lib/commands/pollCommands');
+const { sanitizeActivePolls } = require('../lib/pollStore');
 const { extractCommonFlags } = require('../lib/recurringPolls');
 
 describe('pollCommands', () => {
@@ -167,6 +170,20 @@ describe('pollCommands', () => {
       assert.equal(parsed.includePrebookedSpots, true);
       assert.equal(parsed['--pre-allocate-slots'], true);
       assert.equal(parsed['pre-allocate-slots'], true);
+    });
+
+    it('should parse reminders flags and default to true', () => {
+      const parsed1 = parsePollCreationText('!createpoll 4 today 6pm');
+      assert.ok(parsed1);
+      assert.equal(parsed1.reminders, true);
+
+      const parsed2 = parsePollCreationText('!createpoll 4 today 6pm --no-reminders');
+      assert.ok(parsed2);
+      assert.equal(parsed2.reminders, false);
+
+      const parsed3 = parsePollCreationText('!createpoll 4 today 6pm --reminders=off');
+      assert.ok(parsed3);
+      assert.equal(parsed3.reminders, false);
     });
 
     it('should return null for non-poll messages', () => {
@@ -2755,6 +2772,76 @@ describe('pollCommands', () => {
         const count2 = migratePollMatchupOptions({ activePolls, recurringPolls });
         assert.equal(count2, 0, "Second migration pass should perform 0 changes");
       });
+    });
+  });
+
+  describe("reminders option and consolidation", () => {
+    it("should pause and resume reminders using reminders boolean", async () => {
+      const pollState = {
+        id: "p_rem_test",
+        name: "Tennis Match",
+        status: "active",
+        reminders: true,
+        remoteJid: "group1@g.us"
+      };
+      const activePolls = new Map([["p_rem_test", pollState]]);
+      let persisted = false;
+      const context = {
+        activePolls,
+        recurringPolls: new Map(),
+        persistPolls: () => { persisted = true; }
+      };
+
+      // 1. Pause reminders
+      const pauseRes = await handlePauseReminders(null, "group1@g.us", "Alice", "p_rem_test", context);
+      assert.match(pauseRes, /Reminders have been paused/);
+      assert.equal(pollState.reminders, false);
+      assert.equal(pollState.remindersPaused, undefined);
+      assert.equal(persisted, true);
+
+      // Attempting to pause again
+      const pauseAgain = await handlePauseReminders(null, "group1@g.us", "Alice", "p_rem_test", context);
+      assert.match(pauseAgain, /already paused/);
+
+      // 2. Resume reminders
+      persisted = false;
+      const resumeRes = await handleResumeReminders(null, "group1@g.us", "Alice", "p_rem_test", context);
+      assert.match(resumeRes, /Reminders have been resumed/);
+      assert.equal(pollState.reminders, true);
+      assert.equal(pollState.remindersPaused, undefined);
+      assert.equal(persisted, true);
+
+      // Attempting to resume again
+      const resumeAgain = await handleResumeReminders(null, "group1@g.us", "Alice", "p_rem_test", context);
+      assert.match(resumeAgain, /already active/);
+    });
+
+    it("should sanitize and migrate legacy remindersPaused to reminders", () => {
+      const legacyPollPaused = {
+        remindersPaused: true
+      };
+      const legacyPollActive = {
+        remindersPaused: false
+      };
+      const newPoll = {
+        reminders: false
+      };
+      const activePolls = new Map([
+        ["p1", legacyPollPaused],
+        ["p2", legacyPollActive],
+        ["p3", newPoll]
+      ]);
+
+      sanitizeActivePolls(activePolls);
+
+      assert.equal(legacyPollPaused.reminders, false);
+      assert.equal(legacyPollPaused.remindersPaused, undefined);
+
+      assert.equal(legacyPollActive.reminders, true);
+      assert.equal(legacyPollActive.remindersPaused, undefined);
+
+      assert.equal(newPoll.reminders, false);
+      assert.equal(newPoll.remindersPaused, undefined);
     });
   });
 });
