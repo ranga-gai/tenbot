@@ -59,6 +59,23 @@ describe('recurringPolls', () => {
       assert.equal(flags.courtBookingType, 'pre-book');
       assert.match(remainingText, /8 Mon-Thu 7pm/);
     });
+
+    it('should extract --pre-allocate-slots flag', () => {
+      const text = 'auto 7pm mon-thu --pre-allocate-slots';
+      const { flags, remainingText } = extractCommonFlags(text);
+      assert.equal(flags.includePrebookedSpots, true);
+      assert.equal(flags['--pre-allocate-slots'], true);
+      assert.equal(flags['pre-allocate-slots'], true);
+      assert.match(remainingText, /auto 7pm mon-thu/);
+    });
+
+    it('should extract --no-pre-allocate-slots flag', () => {
+      const text = 'auto 7pm mon-thu --no-pre-allocate-slots';
+      const { flags, remainingText } = extractCommonFlags(text);
+      assert.equal(flags.includePrebookedSpots, false);
+      assert.equal(flags['--pre-allocate-slots'], false);
+      assert.equal(flags['pre-allocate-slots'], false);
+    });
   });
 
   describe('extractSkipArgs', () => {
@@ -90,6 +107,14 @@ describe('recurringPolls', () => {
       assert.equal(parsed.size, 8);
       assert.equal(parsed.matchTime, '7pm');
       assert.equal(parsed.days.toLowerCase(), 'mon-thu');
+    });
+
+    it('should parse --pre-allocate-slots in recurring poll command', () => {
+      const parsed = parseRecurringPollText('!recurringpoll auto 7pm mon-thu --pre-allocate-slots');
+      assert.ok(parsed);
+      assert.equal(parsed.includePrebookedSpots, true);
+      assert.equal(parsed['--pre-allocate-slots'], true);
+      assert.equal(parsed['pre-allocate-slots'], true);
     });
 
     it('should parse modify recurring poll command', () => {

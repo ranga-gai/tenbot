@@ -161,6 +161,14 @@ describe('pollCommands', () => {
       assert.equal(parsed.checkCourts, true);
     });
 
+    it('should parse --pre-allocate-slots flag', () => {
+      const parsed = parsePollCreationText('!createpoll auto tomorrow 7pm --pre-allocate-slots');
+      assert.ok(parsed);
+      assert.equal(parsed.includePrebookedSpots, true);
+      assert.equal(parsed['--pre-allocate-slots'], true);
+      assert.equal(parsed['pre-allocate-slots'], true);
+    });
+
     it('should return null for non-poll messages', () => {
       assert.equal(parsePollCreationText('who wants to play tennis?'), null);
       assert.equal(parsePollCreationText('!score Mike def John 6-4'), null);
