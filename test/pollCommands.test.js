@@ -41,7 +41,8 @@ const {
   migratePollMatchupOptions,
   handlePauseReminders,
   handleResumeReminders,
-  formatCourtTentativeTitleLine
+  formatCourtTentativeTitleLine,
+  cleanupExpiredPolls
 } = require('../lib/commands/pollCommands');
 const { sanitizeActivePolls } = require('../lib/pollStore');
 const { extractCommonFlags } = require('../lib/recurringPolls');
@@ -3860,4 +3861,119 @@ describe('pollCommands', () => {
     });
   });
 
+  describe("cleanupExpiredPolls with 2-week check", () => {
+    it("should purge untimed poll (playAt is null) if createdAt is older than 2 weeks", () => {
+      const now = new Date("2026-10-29T12:00:00Z").getTime();
+      const fifteenDaysAgo = new Date(now - 15 * 24 * 60 * 60 * 1000).toISOString();
+      const tenDaysAgo = new Date(now - 10 * 24 * 60 * 60 * 1000).toISOString();
+
+      const oldUntimedPoll = {
+        name: "Tennis Sunday Old",
+        status: "active",
+        remoteJid: "group1@g.us",
+        playAt: null,
+        createdAt: fifteenDaysAgo
+      };
+
+      const recentUntimedPoll = {
+        name: "Tennis Sunday Recent",
+        status: "active",
+        remoteJid: "group1@g.us",
+        playAt: null,
+        createdAt: tenDaysAgo
+      };
+
+      const activePolls = new Map([
+        ["poll_old_untimed", oldUntimedPoll],
+        ["poll_recent_untimed", recentUntimedPoll]
+      ]);
+      const messageStore = new Map([
+        ["group1@g.us:poll_old_untimed", { msg: 1 }],
+        ["group1@g.us:poll_recent_untimed", { msg: 2 }]
+      ]);
+      const latestPollIdByChat = new Map([["group1@g.us", "poll_recent_untimed"]]);
+      let persisted = false;
+      const context = {
+        activePolls,
+        messageStore,
+        latestPollIdByChat,
+        persistPolls: () => { persisted = true; }
+      };
+
+      const removed = cleanupExpiredPolls(context, now);
+
+      assert.deepEqual(removed, ["poll_old_untimed"]);
+      assert.equal(activePolls.has("poll_old_untimed"), false, "15-day-old untimed poll should be purged");
+      assert.equal(activePolls.has("poll_recent_untimed"), true, "10-day-old untimed poll should be retained");
+      assert.equal(messageStore.has("group1@g.us:poll_old_untimed"), false);
+      assert.equal(messageStore.has("group1@g.us:poll_recent_untimed"), true);
+      assert.equal(persisted, true);
+    });
+
+    it("should purge untimed poll using createdDate property if createdAt is not present", () => {
+      const now = new Date("2026-10-29T12:00:00Z").getTime();
+      const sixteenDaysAgo = new Date(now - 16 * 24 * 60 * 60 * 1000).toISOString();
+
+      const pollState = {
+        name: "Untimed Poll",
+        status: "filled",
+        remoteJid: "group1@g.us",
+        playAt: null,
+        createdDate: sixteenDaysAgo
+      };
+
+      const activePolls = new Map([["poll_created_date", pollState]]);
+      const context = {
+        activePolls,
+        messageStore: new Map(),
+        latestPollIdByChat: new Map([["group1@g.us", "poll_created_date"]]),
+        persistPolls: () => {}
+      };
+
+      const removed = cleanupExpiredPolls(context, now);
+      assert.deepEqual(removed, ["poll_created_date"]);
+      assert.equal(activePolls.size, 0);
+      assert.equal(context.latestPollIdByChat.has("group1@g.us"), false);
+    });
+
+    it("should purge timed poll using playAt for the 2-week check", () => {
+      const now = new Date("2026-10-29T12:00:00Z").getTime();
+      const fifteenDaysAgo = new Date(now - 15 * 24 * 60 * 60 * 1000).toISOString();
+      const tenDaysAgo = new Date(now - 10 * 24 * 60 * 60 * 1000).toISOString();
+
+      const oldTimedPoll = {
+        name: "Timed Poll 15d",
+        status: "resolved",
+        remoteJid: "group1@g.us",
+        playAt: fifteenDaysAgo,
+        createdAt: new Date(now - 17 * 24 * 60 * 60 * 1000).toISOString()
+      };
+
+      const recentTimedPoll = {
+        name: "Timed Poll 10d",
+        status: "active",
+        remoteJid: "group1@g.us",
+        playAt: tenDaysAgo,
+        createdAt: new Date(now - 12 * 24 * 60 * 60 * 1000).toISOString()
+      };
+
+      const activePolls = new Map([
+        ["poll_old_timed", oldTimedPoll],
+        ["poll_recent_timed", recentTimedPoll]
+      ]);
+      const context = {
+        activePolls,
+        messageStore: new Map(),
+        latestPollIdByChat: new Map(),
+        persistPolls: () => {}
+      };
+
+      const removed = cleanupExpiredPolls(context, now);
+      assert.deepEqual(removed, ["poll_old_timed"]);
+      assert.equal(activePolls.has("poll_old_timed"), false);
+      assert.equal(activePolls.has("poll_recent_timed"), true);
+      // recentTimedPoll passed playAt, so status should become 'expired'
+      assert.equal(recentTimedPoll.status, "expired");
+    });
+  });
 });
