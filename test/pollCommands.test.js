@@ -2612,6 +2612,57 @@ describe('pollCommands', () => {
       assert.match(sentMessage.text, /Player 2.*already taken/i);
     });
 
+    it("should warn a player if they voted on more than one slot when slotCheck is true", async () => {
+      const pollState = {
+        name: "Test Poll",
+        slotCheck: true,
+        type: "manual",
+        options: ["Player 2", "Player 3", "Player 4"],
+        remoteJid: "group1@g.us",
+        voteBuffer: new Map([
+          ["user1@s.whatsapp.net", { senderTimestampMs: 1000 }]
+        ])
+      };
+      const aggregated = [
+        { name: "Player 2", voters: ["user1@s.whatsapp.net"] },
+        { name: "Player 3", voters: ["user1@s.whatsapp.net"] },
+        { name: "Player 4", voters: [] }
+      ];
+      let sentMessage = null;
+      const mockSock = {
+        sendMessage: async (jid, content) => { sentMessage = content; }
+      };
+      const res = await checkAndNotifySlotConflicts(mockSock, "p1", pollState, aggregated, { messageStore: new Map() });
+      assert.equal(res, true);
+      assert.ok(sentMessage);
+      assert.match(sentMessage.text, /you have voted for more than one slot/i);
+      assert.match(sentMessage.text, /Player 2.*Player 3/);
+    });
+
+    it("should not warn a player for voting on multiple options if option is No or Out", async () => {
+      const pollState = {
+        name: "Test Poll",
+        slotCheck: true,
+        type: "manual",
+        options: ["Player 2", "No"],
+        remoteJid: "group1@g.us",
+        voteBuffer: new Map([
+          ["user1@s.whatsapp.net", { senderTimestampMs: 1000 }]
+        ])
+      };
+      const aggregated = [
+        { name: "Player 2", voters: ["user1@s.whatsapp.net"] },
+        { name: "No", voters: ["user1@s.whatsapp.net"] }
+      ];
+      let sentMessage = null;
+      const mockSock = {
+        sendMessage: async (jid, content) => { sentMessage = content; }
+      };
+      const res = await checkAndNotifySlotConflicts(mockSock, "p1", pollState, aggregated, { messageStore: new Map() });
+      assert.equal(res, false);
+      assert.equal(sentMessage, null);
+    });
+
     it("should enable slotCheck in LLM interpretation for manual poll with separate vote per player slots", async () => {
       const interp = await interpretManualPollWithLLM("Tennis Tomorrow 7pm", ["Player 1", "Player 2", "Player 3", "Player 4"], "Alice");
       assert.equal(interp.slotCheck, true);
@@ -2679,6 +2730,170 @@ describe('pollCommands', () => {
       pollState.slotCheck = false;
       const status2 = pollStatusText("group1@g.us", { targetId: "p_status_slotcheck" }, { activePolls, recurringPolls: new Map(), messageStore: new Map() });
       assert.match(status2, /Slot check: Disabled/i);
+    });
+
+    it("should consider manual poll filled when every slot has a vote even with duplicate votes, and send slot check warnings", async () => {
+      const crypto = require('crypto');
+      const makeOptHash = (name) => crypto.createHash('sha256').update(name).digest();
+      const messagesSent = [];
+      const mockSock = {
+        sendMessage: async (jid, content) => {
+          messagesSent.push({ jid, content });
+          return { key: { id: 'msg_' + Date.now(), remoteJid: jid } };
+        }
+      };
+
+      const pollState = {
+        name: "Weekend Tennis",
+        isManual: true,
+        status: "active",
+        remoteJid: "group1@g.us",
+        options: ["Player 2", "Player 3", "Player 4"],
+        size: 4,
+        type: "fixed",
+        slotCheck: true,
+        voteBuffer: new Map()
+      };
+
+      const rawPollMsg = {
+        messageContextInfo: { messageSecret: Buffer.from('secret') },
+        pollCreationMessage: {
+          name: "Weekend Tennis",
+          options: [{ optionName: "Player 2" }, { optionName: "Player 3" }, { optionName: "Player 4" }]
+        }
+      };
+
+      const messageStore = new Map([["group1@g.us:poll_filled_test", rawPollMsg]]);
+      const activePolls = new Map([["poll_filled_test", pollState]]);
+      const context = {
+        activePolls,
+        messageStore,
+        persistPolls: () => {}
+      };
+
+      // Alice votes for Player 2 and Player 3; Bob votes for Player 4
+      const updates = [
+        {
+          pollUpdateMessageKey: { participant: "111@s.whatsapp.net" },
+          senderTimestampMs: 1000,
+          vote: { selectedOptions: [makeOptHash("Player 2"), makeOptHash("Player 3")] }
+        },
+        {
+          pollUpdateMessageKey: { participant: "222@s.whatsapp.net" },
+          senderTimestampMs: 2000,
+          vote: { selectedOptions: [makeOptHash("Player 4")] }
+        }
+      ];
+
+      const { processPollVoteEvent } = require('../lib/commands/pollCommands');
+      await processPollVoteEvent(mockSock, { id: "poll_filled_test", remoteJid: "group1@g.us" }, updates, context);
+
+      // Poll must be marked as filled
+      assert.equal(pollState.status, "filled");
+
+      // Slot check warning must have been sent for Alice voting on multiple slots
+      const warning = messagesSent.find(m => m.content.text && m.content.text.includes('voted for more than one slot'));
+      assert.ok(warning, 'Slot check warning must be sent when poll is filled with duplicate votes');
+      assert.match(warning.content.text, /Player 2.*Player 3/);
+      assert.match(warning.content.text, /All other slots are currently taken/);
+
+      // Now a subsequent vote arrives after poll is filled (Charlie also votes for Player 4)
+      const subsequentUpdate = [
+        {
+          pollUpdateMessageKey: { participant: "333@s.whatsapp.net" },
+          senderTimestampMs: 3000,
+          vote: { selectedOptions: [makeOptHash("Player 4")] }
+        }
+      ];
+      messagesSent.length = 0;
+      await processPollVoteEvent(mockSock, { id: "poll_filled_test", remoteJid: "group1@g.us" }, subsequentUpdate, context);
+
+      // Warning should NOT be sent to group after poll is already filled; only logged
+      const afterFillWarning = messagesSent.find(m => m.content.text && m.content.text.includes('already taken by'));
+      assert.equal(afterFillWarning, undefined, 'Slot check warning must NOT be sent to group after poll is filled');
+      assert.equal(messagesSent.length, 0, 'No warning message sent to group');
+      assert.equal(pollState.status, "filled");
+    });
+
+    it("should consider automatic poll filled when every slot has a vote even with duplicate votes, and send warnings", async () => {
+      const crypto = require('crypto');
+      const makeOptHash = (name) => crypto.createHash('sha256').update(name).digest();
+      const messagesSent = [];
+      const mockSock = {
+        sendMessage: async (jid, content) => {
+          messagesSent.push({ jid, content });
+          return { key: { id: 'msg_' + Date.now(), remoteJid: jid } };
+        }
+      };
+
+      const pollState = {
+        name: "Automated Tennis",
+        isManual: false,
+        status: "active",
+        remoteJid: "group1@g.us",
+        creator: { name: "Organizer", jid: "creator@s.whatsapp.net" },
+        options: ["Player 2", "Player 3", "Player 4"],
+        size: 4,
+        type: "fixed",
+        slotCheck: true,
+        voteBuffer: new Map()
+      };
+
+      const rawPollMsg = {
+        messageContextInfo: { messageSecret: Buffer.from('secret') },
+        pollCreationMessage: {
+          name: "Automated Tennis",
+          options: [{ optionName: "Player 2" }, { optionName: "Player 3" }, { optionName: "Player 4" }]
+        }
+      };
+
+      const messageStore = new Map([["group1@g.us:poll_auto_filled_test", rawPollMsg]]);
+      const activePolls = new Map([["poll_auto_filled_test", pollState]]);
+      const context = {
+        activePolls,
+        messageStore,
+        persistPolls: () => {}
+      };
+
+      // Alice votes for Player 2 and Player 3; Bob votes for Player 4
+      const updates = [
+        {
+          pollUpdateMessageKey: { participant: "111@s.whatsapp.net" },
+          senderTimestampMs: 1000,
+          vote: { selectedOptions: [makeOptHash("Player 2"), makeOptHash("Player 3")] }
+        },
+        {
+          pollUpdateMessageKey: { participant: "222@s.whatsapp.net" },
+          senderTimestampMs: 2000,
+          vote: { selectedOptions: [makeOptHash("Player 4")] }
+        }
+      ];
+
+      const { processPollVoteEvent } = require('../lib/commands/pollCommands');
+      await processPollVoteEvent(mockSock, { id: "poll_auto_filled_test", remoteJid: "group1@g.us" }, updates, context);
+
+      // Poll must be marked as filled
+      assert.equal(pollState.status, "filled");
+
+      // Slot check warning was sent
+      const warning = messagesSent.find(m => m.content.text && m.content.text.includes('voted for more than one slot'));
+      assert.ok(warning, 'Slot check warning must be sent on automatic poll');
+
+      // Subsequent vote from Charlie after fill
+      const subsequentUpdate = [
+        {
+          pollUpdateMessageKey: { participant: "333@s.whatsapp.net" },
+          senderTimestampMs: 3000,
+          vote: { selectedOptions: [makeOptHash("Player 3")] }
+        }
+      ];
+      messagesSent.length = 0;
+      await processPollVoteEvent(mockSock, { id: "poll_auto_filled_test", remoteJid: "group1@g.us" }, subsequentUpdate, context);
+
+      const afterFillWarning = messagesSent.find(m => m.content.text && m.content.text.includes('already taken by'));
+      assert.equal(afterFillWarning, undefined, 'Slot check warning must NOT be sent to group after auto poll is filled');
+      assert.equal(messagesSent.length, 0, 'No warning message sent to group');
+      assert.equal(pollState.status, "filled");
     });
   });
 
