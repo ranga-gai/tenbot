@@ -188,6 +188,20 @@ describe('pollCommands', () => {
       assert.equal(parsed3.reminders, false);
     });
 
+    it('should parse --max-courts option', () => {
+      const parsed1 = parsePollCreationText('!createpoll auto tomorrow 7pm --max-courts=3');
+      assert.ok(parsed1);
+      assert.equal(parsed1.maxCourts, 3);
+
+      const parsed2 = parsePollCreationText('!createpoll auto tomorrow 7pm --max-courts 4');
+      assert.ok(parsed2);
+      assert.equal(parsed2.maxCourts, 4);
+
+      const parsed3 = parsePollCreationText('!createpoll auto tomorrow 7pm max-courts=2');
+      assert.ok(parsed3);
+      assert.equal(parsed3.maxCourts, 2);
+    });
+
     it('should return null for non-poll messages', () => {
       assert.equal(parsePollCreationText('who wants to play tennis?'), null);
       assert.equal(parsePollCreationText('!score Mike def John 6-4'), null);
@@ -3974,6 +3988,358 @@ describe('pollCommands', () => {
       assert.equal(activePolls.has("poll_recent_timed"), true);
       // recentTimedPoll passed playAt, so status should become 'expired'
       assert.equal(recentTimedPoll.status, "expired");
+    });
+  });
+  describe('max-courts option for auto polls', () => {
+    it('Example 1: max-courts=3 with courts 2 & 3 prebooked and court 1 available -> 3 courts, 12 slots', async () => {
+      const origCheck = scvcc.checkCourtAvailability;
+      const origBookings = scvcc.getCourtBookings;
+      const origGetConfig = groupsConfig.getGroupConfig;
+
+      try {
+        groupsConfig.getGroupConfig = () => ({
+          name: 'Test Group',
+          sport: 'tennis',
+          courtBookingEnabled: true
+        });
+
+        // Court 2 and Court 3 booked, Court 1 available
+        scvcc.checkCourtAvailability = async () => ({
+          slots: [{
+            time: '7:00 PM',
+            courts: [
+              { court: 'Court 1', status: 'available', availableMinutes: 90 },
+              { court: 'Court 2', status: 'booked', blockTitle: 'Member Match' },
+              { court: 'Court 3', status: 'booked', blockTitle: 'Member Match' }
+            ]
+          }]
+        });
+
+        scvcc.getCourtBookings = async () => ({
+          bookings: [
+            { court: 'Court 2', blockTitle: 'Member Match', players: ['Pramod Immaneni'], durationMins: 90 },
+            { court: 'Court 3', blockTitle: 'Member Match', players: ['Conrad Rodricks'], durationMins: 90 }
+          ]
+        });
+
+        let sentPoll = null;
+        const mockSock = {
+          sendMessage: async (jid, content) => {
+            if (content.poll) sentPoll = content.poll;
+            return { key: { id: 'poll_maxcourts_ex1', remoteJid: jid }, message: content };
+          }
+        };
+        const activePolls = new Map();
+        const context = { activePolls, recurringPolls: new Map(), messageStore: new Map(), latestPollIdByChat: new Map(), persistPolls: () => {} };
+
+        const res = await createMatchPoll(
+          mockSock,
+          'group1@g.us',
+          'auto',
+          'Tomorrow 7pm',
+          null,
+          null,
+          'Alice',
+          'alice@s.whatsapp.net',
+          false,
+          null,
+          false,
+          false,
+          false,
+          true, // checkCourts
+          false,
+          false,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          context,
+          { maxCourts: 3 }
+        );
+
+        assert.ok(sentPoll, 'Poll should be sent');
+        assert.equal(sentPoll.values.length, 12, 'Voting slots should be 12 (4 * 3 courts)');
+        assert.equal(res.size, 12, 'Size should be 12');
+        assert.equal(res.votingSpotsCount, 12, 'Voting spots count should be 12');
+        assert.equal(res.maxCourts, 3, 'Max courts should be 3');
+        const pollState = activePolls.get(res.pollId);
+        assert.equal(pollState.maxCourts, 3, 'Max courts in pollState should be 3');
+        const courtsCount = (pollState.prebookedCourts?.length || 0) + (pollState.unbookedCourts?.length || 0) + (pollState.tentativeCourts?.length || 0);
+        assert.equal(courtsCount, 3, 'Total courts count should be 3');
+        assert.match(sentPoll.name, /Court 2 - Booked/);
+        assert.match(sentPoll.name, /Court 3 - Booked/);
+        assert.match(sentPoll.name, /Court 1 - Available/);
+      } finally {
+        scvcc.checkCourtAvailability = origCheck;
+        scvcc.getCourtBookings = origBookings;
+        groupsConfig.getGroupConfig = origGetConfig;
+      }
+    });
+
+    it('Example 2: max-courts=3 with court 2 prebooked, court 5 tentative, and no other court available -> 2 courts, 8 slots', async () => {
+      const origCheck = scvcc.checkCourtAvailability;
+      const origBookings = scvcc.getCourtBookings;
+      const origGetConfig = groupsConfig.getGroupConfig;
+
+      try {
+        groupsConfig.getGroupConfig = () => ({
+          name: 'Test Group',
+          sport: 'tennis',
+          courtBookingEnabled: true,
+          tentativeBookingTitles: ['Clinic']
+        });
+
+        // Court 2 booked (regular), Court 5 booked with Clinic (tentative), no other available
+        scvcc.checkCourtAvailability = async () => ({
+          slots: [{
+            time: '7:00 PM',
+            courts: [
+              { court: 'Court 2', status: 'booked', blockTitle: 'Member Match' },
+              { court: 'Court 5', status: 'booked', blockTitle: 'Tennis Clinic' }
+            ]
+          }]
+        });
+
+        scvcc.getCourtBookings = async () => ({
+          bookings: [
+            { court: 'Court 2', blockTitle: 'Member Match', players: ['Pramod Immaneni'], durationMins: 90 },
+            { court: 'Court 5', blockTitle: 'Tennis Clinic', type: 'Clinic', durationMins: 90 }
+          ]
+        });
+
+        let sentPoll = null;
+        const mockSock = {
+          sendMessage: async (jid, content) => {
+            if (content.poll) sentPoll = content.poll;
+            return { key: { id: 'poll_maxcourts_ex2', remoteJid: jid }, message: content };
+          }
+        };
+        const activePolls = new Map();
+        const context = { activePolls, recurringPolls: new Map(), messageStore: new Map(), latestPollIdByChat: new Map(), persistPolls: () => {} };
+
+        const res = await createMatchPoll(
+          mockSock,
+          'group1@g.us',
+          'auto',
+          'Tomorrow 7pm',
+          null,
+          null,
+          'Alice',
+          'alice@s.whatsapp.net',
+          false,
+          null,
+          false,
+          false,
+          false,
+          true, // checkCourts
+          false,
+          false,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          context,
+          { maxCourts: 3 }
+        );
+
+        assert.ok(sentPoll, 'Poll should be sent');
+        assert.equal(sentPoll.values.length, 8, 'Voting slots should be 8 (4 * 2 courts)');
+        assert.equal(res.size, 8, 'Size should be 8');
+        assert.equal(res.votingSpotsCount, 8, 'Voting spots count should be 8');
+        assert.equal(res.maxCourts, 3, 'Max courts should be 3');
+        const pollState = activePolls.get(res.pollId);
+        assert.equal(pollState.maxCourts, 3, 'Max courts in pollState should be 3');
+        const courtsCount = (pollState.prebookedCourts?.length || 0) + (pollState.unbookedCourts?.length || 0) + (pollState.tentativeCourts?.length || 0);
+        assert.equal(courtsCount, 2, 'Total courts count should be 2');
+        assert.match(sentPoll.name, /Court 2 - Booked/);
+        assert.match(sentPoll.name, /Court 5 - Tentative/);
+      } finally {
+        scvcc.checkCourtAvailability = origCheck;
+        scvcc.getCourtBookings = origBookings;
+        groupsConfig.getGroupConfig = origGetConfig;
+      }
+    });
+
+    it('Example 3: max-courts=3 with courts 2, 3, 1, 5, 6 free -> 3 courts, 12 slots', async () => {
+      const origCheck = scvcc.checkCourtAvailability;
+      const origBookings = scvcc.getCourtBookings;
+      const origGetConfig = groupsConfig.getGroupConfig;
+
+      try {
+        groupsConfig.getGroupConfig = () => ({
+          name: 'Test Group',
+          sport: 'tennis',
+          courtBookingEnabled: true,
+          bookingCourtPreference: '2, 3, 1, 5, 6'
+        });
+
+        // Courts 2, 3, 1, 5, 6 available
+        scvcc.checkCourtAvailability = async () => ({
+          slots: [{
+            time: '7:00 PM',
+            courts: [
+              { court: 'Court 1', status: 'available', availableMinutes: 90 },
+              { court: 'Court 2', status: 'available', availableMinutes: 90 },
+              { court: 'Court 3', status: 'available', availableMinutes: 90 },
+              { court: 'Court 5', status: 'available', availableMinutes: 90 },
+              { court: 'Court 6', status: 'available', availableMinutes: 90 }
+            ]
+          }]
+        });
+
+        scvcc.getCourtBookings = async () => ({ bookings: [] });
+
+        let sentPoll = null;
+        const mockSock = {
+          sendMessage: async (jid, content) => {
+            if (content.poll) sentPoll = content.poll;
+            return { key: { id: 'poll_maxcourts_ex3', remoteJid: jid }, message: content };
+          }
+        };
+        const activePolls = new Map();
+        const context = { activePolls, recurringPolls: new Map(), messageStore: new Map(), latestPollIdByChat: new Map(), persistPolls: () => {} };
+
+        const res = await createMatchPoll(
+          mockSock,
+          'group1@g.us',
+          'auto',
+          'Tomorrow 7pm',
+          null,
+          null,
+          'Alice',
+          'alice@s.whatsapp.net',
+          false,
+          null,
+          false,
+          false,
+          false,
+          true, // checkCourts
+          false,
+          false,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          context,
+          { maxCourts: 3 }
+        );
+
+        assert.ok(sentPoll, 'Poll should be sent');
+        assert.equal(sentPoll.values.length, 12, 'Voting slots should be 12 (4 * 3 courts)');
+        assert.equal(res.size, 12, 'Size should be 12');
+        assert.equal(res.votingSpotsCount, 12, 'Voting spots count should be 12');
+        assert.equal(res.maxCourts, 3, 'Max courts should be 3');
+        const pollState = activePolls.get(res.pollId);
+        assert.equal(pollState.maxCourts, 3, 'Max courts in pollState should be 3');
+        const courtsCount = (pollState.prebookedCourts?.length || 0) + (pollState.unbookedCourts?.length || 0) + (pollState.tentativeCourts?.length || 0);
+        assert.equal(courtsCount, 3, 'Total courts count should be 3');
+        // Preferred courts: Court 2, 3, 1
+        assert.match(sentPoll.name, /Court 2 - Available/);
+        assert.match(sentPoll.name, /Court 3 - Available/);
+        assert.match(sentPoll.name, /Court 1 - Available/);
+        assert.doesNotMatch(sentPoll.name, /Court 5/);
+        assert.doesNotMatch(sentPoll.name, /Court 6/);
+      } finally {
+        scvcc.checkCourtAvailability = origCheck;
+        scvcc.getCourtBookings = origBookings;
+        groupsConfig.getGroupConfig = origGetConfig;
+      }
+    });
+
+    it('should display Max Courts in pollStatusText for auto poll', () => {
+      const pollState = {
+        name: 'Tennis Match (Auto: Court 2 - Booked, Court 1 - Available)',
+        size: 'auto',
+        isAuto: true,
+        maxCourts: 3,
+        status: 'active',
+        creator: { name: 'Alice' },
+        remoteJid: 'group1@g.us',
+        playAt: new Date(Date.now() + 3600000).toISOString(),
+        options: ['Player 1', 'Player 2', 'Player 3', 'Player 4', 'Player 5*', 'Player 6*', 'Player 7*', 'Player 8*'],
+        votes: {},
+        voteBuffer: new Map()
+      };
+      const activePolls = new Map([['p_status_maxcourts', pollState]]);
+      const status = pollStatusText('group1@g.us', { targetId: 'p_status_maxcourts' }, { activePolls, recurringPolls: new Map(), messageStore: new Map() });
+      assert.match(status, /Max Courts:\s*3/);
+    });
+
+    it('should support modifying maxCourts via !modifyinstance / !modifypoll', async () => {
+      const origCheck = scvcc.checkCourtAvailability;
+      const origBookings = scvcc.getCourtBookings;
+      const origGetConfig = groupsConfig.getGroupConfig;
+
+      try {
+        groupsConfig.getGroupConfig = () => ({
+          name: 'Test Group',
+          sport: 'tennis',
+          courtBookingEnabled: true
+        });
+
+        scvcc.checkCourtAvailability = async () => ({
+          slots: [{
+            time: '7:00 PM',
+            courts: [
+              { court: 'Court 1', status: 'available', availableMinutes: 90 },
+              { court: 'Court 2', status: 'available', availableMinutes: 90 },
+              { court: 'Court 3', status: 'available', availableMinutes: 90 }
+            ]
+          }]
+        });
+        scvcc.getCourtBookings = async () => ({ bookings: [] });
+
+        let sentPoll = null;
+        const mockSock = {
+          sendMessage: async (jid, content) => {
+            if (content.poll) sentPoll = content.poll;
+            return { key: { id: 'p_mod_new', remoteJid: jid }, message: content };
+          }
+        };
+
+        const pollState = {
+          id: 'p_mod_maxcourts',
+          name: 'Tennis Match (Tomorrow 7pm)',
+          size: 'auto',
+          isAuto: true,
+          maxCourts: 2,
+          checkCourts: true,
+          status: 'active',
+          creator: { name: 'Alice', jid: 'alice@s.whatsapp.net' },
+          remoteJid: 'group1@g.us',
+          playAt: new Date(Date.now() + 3600000).toISOString(),
+          options: ['Player 1', 'Player 2', 'Player 3', 'Player 4', 'Player 5*', 'Player 6*', 'Player 7*', 'Player 8*'],
+          votes: {},
+          voteBuffer: new Map()
+        };
+        const activePolls = new Map([['p_mod_maxcourts', pollState]]);
+        const context = { activePolls, recurringPolls: new Map(), messageStore: new Map(), latestPollIdByChat: new Map(), persistPolls: () => {} };
+
+        const cmd1 = parseModifyInstanceCommand('!modifyinstance p_mod_maxcourts --max-courts=3');
+        assert.equal(cmd1.updates.maxCourts, 3);
+
+        const res1 = await handleModifyPollInstance(mockSock, 'group1@g.us', 'Alice', 'alice@s.whatsapp.net', cmd1.targetId, cmd1.updates, context);
+        assert.match(res1, /Modified recurring poll instance/i);
+        assert.match(res1, /\*Max Courts:\*\s*3/i);
+
+        const newPoll = activePolls.get('p_mod_new');
+        assert.ok(newPoll, 'New poll should exist in activePolls');
+        assert.equal(newPoll.maxCourts, 3);
+        assert.equal(newPoll.options.length, 12);
+      } finally {
+        scvcc.checkCourtAvailability = origCheck;
+        scvcc.getCourtBookings = origBookings;
+        groupsConfig.getGroupConfig = origGetConfig;
+      }
     });
   });
 });

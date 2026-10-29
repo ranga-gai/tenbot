@@ -50,6 +50,18 @@ describe('recurringPolls', () => {
   });
 
   describe('extractCommonFlags', () => {
+    it('should extract --max-courts flag', () => {
+      const res1 = extractCommonFlags('auto 7pm mon-thu --max-courts=3');
+      assert.equal(res1.flags.maxCourts, 3);
+      assert.match(res1.remainingText, /auto 7pm mon-thu/);
+
+      const res2 = extractCommonFlags('auto 7pm mon-thu --max-courts 4');
+      assert.equal(res2.flags.maxCourts, 4);
+
+      const res3 = extractCommonFlags('auto 7pm mon-thu max-courts=2');
+      assert.equal(res3.flags.maxCourts, 2);
+    });
+
     it('should extract common CLI flags and return cleaned remaining text', () => {
       const text = '8 Mon-Thu 7pm --no-matchups --courts --pre-book-courts=2 --court-booking-type=pre-book';
       const { flags, remainingText } = extractCommonFlags(text);
@@ -118,6 +130,20 @@ describe('recurringPolls', () => {
   });
 
   describe('parseRecurringPollText', () => {
+    it('should parse --max-courts in recurring poll creation and modification', () => {
+      const parsedCreate = parseRecurringPollText('!recurringpoll auto 7pm mon-thu --max-courts=3');
+      assert.ok(parsedCreate);
+      assert.equal(parsedCreate.maxCourts, 3);
+
+      const parsedMod = parseRecurringPollText('!modifyrecurringpoll rec_1 --max-courts=4');
+      assert.ok(parsedMod);
+      assert.equal(parsedMod.updates.maxCourts, 4);
+
+      const parsedModNone = parseRecurringPollText('!modifyrecurringpoll rec_1 --max-courts=none');
+      assert.ok(parsedModNone);
+      assert.equal(parsedModNone.updates.maxCourts, null);
+    });
+
     it('should parse recurring poll creation command', () => {
       const parsed = parseRecurringPollText('!recurringpoll 8 Mon-Thu 7pm at 1:15pm');
       assert.ok(parsed);
