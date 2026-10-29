@@ -3,13 +3,21 @@
     "sport": "tennis",
     "courtBookingEnabled": true,
     "autoMatchups": true,
-    "preBookCourts": 1
+    "preBookCourts": 1,
+    "tentativeBookingTitles": [
+      "Clinic",
+      "Club Event"
+    ]
   },
   "groups": {
     "xxxxxxxx@g.us": {
       "name": "xxxxxxxx",
       "courtBookingEnabled": true,
       "courtConfig": "SCVCC",
+      "tentativeBookingTitles": [
+        "Clinic",
+        "Club Event"
+      ],
       "defaultBookingPlayers": [
         "Player 2",
         "Player 3",

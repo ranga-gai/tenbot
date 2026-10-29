@@ -5,6 +5,10 @@
       {
         "name": "SCVCC",
         "ignoredCourts": [
+        ],
+        "tentativeBookingTitles": [
+          "Clinic",
+          "Club Event"
         ]
       }
     ]

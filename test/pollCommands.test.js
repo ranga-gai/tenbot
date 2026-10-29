@@ -40,7 +40,8 @@ const {
   buildLineupReminderText,
   migratePollMatchupOptions,
   handlePauseReminders,
-  handleResumeReminders
+  handleResumeReminders,
+  formatCourtTentativeTitleLine
 } = require('../lib/commands/pollCommands');
 const { sanitizeActivePolls } = require('../lib/pollStore');
 const { extractCommonFlags } = require('../lib/recurringPolls');
@@ -652,6 +653,267 @@ describe('pollCommands', () => {
         groupsConfig.getBookingNotifications = origGetBookingNotifs;
       }
     });
+    it('should book available court first when both unbooked and tentative courts are present', async () => {
+      const originalBookCourt = scvcc.bookCourt;
+      const originalCheckAvail = scvcc.checkCourtAvailability;
+
+      let bookCalledWith = null;
+      scvcc.checkCourtAvailability = async () => ({
+        slots: [{
+          time: '10:30am',
+          courts: [
+            { court: 'Court 1', status: 'available', availableMinutes: 90 },
+            { court: 'Court 4', status: 'available', availableMinutes: 90 }
+          ]
+        }]
+      });
+      scvcc.bookCourt = async (params) => {
+        bookCalledWith = params;
+        return {
+          success: true,
+          court: params.court,
+          date: '10/19/2026',
+          time: '10:30am',
+          reservationId: 'res-avail-first',
+          message: `${params.court} booked successfully`
+        };
+      };
+
+      const messagesSent = [];
+      const mockSock = {
+        sendMessage: async (jid, msg) => { messagesSent.push({ jid, msg }); }
+      };
+
+      const pollState = {
+        remoteJid: '120363403838804497@g.us',
+        targetDateMDY: '10/19/2026',
+        queryTime: '10:30am',
+        prebookedCourts: [
+          { court: 'Court 2', player: 'Player A' }
+        ],
+        advanceBookedCourts: [
+          { court: 'Court 2' }
+        ],
+        unbookedCourts: [{ court: 'Court 1' }],
+        tentativeCourts: [{ court: 'Court 4', title: 'Clinic' }],
+        onDemandBookingInProgress: false
+      };
+
+      try {
+        await handleOnDemandCourtBooking(mockSock, 'poll_avail_first', pollState, [], {});
+
+        assert.ok(bookCalledWith);
+        // Must prioritize available court (Court 1) over tentative court (Court 4)
+        assert.equal(bookCalledWith.court, 'Court 1');
+        assert.equal(pollState.prebookedCourts.length, 2);
+        assert.equal(pollState.prebookedCourts[1].court, 'Court 1');
+        assert.equal(pollState.prebookedCourts[1].bookingType, 'auto');
+        assert.equal(pollState.unbookedCourts.length, 0);
+        // Tentative court remains untouched
+        assert.equal(pollState.tentativeCourts.length, 1);
+        assert.equal(pollState.tentativeCourts[0].court, 'Court 4');
+
+        const groupMsg = messagesSent.find((m) => m.jid === '120363403838804497@g.us');
+        assert.ok(groupMsg);
+        assert.match(groupMsg.msg.text, /🎾 \*Court 1\* is booked!/);
+      } finally {
+        scvcc.bookCourt = originalBookCourt;
+        scvcc.checkCourtAvailability = originalCheckAvail;
+      }
+    });
+
+    it('should check and book tentative court when available court booking fails and tentative court is free', async () => {
+      const originalBookCourt = scvcc.bookCourt;
+      const originalCheckAvail = scvcc.checkCourtAvailability;
+
+      const bookedCourts = [];
+      scvcc.checkCourtAvailability = async () => ({
+        slots: [{
+          time: '10:30am',
+          courts: [
+            { court: 'Court 1', status: 'prebooked' },
+            { court: 'Court 4', status: 'available', availableMinutes: 90 }
+          ]
+        }]
+      });
+      scvcc.bookCourt = async (params) => {
+        bookedCourts.push(params.court);
+        if (params.court === 'Court 1') {
+          return { success: false, message: 'Court 1 was taken' };
+        }
+        return {
+          success: true,
+          court: params.court,
+          date: '10/19/2026',
+          time: '10:30am',
+          reservationId: 'res-tentative-free',
+          message: `${params.court} booked successfully`
+        };
+      };
+
+      const messagesSent = [];
+      const mockSock = {
+        sendMessage: async (jid, msg) => { messagesSent.push({ jid, msg }); }
+      };
+
+      const pollState = {
+        remoteJid: '120363403838804497@g.us',
+        targetDateMDY: '10/19/2026',
+        queryTime: '10:30am',
+        prebookedCourts: [
+          { court: 'Court 2', player: 'Player A' }
+        ],
+        advanceBookedCourts: [
+          { court: 'Court 2' }
+        ],
+        unbookedCourts: [{ court: 'Court 1' }],
+        tentativeCourts: [{ court: 'Court 4', title: 'Clinic' }],
+        onDemandBookingInProgress: false
+      };
+
+      try {
+        await handleOnDemandCourtBooking(mockSock, 'poll_tentative_after_fail', pollState, [], {});
+
+        // Tried Court 1 (and retried), then tried Court 4
+        assert.ok(bookedCourts.includes('Court 1'));
+        assert.ok(bookedCourts.includes('Court 4'));
+        // Court 1 removed from unbookedCourts
+        assert.equal(pollState.unbookedCourts.length, 0);
+        // Court 4 successfully booked and moved to prebookedCourts
+        assert.equal(pollState.prebookedCourts.length, 2);
+        assert.equal(pollState.prebookedCourts[1].court, 'Court 4');
+        assert.equal(pollState.prebookedCourts[1].bookingType, 'auto');
+        assert.equal(pollState.tentativeCourts.length, 0);
+
+        const groupMsg = messagesSent.find((m) => m.jid === '120363403838804497@g.us');
+        assert.ok(groupMsg);
+        assert.match(groupMsg.msg.text, /🎾 \*Court 4\* is booked!/);
+      } finally {
+        scvcc.bookCourt = originalBookCourt;
+        scvcc.checkCourtAvailability = originalCheckAvail;
+      }
+    });
+
+    it('should check and book tentative court when poll has only tentative courts and court becomes free', async () => {
+      const originalBookCourt = scvcc.bookCourt;
+      const originalCheckAvail = scvcc.checkCourtAvailability;
+
+      let bookCalledWith = null;
+      scvcc.checkCourtAvailability = async () => ({
+        slots: [{
+          time: '10:30am',
+          courts: [
+            { court: 'Court 3', status: 'available', availableMinutes: 90 }
+          ]
+        }]
+      });
+      scvcc.bookCourt = async (params) => {
+        bookCalledWith = params;
+        return {
+          success: true,
+          court: params.court,
+          date: '10/19/2026',
+          time: '10:30am',
+          reservationId: 'res-tentative-only',
+          message: `${params.court} booked successfully`
+        };
+      };
+
+      const messagesSent = [];
+      const mockSock = {
+        sendMessage: async (jid, msg) => { messagesSent.push({ jid, msg }); }
+      };
+
+      const pollState = {
+        remoteJid: '120363403838804497@g.us',
+        targetDateMDY: '10/19/2026',
+        queryTime: '10:30am',
+        prebookedCourts: [
+          { court: 'Court 2', player: 'Player A' }
+        ],
+        advanceBookedCourts: [
+          { court: 'Court 2' }
+        ],
+        unbookedCourts: [],
+        tentativeCourts: [{ court: 'Court 3', title: 'Clinic' }],
+        onDemandBookingInProgress: false
+      };
+
+      try {
+        await handleOnDemandCourtBooking(mockSock, 'poll_tentative_only', pollState, [], {});
+
+        assert.ok(bookCalledWith);
+        assert.equal(bookCalledWith.court, 'Court 3');
+        assert.equal(pollState.prebookedCourts.length, 2);
+        assert.equal(pollState.prebookedCourts[1].court, 'Court 3');
+        assert.equal(pollState.prebookedCourts[1].bookingType, 'auto');
+        assert.equal(pollState.tentativeCourts.length, 0);
+
+        const groupMsg = messagesSent.find((m) => m.jid === '120363403838804497@g.us');
+        assert.ok(groupMsg);
+        assert.match(groupMsg.msg.text, /🎾 \*Court 3\* is booked!/);
+      } finally {
+        scvcc.bookCourt = originalBookCourt;
+        scvcc.checkCourtAvailability = originalCheckAvail;
+      }
+    });
+
+    it('should not clamp slotLimit when tentative courts are not free yet', async () => {
+      const originalBookCourt = scvcc.bookCourt;
+      const originalCheckAvail = scvcc.checkCourtAvailability;
+
+      let bookCalled = false;
+      scvcc.checkCourtAvailability = async () => ({
+        slots: [{
+          time: '10:30am',
+          courts: [
+            { court: 'Court 3', status: 'prebooked', blockTitle: 'Clinic' }
+          ]
+        }]
+      });
+      scvcc.bookCourt = async () => {
+        bookCalled = true;
+        return { success: false, message: 'Should not be called' };
+      };
+
+      const messagesSent = [];
+      const mockSock = {
+        sendMessage: async (jid, msg) => { messagesSent.push({ jid, msg }); }
+      };
+
+      const pollState = {
+        remoteJid: '120363403838804497@g.us',
+        targetDateMDY: '10/19/2026',
+        queryTime: '10:30am',
+        size: 8,
+        prebookedCourts: [
+          { court: 'Court 2', player: 'Player A' }
+        ],
+        advanceBookedCourts: [
+          { court: 'Court 2' }
+        ],
+        unbookedCourts: [],
+        tentativeCourts: [{ court: 'Court 3', title: 'Clinic' }],
+        onDemandBookingInProgress: false
+      };
+
+      try {
+        await handleOnDemandCourtBooking(mockSock, 'poll_tentative_not_free', pollState, [], {});
+
+        assert.equal(bookCalled, false, 'Should not attempt booking when court is not free');
+        // Tentative court remains pending
+        assert.equal(pollState.tentativeCourts.length, 1);
+        assert.equal(pollState.tentativeCourts[0].court, 'Court 3');
+        // slotLimit is NOT clamped because tentative court is still waiting
+        assert.equal(pollState.slotLimit, undefined);
+        assert.equal(pollState.size, 8);
+        assert.equal(pollState.onDemandBookingInProgress, false);
+      } finally {
+        scvcc.bookCourt = originalBookCourt;
+        scvcc.checkCourtAvailability = originalCheckAvail;
+      }
+    });
+
     it('should correctly calculate player openings when 2 courts are prebooked', () => {
       const bookedCourtsCount = 2;
       const playersPerCourt = 4;
@@ -2844,4 +3106,271 @@ describe('pollCommands', () => {
       assert.equal(newPoll.remindersPaused, undefined);
     });
   });
+
+  describe("auto booked vs manually booked courts distinction", () => {
+    it("should distinguish auto booked and manually booked courts in poll status output", () => {
+      const pollState = {
+        id: "p_court_status",
+        remoteJid: "group1@g.us",
+        when: "Tomorrow 7pm",
+        size: 8,
+        status: "active",
+        playAt: new Date(Date.now() + 86400000).toISOString(),
+        prebookedCourts: [
+          { court: "Court 2", player: "Pramod", bookingType: "auto" },
+          { court: "Court 3", player: "Kejal", bookingType: "manual" }
+        ],
+        autoBookedCourts: [
+          { court: "Court 2", player: "Pramod", bookingType: "auto" }
+        ],
+        manuallyBookedCourts: [
+          { court: "Court 3", player: "Kejal", bookingType: "manual" }
+        ],
+        voteBuffer: new Map()
+      };
+      const activePolls = new Map([["p_court_status", pollState]]);
+      const text = pollStatusText("group1@g.us", {}, { activePolls, messageStore: new Map(), recurringPolls: new Map() });
+      assert.match(text, /Courts: Court 2 \(auto booked\), Court 3 \(manually booked by Kejal\)/);
+    });
+
+    it("should format booking summary message distinguishing auto booked and manually booked", () => {
+      const msg = scvcc.buildBookingSummaryMessage({
+        targetDateMDY: "10/30/2026",
+        queryTime: "7:00PM",
+        sport: "tennis",
+        targetCourtsCount: 2,
+        advanceBookedCourts: [{ court: "Court 2", duration: "90 Minutes", reservationId: "12345" }],
+        prebookedCourts: [{ court: "Court 3", player: "Kejal" }]
+      });
+      assert.match(msg, /• \*Court 2\* \(auto booked\) \(Doubles, 90 Minutes\) — ID: `12345`/);
+      assert.match(msg, /• \*Court 3\* \(manually booked by Kejal\)/);
+    });
+  });
+  describe("tentative courts support", () => {
+    it("should format tentative court title line correctly", () => {
+      assert.equal(formatCourtTentativeTitleLine("Court 3", null, null), "Court 3 - Tentative");
+      assert.equal(formatCourtTentativeTitleLine("3", null, null), "Court 3 - Tentative");
+      assert.equal(formatCourtTentativeTitleLine("Court 3", "7:00pm", "6:30pm"), "Court 3 (7pm) - Tentative");
+      assert.equal(formatCourtTentativeTitleLine("Court 3", "6:30pm", "6:30pm"), "Court 3 - Tentative");
+    });
+
+    it("should parse slot numbers ending with *", () => {
+      assert.equal(getSlotNumberForOption("Player 9*"), 9);
+      assert.equal(getSlotNumberForOption("Player 12*"), 12);
+      assert.equal(getSlotNumberForOption("Player 1*"), 1);
+    });
+
+    it("should check tentative booking titles from groupsConfig", () => {
+      const origGetConfig = groupsConfig.getGroupConfig;
+      try {
+        groupsConfig.getGroupConfig = () => ({
+          tentativeBookingTitles: ["Clinic", "Club Event", "Team Practice"]
+        });
+        assert.equal(groupsConfig.isTentativeBookingTitle("Adult Tennis Clinic"), true);
+        assert.equal(groupsConfig.isTentativeBookingTitle("Junior Clinic"), true);
+        assert.equal(groupsConfig.isTentativeBookingTitle("Club Event"), true);
+        assert.equal(groupsConfig.isTentativeBookingTitle("Private Lesson"), false);
+        assert.equal(groupsConfig.isTentativeBookingTitle(null), false);
+      } finally {
+        groupsConfig.getGroupConfig = origGetConfig;
+      }
+    });
+
+    it("should detect tentative courts, place them after booked and available courts, and append * to slots", async () => {
+      const origCheck = scvcc.checkCourtAvailability;
+      const origBookings = scvcc.getCourtBookings;
+      const origGetConfig = groupsConfig.getGroupConfig;
+
+      try {
+        groupsConfig.getGroupConfig = () => ({
+          name: "Test Group",
+          sport: "tennis",
+          courtBookingEnabled: true,
+          tentativeBookingTitles: ["Clinic", "Team Practice"]
+        });
+
+        // Setup mock availability & bookings:
+        // Court 2 is booked (prebooked)
+        // Court 1 is available (free)
+        // Court 3 is booked with blockTitle "Tennis Clinic" (matches tentative)
+        scvcc.checkCourtAvailability = async () => ({
+          slots: [{
+            time: "7:00 PM",
+            courts: [
+              { court: "Court 1", status: "available", availableMinutes: 90 },
+              { court: "Court 2", status: "booked", blockTitle: "Member Match" },
+              { court: "Court 3", status: "booked", blockTitle: "Tennis Clinic" }
+            ]
+          }]
+        });
+
+        scvcc.getCourtBookings = async () => ({
+          bookings: [
+            { court: "Court 2", blockTitle: "Pramod Immaneni", players: ["Pramod Immaneni"], durationMins: 90 },
+            { court: "Court 3", blockTitle: "Tennis Clinic", type: "Clinic", durationMins: 90 }
+          ]
+        });
+
+        let sentPoll = null;
+        const mockSock = {
+          sendMessage: async (jid, content) => {
+            if (content.poll) sentPoll = content.poll;
+            return { key: { id: "poll_tentative_test", remoteJid: jid }, message: content };
+          }
+        };
+        const activePolls = new Map();
+        const context = { activePolls, persistPolls: () => {} };
+
+        // Test Auto Poll
+        await createMatchPoll(
+          mockSock,
+          "group1@g.us",
+          "auto",
+          "Tomorrow 7pm",
+          null,
+          null,
+          "Alice",
+          "alice@s.whatsapp.net",
+          false,
+          null,
+          false,
+          false,
+          false,
+          true, // checkCourts
+          false,
+          false,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          context
+        );
+
+        assert.ok(sentPoll, "Poll should be sent");
+        // Title should have Booked > Available > Tentative order
+        assert.match(sentPoll.name, /Court 2 - Booked/);
+        assert.match(sentPoll.name, /Court 1 - Available/);
+        assert.match(sentPoll.name, /Court 3 - Tentative/);
+
+        // Verify order in title: Court 2 (Booked) before Court 1 (Available) before Court 3 (Tentative)
+        const idxBooked = sentPoll.name.indexOf("Court 2 - Booked");
+        const idxAvail = sentPoll.name.indexOf("Court 1 - Available");
+        const idxTentative = sentPoll.name.indexOf("Court 3 - Tentative");
+        assert.ok(idxBooked < idxAvail, "Booked courts should come before Available courts in title");
+        assert.ok(idxAvail < idxTentative, "Available courts should come before Tentative courts in title");
+
+        // Verify voting slots:
+        // Court 2 (slots 1..4): Player 1..Player 4
+        // Court 1 (slots 5..8): Player 5..Player 8
+        // Court 3 (slots 9..12 - tentative): Player 9*..Player 12*
+        assert.equal(sentPoll.values[0], "Player 1");
+        assert.equal(sentPoll.values[7], "Player 8");
+        assert.equal(sentPoll.values[8], "Player 9*");
+        assert.equal(sentPoll.values[9], "Player 10*");
+        assert.equal(sentPoll.values[10], "Player 11*");
+        assert.equal(sentPoll.values[11], "Player 12*");
+
+        // Verify activePolls state has tentativeCourts
+        const savedState = activePolls.get("poll_tentative_test");
+        assert.ok(savedState);
+        assert.ok(Array.isArray(savedState.tentativeCourts));
+        assert.equal(savedState.tentativeCourts.length, 1);
+        assert.equal(savedState.tentativeCourts[0].court, "Court 3");
+
+        // Verify pollStatusText displays tentative courts
+        const statusText = pollStatusText("group1@g.us", { targetId: "poll_tentative_test" }, { activePolls, messageStore: new Map(), recurringPolls: new Map() });
+        assert.match(statusText, /Courts: Court 2 \(manually booked by [^)]+\), Court 3 \(tentative\)/);
+      } finally {
+        scvcc.checkCourtAvailability = origCheck;
+        scvcc.getCourtBookings = origBookings;
+        groupsConfig.getGroupConfig = origGetConfig;
+      }
+    });
+
+    it("should allow poll creation when only tentative courts are found", async () => {
+      const origCheck = scvcc.checkCourtAvailability;
+      const origBookings = scvcc.getCourtBookings;
+      const origGetConfig = groupsConfig.getGroupConfig;
+
+      try {
+        groupsConfig.getGroupConfig = () => ({
+          name: "Test Group",
+          sport: "tennis",
+          courtBookingEnabled: true,
+          tentativeBookingTitles: ["Clinic"]
+        });
+
+        // All courts booked, but Court 3 has Clinic (tentative)
+        scvcc.checkCourtAvailability = async () => ({
+          slots: [{
+            time: "7:00 PM",
+            courts: [
+              { court: "Court 1", status: "booked", blockTitle: "Reserved" },
+              { court: "Court 2", status: "booked", blockTitle: "Reserved" },
+              { court: "Court 3", status: "booked", blockTitle: "Clinic" }
+            ]
+          }]
+        });
+
+        scvcc.getCourtBookings = async () => ({
+          bookings: [
+            { court: "Court 1", blockTitle: "Reserved", durationMins: 90 },
+            { court: "Court 2", blockTitle: "Reserved", durationMins: 90 },
+            { court: "Court 3", blockTitle: "Clinic", durationMins: 90 }
+          ]
+        });
+
+        let sentPoll = null;
+        const mockSock = {
+          sendMessage: async (jid, content) => {
+            if (content.poll) sentPoll = content.poll;
+            return { key: { id: "poll_only_tentative", remoteJid: jid }, message: content };
+          }
+        };
+        const activePolls = new Map();
+        const context = { activePolls, persistPolls: () => {} };
+
+        // Fixed poll of 4 spots
+        const res = await createMatchPoll(
+          mockSock,
+          "group1@g.us",
+          4,
+          "Tomorrow 7pm",
+          null,
+          null,
+          "Alice",
+          "alice@s.whatsapp.net",
+          false,
+          null,
+          false,
+          false,
+          false,
+          true, // checkCourts
+          false,
+          false,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          context
+        );
+
+        assert.ok(sentPoll, "Poll should be created even though no free or prebooked courts exist");
+        assert.match(sentPoll.name, /Court 3 - Tentative/);
+        // All slots for tentative court get *
+        assert.deepEqual(sentPoll.values, ["Player 1*", "Player 2*", "Player 3*", "Player 4*"]);
+      } finally {
+        scvcc.checkCourtAvailability = origCheck;
+        scvcc.getCourtBookings = origBookings;
+        groupsConfig.getGroupConfig = origGetConfig;
+      }
+    });
+  });
+
 });
