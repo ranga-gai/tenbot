@@ -634,9 +634,10 @@ describe('pollCommands', () => {
         assert.equal(pollState.size, 8);
         assert.equal(pollState.onDemandBookingInProgress, false);
 
-        // Message must NOT be posted to the group chat
-        const courtFailMsgInGroup = messagesSent.find(m => m.jid === 'group1@g.us' && m.msg?.text?.includes('Court 1') && m.msg?.text?.includes('8 voting slots'));
-        assert.equal(courtFailMsgInGroup, undefined, 'Court unavailable message must NOT be sent to the group chat');
+        // Message must be posted to the group chat (exactly once, not multiple for retries)
+        const courtFailMsgsInGroup = messagesSent.filter(m => m.jid === 'group1@g.us' && m.msg?.text?.includes('Court 1') && m.msg?.text?.includes('8 voting slots'));
+        assert.equal(courtFailMsgsInGroup.length, 1, 'Court unavailable message must be sent to the group chat exactly once after all retries');
+        assert.equal(courtFailMsgsInGroup[0].msg.text, '⚠️ *Court 1* is no longer available. Only *8 voting slots* are valid for this match poll.');
 
         // Message MUST be sent to bookingNotifications list
         const notifMsg = messagesSent.find(m => m.jid === 'admin1@s.whatsapp.net' && m.msg?.text?.includes('Court 1') && m.msg?.text?.includes('8 voting slots'));
@@ -785,7 +786,11 @@ describe('pollCommands', () => {
         assert.equal(pollState.prebookedCourts[1].bookingType, 'auto');
         assert.equal(pollState.tentativeCourts.length, 0);
 
-        const groupMsg = messagesSent.find((m) => m.jid === '120363403838804497@g.us');
+        const court1FailMsg = messagesSent.find((m) => m.jid === '120363403838804497@g.us' && m.msg?.text?.includes('Court 1'));
+        assert.ok(court1FailMsg, 'Court 1 failure message sent to group');
+        assert.equal(court1FailMsg.msg.text, '⚠️ *Court 1* is no longer available.');
+
+        const groupMsg = messagesSent.find((m) => m.jid === '120363403838804497@g.us' && m.msg?.text?.includes('Court 4'));
         assert.ok(groupMsg);
         assert.match(groupMsg.msg.text, /🎾 \*Court 4\* is booked!/);
       } finally {
@@ -911,6 +916,271 @@ describe('pollCommands', () => {
       } finally {
         scvcc.bookCourt = originalBookCourt;
         scvcc.checkCourtAvailability = originalCheckAvail;
+      }
+    });
+
+    it('should book available court at candidate look around time specified in courtObj.time and announce with time suffix', async () => {
+      const originalBookCourt = scvcc.bookCourt;
+      const originalCheckAvail = scvcc.checkCourtAvailability;
+
+      let bookCalledWith = null;
+      scvcc.checkCourtAvailability = async ({ time }) => ({
+        slots: [{
+          time,
+          courts: [{ court: 'Court 1', status: 'available', availableMinutes: 90 }]
+        }]
+      });
+      scvcc.bookCourt = async (params) => {
+        bookCalledWith = params;
+        return {
+          success: true,
+          court: params.court,
+          date: '10/19/2026',
+          time: params.time,
+          reservationId: 'res-lookaround-ondemand',
+          message: `${params.court} booked successfully at ${params.time}`
+        };
+      };
+
+      const messagesSent = [];
+      const mockSock = {
+        sendMessage: async (jid, msg) => { messagesSent.push({ jid, msg }); }
+      };
+
+      const pollState = {
+        remoteJid: '120363403838804497@g.us',
+        targetDateMDY: '10/19/2026',
+        queryTime: '6:30pm',
+        lookAround: '1h',
+        prebookedCourts: [
+          { court: 'Court 2', player: 'Player A' }
+        ],
+        advanceBookedCourts: [
+          { court: 'Court 2' }
+        ],
+        unbookedCourts: [{ court: 'Court 1', time: '7:00pm' }],
+        onDemandBookingInProgress: false
+      };
+
+      try {
+        await handleOnDemandCourtBooking(mockSock, 'poll_lookaround_court_time', pollState, [], {});
+
+        assert.ok(bookCalledWith, 'scvcc.bookCourt should have been called');
+        assert.equal(bookCalledWith.court, 'Court 1');
+        assert.equal(bookCalledWith.time, '7:00pm', 'Should book Court 1 at 7:00pm as specified in unbookedCourts');
+
+        assert.equal(pollState.prebookedCourts.length, 2);
+        assert.equal(pollState.prebookedCourts[1].court, 'Court 1');
+        assert.equal(pollState.prebookedCourts[1].time, '7:00pm');
+        assert.equal(pollState.autoBookedCourts[0].time, '7:00pm');
+        assert.equal(pollState.unbookedCourts.length, 0);
+
+        const groupMsg = messagesSent.find((m) => m.jid === '120363403838804497@g.us');
+        assert.ok(groupMsg);
+        assert.match(groupMsg.msg.text, /🎾 \*Court 1 \(7(:00)?pm\)\* is booked!/);
+      } finally {
+        scvcc.bookCourt = originalBookCourt;
+        scvcc.checkCourtAvailability = originalCheckAvail;
+      }
+    });
+
+    it('should extract court time from pollState.name if courtObj.time is missing and book at candidate time', async () => {
+      const originalBookCourt = scvcc.bookCourt;
+      const originalCheckAvail = scvcc.checkCourtAvailability;
+
+      let bookCalledWith = null;
+      scvcc.checkCourtAvailability = async ({ time }) => ({
+        slots: [{
+          time,
+          courts: [{ court: 'Court 1', status: 'available', availableMinutes: 90 }]
+        }]
+      });
+      scvcc.bookCourt = async (params) => {
+        bookCalledWith = params;
+        return {
+          success: true,
+          court: params.court,
+          date: '10/19/2026',
+          time: params.time,
+          reservationId: 'res-name-time-ondemand',
+          message: `${params.court} booked successfully at ${params.time}`
+        };
+      };
+
+      const messagesSent = [];
+      const mockSock = {
+        sendMessage: async (jid, msg) => { messagesSent.push({ jid, msg }); }
+      };
+
+      const pollState = {
+        remoteJid: '120363403838804497@g.us',
+        targetDateMDY: '10/19/2026',
+        queryTime: '6:30pm',
+        lookAround: '1h',
+        name: '🎾 Tennis Match (Doubles) - Tomorrow 6:30pm [Court 2 - Booked, Court 1 (7:00pm) - Available]',
+        prebookedCourts: [
+          { court: 'Court 2', player: 'Player A' }
+        ],
+        advanceBookedCourts: [
+          { court: 'Court 2' }
+        ],
+        unbookedCourts: [{ court: 'Court 1' }],
+        onDemandBookingInProgress: false
+      };
+
+      try {
+        await handleOnDemandCourtBooking(mockSock, 'poll_lookaround_from_name', pollState, [], {});
+
+        assert.ok(bookCalledWith, 'scvcc.bookCourt should have been called');
+        assert.equal(bookCalledWith.court, 'Court 1');
+        assert.equal(bookCalledWith.time, '7:00pm', 'Should infer 7:00pm from poll title');
+
+        assert.equal(pollState.prebookedCourts[1].time, '7:00pm');
+        const groupMsg = messagesSent.find((m) => m.jid === '120363403838804497@g.us');
+        assert.ok(groupMsg);
+        assert.match(groupMsg.msg.text, /🎾 \*Court 1 \(7(:00)?pm\)\* is booked!/);
+      } finally {
+        scvcc.bookCourt = originalBookCourt;
+        scvcc.checkCourtAvailability = originalCheckAvail;
+      }
+    });
+
+    it('should try candidate times in look around window if courtObj.time is not specified and base time fails', async () => {
+      const originalBookCourt = scvcc.bookCourt;
+      const originalCheckAvail = scvcc.checkCourtAvailability;
+
+      const attemptedTimes = [];
+      scvcc.checkCourtAvailability = async ({ time }) => {
+        if (time === '6:30pm') {
+          return {
+            slots: [{ time: '6:30pm', courts: [{ court: 'Court 1', status: 'unavailable' }] }]
+          };
+        }
+        if (time === '7pm') {
+          return {
+            slots: [{ time: '7pm', courts: [{ court: 'Court 1', status: 'available', availableMinutes: 90 }] }]
+          };
+        }
+        return { slots: [] };
+      };
+      scvcc.bookCourt = async (params) => {
+        attemptedTimes.push(params.time);
+        if (params.time === '6:30pm') {
+          return { success: false, message: 'Court 1 not available at 6:30pm' };
+        }
+        return {
+          success: true,
+          court: params.court,
+          date: '10/19/2026',
+          time: '7pm',
+          reservationId: 'res-candidate-lookaround',
+          message: 'Court 1 booked at 7pm'
+        };
+      };
+
+      const messagesSent = [];
+      const mockSock = {
+        sendMessage: async (jid, msg) => { messagesSent.push({ jid, msg }); }
+      };
+
+      const pollState = {
+        remoteJid: '120363403838804497@g.us',
+        targetDateMDY: '10/19/2026',
+        queryTime: '6:30pm',
+        lookAround: '1h',
+        prebookedCourts: [{ court: 'Court 2', player: 'Player A' }],
+        advanceBookedCourts: [{ court: 'Court 2' }],
+        unbookedCourts: [{ court: 'Court 1' }],
+        onDemandBookingInProgress: false
+      };
+
+      try {
+        await handleOnDemandCourtBooking(mockSock, 'poll_lookaround_fallback_time', pollState, [], {});
+
+        assert.ok(attemptedTimes.includes('6:30pm'), 'Should have tried base time 6:30pm');
+        assert.ok(attemptedTimes.includes('7pm'), 'Should have proceeded to 7pm in look around window');
+        assert.equal(pollState.prebookedCourts.length, 2);
+        assert.equal(pollState.prebookedCourts[1].court, 'Court 1');
+        assert.equal(pollState.prebookedCourts[1].time, '7pm');
+
+        const groupMsg = messagesSent.find((m) => m.jid === '120363403838804497@g.us');
+        assert.ok(groupMsg);
+        assert.match(groupMsg.msg.text, /🎾 \*Court 1 \(7(:00)?pm\)\* is booked!/);
+      } finally {
+        scvcc.bookCourt = originalBookCourt;
+        scvcc.checkCourtAvailability = originalCheckAvail;
+      }
+    });
+
+    it('createMatchPoll should preserve time property on unbookedCourts when court is available at look around time', async () => {
+      const originalCheckAvail = scvcc.checkCourtAvailability;
+      const originalGetBookings = scvcc.getCourtBookings;
+
+      try {
+        scvcc.getCourtBookings = async () => ({ bookings: [] });
+        scvcc.checkCourtAvailability = async ({ time }) => {
+          if (time === '6:30pm') {
+            return {
+              slots: [{
+                time: '6:30pm',
+                courts: [{ court: 'Court 1', status: 'unavailable', availableMinutes: 0 }]
+              }]
+            };
+          }
+          if (time === '7pm') {
+            return {
+              slots: [{
+                time: '7pm',
+                courts: [{ court: 'Court 1', status: 'available', availableMinutes: 90 }]
+              }]
+            };
+          }
+          return { slots: [] };
+        };
+
+        const activePolls = new Map();
+        const res = await createMatchPoll(
+          {
+            sendMessage: async (jid, content) => ({
+              key: { id: 'poll_unbooked_time_preservation', remoteJid: jid },
+              message: content
+            })
+          },
+          '120363402559062529@g.us',
+          8,
+          'Tomorrow 6:30pm',
+          null,
+          '6:30pm',
+          'Creator',
+          null,
+          false,
+          null,
+          false,
+          true,
+          false,
+          true,
+          false,
+          false,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          { activePolls, messageStore: new Map(), latestPollIdByChat: new Map(), persistPolls: () => {} },
+          60
+        );
+
+        assert.equal(res.err, null);
+        const storedPoll = activePolls.get('poll_unbooked_time_preservation');
+        assert.ok(storedPoll);
+        assert.ok(Array.isArray(storedPoll.unbookedCourts));
+        assert.equal(storedPoll.unbookedCourts.length, 1);
+        assert.equal(storedPoll.unbookedCourts[0].court, 'Court 1');
+        assert.equal(storedPoll.unbookedCourts[0].time, '7pm');
+      } finally {
+        scvcc.checkCourtAvailability = originalCheckAvail;
+        scvcc.getCourtBookings = originalGetBookings;
       }
     });
 
