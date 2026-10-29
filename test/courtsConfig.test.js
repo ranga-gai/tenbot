@@ -3,7 +3,9 @@ const assert = require('node:assert/strict');
 const {
   isIgnoredCourt,
   getAllCourtConfigs,
-  getCourtConfig
+  getCourtConfig,
+  isTentativeBookingTitle,
+  matchesTentativePattern
 } = require('../lib/courtsConfig');
 
 describe('courtsConfig', () => {
@@ -25,5 +27,23 @@ describe('courtsConfig', () => {
     assert.equal(isIgnoredCourt('Court 999'), false);
     assert.equal(isIgnoredCourt(''), false);
     assert.equal(isIgnoredCourt(null), false);
+  });
+  it("should support regex and string match for tentative booking titles in courtsConfig", () => {
+    const courtsConfig = require("../lib/courtsConfig");
+    const origGetTentative = courtsConfig.getTentativeBookingTitles;
+    try {
+      courtsConfig.getTentativeBookingTitles = () => [
+        "Clinic",
+        "/^Team Practice/i",
+        "/Junior.*Clinic/i"
+      ];
+      assert.equal(isTentativeBookingTitle("Adult Tennis Clinic"), true);
+      assert.equal(isTentativeBookingTitle("Team Practice Ct 1"), true);
+      assert.equal(isTentativeBookingTitle("Early Team Practice"), false);
+      assert.equal(isTentativeBookingTitle("Junior Tennis Clinic"), true);
+      assert.equal(isTentativeBookingTitle("Private Lesson"), false);
+    } finally {
+      courtsConfig.getTentativeBookingTitles = origGetTentative;
+    }
   });
 });

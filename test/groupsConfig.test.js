@@ -8,7 +8,9 @@ const {
   saveRawConfig,
   getGroupJid,
   pauseCourtBookings,
-  resumeCourtBookings
+  resumeCourtBookings,
+  isTentativeBookingTitle,
+  matchesTentativePattern
 } = require('../lib/groupsConfig');
 
 describe('groupsConfig', () => {
@@ -124,6 +126,72 @@ describe('groupsConfig', () => {
         }
       } finally {
         saveRawConfig(origConfig);
+      }
+    });
+  });
+
+  describe("isTentativeBookingTitle and matchesTentativePattern", () => {
+    it("should match plain string substrings case-insensitively", () => {
+      assert.equal(matchesTentativePattern("Adult Tennis Clinic", "Clinic"), true);
+      assert.equal(matchesTentativePattern("tennis clinic", "Clinic"), true);
+      assert.equal(matchesTentativePattern("Private Lesson", "Clinic"), false);
+      assert.equal(matchesTentativePattern(null, "Clinic"), false);
+      assert.equal(matchesTentativePattern("Clinic", null), false);
+    });
+
+    it("should match regex literal string in /pattern/flags format", () => {
+      assert.equal(matchesTentativePattern("Team Practice - Ct 1", "/^Team Practice/i"), true);
+      assert.equal(matchesTentativePattern("team practice", "/^Team Practice/i"), true);
+      assert.equal(matchesTentativePattern("Morning Team Practice", "/^Team Practice/i"), false);
+
+      assert.equal(matchesTentativePattern("Junior Tennis Clinic", "/Junior.*Clinic/i"), true);
+      assert.equal(matchesTentativePattern("Adult Clinic", "/Junior.*Clinic/i"), false);
+
+      // Exact matching with ^...$
+      assert.equal(matchesTentativePattern("Club Event", "/^Club Event$/i"), true);
+      assert.equal(matchesTentativePattern("Club Event Special", "/^Club Event$/i"), false);
+    });
+
+    it("should match raw regex pattern strings", () => {
+      assert.equal(matchesTentativePattern("Junior Tennis Clinic", "^Junior.*Clinic"), true);
+      assert.equal(matchesTentativePattern("Adult Clinic", "^Junior.*Clinic"), false);
+      assert.equal(matchesTentativePattern("Clinic Match Play", "^Clinic.*Play$"), true);
+      assert.equal(matchesTentativePattern("Sunday Clinic Match Play", "^Clinic.*Play$"), false);
+    });
+
+    it("should support RegExp instances", () => {
+      assert.equal(matchesTentativePattern("Adult Clinic", /^Adult Clinic$/i), true);
+      assert.equal(matchesTentativePattern("Junior Clinic", /^Adult Clinic$/i), false);
+    });
+
+    it("should safely handle invalid regex strings without throwing", () => {
+      assert.equal(matchesTentativePattern("Some Title", "/[unclosed/i"), false);
+      assert.equal(matchesTentativePattern("Some Title", "[unclosed"), false);
+    });
+
+    it("should evaluate tentative booking titles using isTentativeBookingTitle", () => {
+      const groupsConfig = require("../lib/groupsConfig");
+      const origGetConfig = groupsConfig.getGroupConfig;
+      try {
+        groupsConfig.getGroupConfig = () => ({
+          tentativeBookingTitles: [
+            "Clinic",
+            "/^Team Practice/i",
+            "/Junior.*Clinic/i",
+            "/^Club Event$/i"
+          ]
+        });
+        assert.equal(isTentativeBookingTitle("Adult Tennis Clinic"), true);
+        assert.equal(isTentativeBookingTitle("Team Practice - 1"), true);
+        assert.equal(isTentativeBookingTitle("Early Team Practice"), false);
+        assert.equal(isTentativeBookingTitle("Junior League Clinic"), true);
+        assert.equal(isTentativeBookingTitle("Club Event"), true);
+        assert.equal(isTentativeBookingTitle("Club Event Party"), false);
+        assert.equal(isTentativeBookingTitle("Regular Booking"), false);
+        assert.equal(isTentativeBookingTitle(""), false);
+        assert.equal(isTentativeBookingTitle(null), false);
+      } finally {
+        groupsConfig.getGroupConfig = origGetConfig;
       }
     });
   });

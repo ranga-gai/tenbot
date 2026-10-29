@@ -6,7 +6,9 @@
     "preBookCourts": 1,
     "tentativeBookingTitles": [
       "Clinic",
-      "Club Event"
+      "Club Event",
+      "/^Team Practice/i",
+      "/Junior.*Clinic/i"
     ]
   },
   "groups": {

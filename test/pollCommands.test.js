@@ -3676,6 +3676,31 @@ describe('pollCommands', () => {
       }
     });
 
+    it("should support regex match for tentative booking titles in groupsConfig", () => {
+      const origGetConfig = groupsConfig.getGroupConfig;
+      try {
+        groupsConfig.getGroupConfig = () => ({
+          tentativeBookingTitles: [
+            "/^Team Practice/i",
+            "/Junior.*Clinic/i",
+            "/^Club Event$/i",
+            "Clinic"
+          ]
+        });
+        assert.equal(groupsConfig.isTentativeBookingTitle("Team Practice - Court 1"), true);
+        assert.equal(groupsConfig.isTentativeBookingTitle("team practice"), true);
+        assert.equal(groupsConfig.isTentativeBookingTitle("Morning Team Practice"), false);
+        assert.equal(groupsConfig.isTentativeBookingTitle("Junior Tennis Clinic"), true);
+        assert.equal(groupsConfig.isTentativeBookingTitle("Adult Clinic"), true);
+        assert.equal(groupsConfig.isTentativeBookingTitle("Club Event"), true);
+        assert.equal(groupsConfig.isTentativeBookingTitle("Club Event Party"), false);
+        assert.equal(groupsConfig.isTentativeBookingTitle("Private Lesson"), false);
+        assert.equal(groupsConfig.isTentativeBookingTitle(null), false);
+      } finally {
+        groupsConfig.getGroupConfig = origGetConfig;
+      }
+    });
+
     it("should detect tentative courts, place them after booked and available courts, and append * to slots", async () => {
       const origCheck = scvcc.checkCourtAvailability;
       const origBookings = scvcc.getCourtBookings;

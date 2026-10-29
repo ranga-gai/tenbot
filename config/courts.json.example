@@ -8,7 +8,8 @@
         ],
         "tentativeBookingTitles": [
           "Clinic",
-          "Club Event"
+          "Club Event",
+          "/^Team Practice/i"
         ]
       }
     ]
