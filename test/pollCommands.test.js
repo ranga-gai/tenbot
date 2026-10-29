@@ -3533,11 +3533,13 @@ describe('pollCommands', () => {
         assert.ok(idxAvail < idxTentative, "Available courts should come before Tentative courts in title");
 
         // Verify voting slots:
-        // Court 2 (slots 1..4): Player 1..Player 4
-        // Court 1 (slots 5..8): Player 5..Player 8
-        // Court 3 (slots 9..12 - tentative): Player 9*..Player 12*
+        // Court 2 (slots 1..4 - booked): Player 1..Player 4 (no *)
+        // Court 1 (slots 5..8 - available): Player 5*..Player 8* (has *)
+        // Court 3 (slots 9..12 - tentative): Player 9*..Player 12* (has *)
         assert.equal(sentPoll.values[0], "Player 1");
-        assert.equal(sentPoll.values[7], "Player 8");
+        assert.equal(sentPoll.values[3], "Player 4");
+        assert.equal(sentPoll.values[4], "Player 5*");
+        assert.equal(sentPoll.values[7], "Player 8*");
         assert.equal(sentPoll.values[8], "Player 9*");
         assert.equal(sentPoll.values[9], "Player 10*");
         assert.equal(sentPoll.values[10], "Player 11*");
