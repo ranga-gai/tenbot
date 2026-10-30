@@ -3656,8 +3656,11 @@ describe('pollCommands', () => {
 
     it("should parse slot numbers ending with *", () => {
       assert.equal(getSlotNumberForOption("Player 9*"), 9);
+      assert.equal(getSlotNumberForOption("Player 9 ✱"), 9);
       assert.equal(getSlotNumberForOption("Player 12*"), 12);
+      assert.equal(getSlotNumberForOption("Player 12 ✱"), 12);
       assert.equal(getSlotNumberForOption("Player 1*"), 1);
+      assert.equal(getSlotNumberForOption("Player 1 ✱"), 1);
     });
 
     it("should check tentative booking titles from groupsConfig", () => {
@@ -3793,12 +3796,12 @@ describe('pollCommands', () => {
         // Court 3 (slots 9..12 - tentative): Player 9*..Player 12* (has *)
         assert.equal(sentPoll.values[0], "Player 1");
         assert.equal(sentPoll.values[3], "Player 4");
-        assert.equal(sentPoll.values[4], "Player 5*");
-        assert.equal(sentPoll.values[7], "Player 8*");
-        assert.equal(sentPoll.values[8], "Player 9*");
-        assert.equal(sentPoll.values[9], "Player 10*");
-        assert.equal(sentPoll.values[10], "Player 11*");
-        assert.equal(sentPoll.values[11], "Player 12*");
+        assert.equal(sentPoll.values[4], "Player 5 ✱");
+        assert.equal(sentPoll.values[7], "Player 8 ✱");
+        assert.equal(sentPoll.values[8], "Player 9 ✱");
+        assert.equal(sentPoll.values[9], "Player 10 ✱");
+        assert.equal(sentPoll.values[10], "Player 11 ✱");
+        assert.equal(sentPoll.values[11], "Player 12 ✱");
 
         // Verify activePolls state has tentativeCourts
         const savedState = activePolls.get("poll_tentative_test");
@@ -3891,7 +3894,7 @@ describe('pollCommands', () => {
         assert.ok(sentPoll, "Poll should be created even though no free or prebooked courts exist");
         assert.match(sentPoll.name, /Court 3 - Tentative/);
         // All slots for tentative court get *
-        assert.deepEqual(sentPoll.values, ["Player 1*", "Player 2*", "Player 3*", "Player 4*"]);
+        assert.deepEqual(sentPoll.values, ["Player 1 ✱", "Player 2 ✱", "Player 3 ✱", "Player 4 ✱"]);
       } finally {
         scvcc.checkCourtAvailability = origCheck;
         scvcc.getCourtBookings = origBookings;

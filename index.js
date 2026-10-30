@@ -1198,6 +1198,10 @@ async function startBot() {
 
         if (!activePolls.has(pollId)) {
           const pollName = pollCreation.name || 'Match Poll';
+          if (pollCommands.hasSimulationPrefix && pollCommands.hasSimulationPrefix(pollName)) {
+            console.log(`[poll] Ignored manual poll with simulation prefix: ${pollId} ("${pollName}") in ${remoteJid}`);
+            continue;
+          }
           const options = (pollCreation.options || []).map((o) => o.optionName);
           const creatorName = msg.pushName || (msg.key.participant ? nameFor(msg.key.participant) : 'Someone');
           const creatorJid = msg.key.participant || remoteJid || null;
