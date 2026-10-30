@@ -888,6 +888,11 @@ if (require.main === module) {
     pollCommands.cleanupExpiredPolls(getPollContext());
   }, POLL_CLEANUP_INTERVAL_MINUTES * 60 * 1000);
 
+  // Daily message history pruning sweep (runs once per 24 hours)
+  setInterval(() => {
+    messageHistory.pruneAllExpiredMessages();
+  }, 24 * 60 * 60 * 1000);
+
   setInterval(() => {
     if (botSock) {
       pollCommands.checkAndSendPollReminders(botSock, getPollContext());

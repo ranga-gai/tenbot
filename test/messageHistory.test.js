@@ -4,7 +4,7 @@ const fs = require('fs');
 const path = require('path');
 const messageHistory = require('../lib/messageHistory');
 
-describe('messageHistory per-group storage architecture', () => {
+describe('messageHistory per-group JSONL storage architecture', () => {
   const chat1 = 'test_history_group_1@g.us';
   const chat2 = 'test_history_group_2@g.us';
 
@@ -13,7 +13,7 @@ describe('messageHistory per-group storage architecture', () => {
     messageHistory.clear(chat2);
   });
 
-  it('should store message history in separate files per chat', () => {
+  it('should store message history as JSON lines (.jsonl) in separate files per chat', () => {
     const now = Date.now();
     messageHistory.recordMessage(chat1, 'Alice', 'Hello from Chat 1', now - 1000);
     messageHistory.recordMessage(chat2, 'Bob', 'Hello from Chat 2', now);
@@ -21,18 +21,62 @@ describe('messageHistory per-group storage architecture', () => {
     const file1 = messageHistory.getChatFilePath(chat1);
     const file2 = messageHistory.getChatFilePath(chat2);
 
+    assert.ok(file1.endsWith('.jsonl'));
+    assert.ok(file2.endsWith('.jsonl'));
     assert.ok(fs.existsSync(file1));
     assert.ok(fs.existsSync(file2));
 
-    const content1 = JSON.parse(fs.readFileSync(file1, 'utf8'));
-    assert.equal(content1.chatId, chat1);
-    assert.equal(content1.messages.length, 1);
-    assert.equal(content1.messages[0].text, 'Hello from Chat 1');
+    const messages1 = messageHistory.parseJsonLines(fs.readFileSync(file1, 'utf8'));
+    assert.equal(messages1.length, 1);
+    assert.equal(messages1[0].text, 'Hello from Chat 1');
+    assert.equal(messages1[0].sender, 'Alice');
 
-    const content2 = JSON.parse(fs.readFileSync(file2, 'utf8'));
-    assert.equal(content2.chatId, chat2);
-    assert.equal(content2.messages.length, 1);
-    assert.equal(content2.messages[0].text, 'Hello from Chat 2');
+    const messages2 = messageHistory.parseJsonLines(fs.readFileSync(file2, 'utf8'));
+    assert.equal(messages2.length, 1);
+    assert.equal(messages2[0].text, 'Hello from Chat 2');
+    assert.equal(messages2[0].sender, 'Bob');
+  });
+
+  it('should perform O(1) appends to .jsonl file without pruning on each incoming message', () => {
+    const now = Date.now();
+    const oldTimestamp = now - (16 * 24 * 60 * 60 * 1000); // 16 days ago
+
+    // Record an older message
+    messageHistory.recordMessage(chat1, 'Alice', 'Old line', oldTimestamp);
+    const file1 = messageHistory.getChatFilePath(chat1);
+
+    // Record a new message - verify it appends rather than compacting/rewriting immediately
+    messageHistory.recordMessage(chat1, 'Bob', 'New line', now);
+
+    const raw = fs.readFileSync(file1, 'utf8');
+    const lines = raw.trim().split('\n');
+    assert.equal(lines.length, 2); // Both lines still in file (no rewriting during recordMessage)
+
+    // But getRecentMessages filters out the 16-day-old message
+    const recent = messageHistory.getRecentMessages(chat1);
+    assert.equal(recent.length, 1);
+    assert.equal(recent[0].text, 'New line');
+  });
+
+  it('should prune messages older than 2 weeks when pruneAllExpiredMessages runs', () => {
+    const now = Date.now();
+    const oldTimestamp = now - (15 * 24 * 60 * 60 * 1000); // 15 days ago
+    const recentTimestamp = now - (1 * 24 * 60 * 60 * 1000); // 1 day ago
+
+    messageHistory.recordMessage(chat1, 'Alice', 'Old message', oldTimestamp);
+    messageHistory.recordMessage(chat1, 'Alice', 'Recent message', recentTimestamp);
+
+    const file1 = messageHistory.getChatFilePath(chat1);
+    assert.equal(messageHistory.parseJsonLines(fs.readFileSync(file1, 'utf8')).length, 2);
+
+    // Run explicit daily prune sweep
+    const count = messageHistory.pruneAllExpiredMessages();
+    assert.ok(count >= 1);
+
+    // File on disk now only has the unexpired message
+    const onDiskAfterPrune = messageHistory.parseJsonLines(fs.readFileSync(file1, 'utf8'));
+    assert.equal(onDiskAfterPrune.length, 1);
+    assert.equal(onDiskAfterPrune[0].text, 'Recent message');
   });
 
   it('should only modify the target chat file when adding messages', () => {
@@ -54,19 +98,6 @@ describe('messageHistory per-group storage architecture', () => {
 
     const history2 = messageHistory.getRecentMessages(chat2);
     assert.equal(history2.length, 1);
-  });
-
-  it('should prune messages older than 2 weeks', () => {
-    const now = Date.now();
-    const oldTimestamp = now - (15 * 24 * 60 * 60 * 1000); // 15 days ago
-    const recentTimestamp = now - (1 * 24 * 60 * 60 * 1000); // 1 day ago
-
-    messageHistory.recordMessage(chat1, 'Alice', 'Old message', oldTimestamp);
-    messageHistory.recordMessage(chat1, 'Alice', 'Recent message', recentTimestamp);
-
-    const history = messageHistory.getRecentMessages(chat1);
-    assert.equal(history.length, 1);
-    assert.equal(history[0].text, 'Recent message');
   });
 
   it('should clear only the target chat when clear(chatId) is called', () => {
