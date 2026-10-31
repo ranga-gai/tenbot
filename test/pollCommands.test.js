@@ -934,6 +934,166 @@ describe('pollCommands', () => {
       }
     });
 
+    it('should not send failure message to group nor limit slots when tentative court booking fails', async () => {
+      const originalBookCourt = scvcc.bookCourt;
+      const originalCheckAvail = scvcc.checkCourtAvailability;
+
+      let bookAttemptCount = 0;
+      scvcc.checkCourtAvailability = async () => ({
+        slots: [{
+          time: '10:30am',
+          courts: [
+            { court: 'Court 3', status: 'available', availableMinutes: 90 }
+          ]
+        }]
+      });
+      scvcc.bookCourt = async () => {
+        bookAttemptCount++;
+        return { success: false, message: 'Court taken by another player' };
+      };
+
+      const messagesSent = [];
+      const mockSock = {
+        sendMessage: async (jid, msg) => { messagesSent.push({ jid, msg }); }
+      };
+
+      const pollState = {
+        remoteJid: '120363403838804497@g.us',
+        targetDateMDY: '10/19/2026',
+        queryTime: '10:30am',
+        size: 8,
+        prebookedCourts: [
+          { court: 'Court 2', player: 'Player A' }
+        ],
+        advanceBookedCourts: [
+          { court: 'Court 2' }
+        ],
+        unbookedCourts: [],
+        tentativeCourts: [{ court: 'Court 3', title: 'Clinic' }],
+        onDemandBookingInProgress: false
+      };
+
+      try {
+        await handleOnDemandCourtBooking(mockSock, 'poll_tentative_fail_test', pollState, [], {});
+
+        assert.ok(bookAttemptCount > 0, 'Booking should have been attempted');
+        // Tentative court is NOT removed from tentativeCourts
+        assert.equal(pollState.tentativeCourts.length, 1);
+        assert.equal(pollState.tentativeCourts[0].court, 'Court 3');
+        // slotLimit is NOT clamped and size remains unchanged
+        assert.equal(pollState.slotLimit, undefined);
+        assert.equal(pollState.size, 8);
+        assert.equal(pollState.onDemandBookingInProgress, false);
+
+        // No failure message sent to group
+        const groupMsg = messagesSent.find((m) => m.jid === '120363403838804497@g.us');
+        assert.equal(groupMsg, undefined, 'No failure message should be sent to the group chat');
+      } finally {
+        scvcc.bookCourt = originalBookCourt;
+        scvcc.checkCourtAvailability = originalCheckAvail;
+      }
+    });
+
+    it('should trigger on-demand booking again when the first voting slot corresponding to tentative court is voted on', async () => {
+      const crypto = require("crypto");
+      const makeOptHash = (name) => crypto.createHash("sha256").update(name).digest();
+      const originalBookCourt = scvcc.bookCourt;
+      const originalCheckAvail = scvcc.checkCourtAvailability;
+
+      let bookAttemptCount = 0;
+      scvcc.checkCourtAvailability = async () => ({
+        slots: [{
+          time: '10:30am',
+          courts: [
+            { court: 'Court 3', status: 'available', availableMinutes: 90 }
+          ]
+        }]
+      });
+      scvcc.bookCourt = async (params) => {
+        bookAttemptCount++;
+        return {
+          success: true,
+          court: 'Court 3',
+          date: '10/19/2026',
+          time: '10:30am',
+          reservationId: 'res-tentative-slot5',
+          players: params.players,
+          message: 'Court 3 booked successfully'
+        };
+      };
+
+      const messagesSent = [];
+      const mockSock = {
+        sendMessage: async (jid, msg) => { messagesSent.push({ jid, msg }); }
+      };
+
+      // 1 booked court (Court 2, 4 spots: 1..4), 1 tentative court (Court 3, spots: 5..8)
+      // Slots 1-4 already filled, now 5th player votes on Player 5 (first slot of tentative court)
+      const options = [
+        "Player 1", "Player 2", "Player 3", "Player 4",
+        "Player 5 ✱", "Player 6 ✱", "Player 7 ✱", "Player 8 ✱"
+      ];
+      const pollState = {
+        remoteJid: '120363403838804497@g.us',
+        targetDateMDY: '10/19/2026',
+        queryTime: '10:30am',
+        size: 8,
+        options,
+        prebookedCourts: [
+          { court: 'Court 2', player: 'Player A' }
+        ],
+        advanceBookedCourts: [
+          { court: 'Court 2' }
+        ],
+        unbookedCourts: [],
+        tentativeCourts: [{ court: 'Court 3', title: 'Clinic' }],
+        onDemandBookingInProgress: false,
+        voteBuffer: new Map()
+      };
+
+      // 5 voters: voter1..voter4 on slots 1..4, voter5 on slot 5 (tentative court)
+      const aggregated = [];
+      for (let i = 1; i <= 5; i++) {
+        const optName = options[i - 1];
+        aggregated.push({ name: optName, voters: [`voter${i}@s.whatsapp.net`] });
+        pollState.voteBuffer.set(`voter${i}@s.whatsapp.net`, {
+          pollUpdateMessageKey: { remoteJid: '120363403838804497@g.us', participant: `voter${i}@s.whatsapp.net` },
+          vote: { selectedOptions: [makeOptHash(optName)] },
+          senderTimestampMs: 1000 + i
+        });
+      }
+
+      const messageStore = new Map([['120363403838804497@g.us:poll_slot5_test', {
+        messageContextInfo: { messageSecret: Buffer.from('secret') },
+        pollCreationMessage: { options: options.map(o => ({ optionName: o })) }
+      }]]);
+
+      try {
+        const { processPollVoteEvent } = require('../lib/commands/pollCommands');
+        await processPollVoteEvent(mockSock, { id: 'poll_slot5_test', remoteJid: '120363403838804497@g.us' }, [], {
+          activePolls: new Map([['poll_slot5_test', pollState]]),
+          messageStore,
+          persistPolls: () => {}
+        });
+
+        // Wait a tick for async background on-demand booking to complete
+        await new Promise(r => setTimeout(r, 50));
+
+        assert.ok(bookAttemptCount > 0, 'Booking should have been triggered when slot 5 was voted on');
+        // Court 3 booked and moved to prebookedCourts
+        assert.equal(pollState.prebookedCourts.length, 2);
+        assert.equal(pollState.prebookedCourts[1].court, 'Court 3');
+        assert.equal(pollState.tentativeCourts.length, 0);
+
+        const groupMsg = messagesSent.find((m) => m.jid === '120363403838804497@g.us' && m.msg?.text?.includes('Court 3'));
+        assert.ok(groupMsg, 'Group should receive announcement that Court 3 is booked');
+        assert.match(groupMsg.msg.text, /Court 3.*is booked/);
+      } finally {
+        scvcc.bookCourt = originalBookCourt;
+        scvcc.checkCourtAvailability = originalCheckAvail;
+      }
+    });
+
     it('should book available court at candidate look around time specified in courtObj.time and announce with time suffix', async () => {
       const originalBookCourt = scvcc.bookCourt;
       const originalCheckAvail = scvcc.checkCourtAvailability;
