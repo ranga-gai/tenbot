@@ -92,6 +92,28 @@ describe('matchups', () => {
       assert.match(formatted, /Set 1:/);
       assert.match(formatted, /Set 2:/);
     });
+
+    it('should NOT label 3-player (2 vs 1) lineup as Singles', () => {
+      const schedule = {
+        type: 'singles',
+        sets: [
+          {
+            set: 1,
+            courts: [
+              {
+                court: 3,
+                teamA: ['Srini Usa', 'Vik'],
+                teamB: ['GBill']
+              }
+            ]
+          }
+        ]
+      };
+      const formatted = formatMatchups(schedule);
+      assert.doesNotMatch(formatted, /\(Singles\)/i);
+      assert.match(formatted, /Court 3:/);
+      assert.match(formatted, /Srini Usa & Vik vs GBill/);
+    });
   });
 
   describe('summarizeSchedule & findMatchupFor', () => {

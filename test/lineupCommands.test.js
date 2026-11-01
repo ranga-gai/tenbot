@@ -5,6 +5,7 @@ const {
   extractTimeFromLineupMessage,
   getPollMatchTime,
   findBestMatchingPollForLineup,
+  reconcileMissingPlayer,
   handleManualLineup,
   executeLineupTool,
   LINEUP_PARSER_TOOL
@@ -180,6 +181,7 @@ describe('lineupCommands', () => {
       assert.equal(res.targetPollId, null);
       assert.equal(res.matchInfo, 'none');
     });
+
     it('should match a resolved poll when updating matchups even if another poll is active in the same chat', () => {
       const activePolls = new Map([
         ['poll_resolved_today', {
@@ -251,6 +253,121 @@ describe('lineupCommands', () => {
     });
   });
 
+  describe('reconcileMissingPlayer', () => {
+    it('should reconcile singles match when 1 player is detected instead of 2', () => {
+      const poll = {
+        size: 2,
+        courtBookingType: 'singles',
+        creator: { name: 'Alice' }
+      };
+      const lineup = {
+        type: 'singles',
+        players: ['Bob'],
+        sets: [{
+          set: 1,
+          courts: [{ court: 1, teamA: ['Bob'], teamB: [] }]
+        }]
+      };
+
+      reconcileMissingPlayer(lineup, 'p_singles', poll, 'Alice', null, new Map());
+
+      assert.equal(lineup.players.length, 2);
+      assert.deepEqual(lineup.players, ['Bob', 'Alice']);
+      assert.equal(lineup.type, 'singles');
+      const court1 = lineup.sets[0].courts[0];
+      assert.deepEqual(court1.teamA, ['Bob']);
+      assert.deepEqual(court1.teamB, ['Alice']);
+    });
+
+    it('should reconcile 2-court doubles match when 7 players are detected instead of 8', () => {
+      const poll = {
+        size: 8,
+        creator: { name: 'Player8' }
+      };
+      const lineup = {
+        type: 'doubles',
+        players: ['P1', 'P2', 'P3', 'P4', 'P5', 'P6', 'P7'],
+        sets: [{
+          set: 1,
+          courts: [
+            { court: 1, teamA: ['P1', 'P2'], teamB: ['P3', 'P4'] },
+            { court: 2, teamA: ['P5', 'P6'], teamB: ['P7'] }
+          ]
+        }]
+      };
+
+      reconcileMissingPlayer(lineup, 'p_doubles8', poll, 'Player8', null, new Map());
+
+      assert.equal(lineup.players.length, 8);
+      assert.ok(lineup.players.includes('Player8'));
+      assert.equal(lineup.type, 'doubles');
+      assert.equal(lineup.sets[0].courts[0].teamA.length, 2);
+      assert.equal(lineup.sets[0].courts[0].teamB.length, 2);
+      assert.equal(lineup.sets[0].courts[1].teamA.length, 2);
+      assert.equal(lineup.sets[0].courts[1].teamB.length, 2);
+      assert.deepEqual(lineup.sets[0].courts[1].teamB, ['P7', 'Player8']);
+    });
+
+    it('should reconcile 3-court doubles match when 11 players are detected instead of 12', () => {
+      const poll = {
+        size: 12,
+        creator: { name: 'P12' }
+      };
+      const lineup = {
+        type: 'doubles',
+        players: ['P1', 'P2', 'P3', 'P4', 'P5', 'P6', 'P7', 'P8', 'P9', 'P10', 'P11'],
+        sets: [{
+          set: 1,
+          courts: [
+            { court: 1, teamA: ['P1', 'P2'], teamB: ['P3', 'P4'] },
+            { court: 2, teamA: ['P5', 'P6'], teamB: ['P7', 'P8'] },
+            { court: 3, teamA: ['P9', 'P10'], teamB: ['P11'] }
+          ]
+        }]
+      };
+
+      reconcileMissingPlayer(lineup, 'p_doubles12', poll, 'P12', null, new Map());
+
+      assert.equal(lineup.players.length, 12);
+      assert.ok(lineup.players.includes('P12'));
+      assert.deepEqual(lineup.sets[0].courts[2].teamB, ['P11', 'P12']);
+    });
+
+    it('should reconcile standalone lineup without active poll using sender', () => {
+      const lineup = {
+        type: 'doubles',
+        players: ['Alice', 'Bob', 'Charlie'],
+        sets: [{
+          set: 1,
+          courts: [{ court: 1, teamA: ['Alice', 'Bob'], teamB: ['Charlie'] }]
+        }]
+      };
+
+      reconcileMissingPlayer(lineup, null, null, 'Dave', null, new Map());
+
+      assert.equal(lineup.players.length, 4);
+      assert.ok(lineup.players.includes('Dave'));
+      assert.deepEqual(lineup.sets[0].courts[0].teamB, ['Charlie', 'Dave']);
+      assert.equal(lineup.type, 'doubles');
+    });
+
+    it('should not modify lineup when player count is already a valid configuration', () => {
+      const lineup = {
+        type: 'doubles',
+        players: ['Alice', 'Bob', 'Charlie', 'Dave'],
+        sets: [{
+          set: 1,
+          courts: [{ court: 1, teamA: ['Alice', 'Bob'], teamB: ['Charlie', 'Dave'] }]
+        }]
+      };
+
+      reconcileMissingPlayer(lineup, null, null, 'Eve', null, new Map());
+
+      assert.equal(lineup.players.length, 4);
+      assert.equal(lineup.players.includes('Eve'), false);
+    });
+  });
+
   describe('handleManualLineup', () => {
     it('should update lastPlayers, lastSchedule and send 🤖 reaction on a resolved poll', async () => {
       const targetPoll = {
@@ -312,6 +429,127 @@ describe('lineupCommands', () => {
       const reactMsg = sentMessages.find((m) => m.payload?.react?.text === '🤖');
       assert.ok(reactMsg, 'Expected 🤖 bot emoji reaction to be sent');
       assert.equal(reactMsg.payload.react.key.id, 'lineup_msg_123');
+    });
+
+    it('should automatically add poll creator as 4th player when 3 players are posted for a 4-player doubles court', async () => {
+      const targetPoll = {
+        remoteJid: 'test_chat@g.us',
+        when: 'Today 7:00am',
+        size: 4,
+        status: 'active',
+        creator: { name: 'Pramod Immaneni', jid: 'pramod@s.whatsapp.net' },
+        lastPlayers: ['Pramod Immaneni', 'Srinivas Chinnamalli', 'Vikram Takru', 'Ghufran Ahmed'],
+        lastSchedule: null
+      };
+
+      const activePolls = new Map([['poll_7am', targetPoll]]);
+      const sentMessages = [];
+      const dummySock = {
+        user: { id: 'bot@s.whatsapp.net' },
+        sendMessage: async (jid, payload) => {
+          sentMessages.push({ jid, payload });
+          return { key: { id: 'msg1' } };
+        }
+      };
+
+      // 3 players tagged by the creator on Court 3
+      const threePlayerLineup = {
+        type: 'singles',
+        time: '7:00am',
+        players: ['Srinivas Chinnamalli', 'Vikram Takru', 'Ghufran Ahmed'],
+        sets: [{
+          set: 1,
+          courts: [{ court: 3, teamA: ['Srinivas Chinnamalli', 'Vikram Takru'], teamB: ['Ghufran Ahmed'] }]
+        }]
+      };
+
+      let persisted = false;
+      const context = {
+        activePolls,
+        persistPolls: () => { persisted = true; },
+        messageStore: new Map()
+      };
+
+      const dummyMsg = {
+        key: { remoteJid: 'test_chat@g.us', id: 'lineup_msg_456', fromMe: false }
+      };
+
+      await handleManualLineup(
+        dummySock,
+        'test_chat@g.us',
+        'Pramod Immaneni',
+        threePlayerLineup,
+        dummyMsg,
+        '@Srinivas Chinnamalli @Vikram Takru @Ghufran Ahmed Court 3 7.00 AM',
+        context
+      );
+
+      assert.equal(targetPoll.status, 'resolved');
+      assert.equal(threePlayerLineup.type, 'doubles');
+      assert.equal(threePlayerLineup.players.length, 4);
+      assert.ok(threePlayerLineup.players.includes('Pramod Immaneni'));
+      const court3 = threePlayerLineup.sets[0].courts[0];
+      assert.equal(court3.teamA.length + court3.teamB.length, 4);
+      assert.ok(court3.teamB.includes('Pramod Immaneni'));
+      assert.equal(persisted, true);
+    });
+
+    it('should reconcile 2-court doubles match when 7 players are posted for an 8-player poll', async () => {
+      const targetPoll = {
+        remoteJid: 'test_chat@g.us',
+        when: 'Today 8:00am',
+        size: 8,
+        status: 'active',
+        creator: { name: 'Player8', jid: 'p8@s.whatsapp.net' },
+        lastPlayers: ['P1', 'P2', 'P3', 'P4', 'P5', 'P6', 'P7', 'Player8'],
+        lastSchedule: null
+      };
+
+      const activePolls = new Map([['poll_8am', targetPoll]]);
+      const dummySock = {
+        user: { id: 'bot@s.whatsapp.net' },
+        sendMessage: async () => ({ key: { id: 'msg1' } })
+      };
+
+      const sevenPlayerLineup = {
+        type: 'doubles',
+        time: '8:00am',
+        players: ['P1', 'P2', 'P3', 'P4', 'P5', 'P6', 'P7'],
+        sets: [{
+          set: 1,
+          courts: [
+            { court: 1, teamA: ['P1', 'P2'], teamB: ['P3', 'P4'] },
+            { court: 2, teamA: ['P5', 'P6'], teamB: ['P7'] }
+          ]
+        }]
+      };
+
+      let persisted = false;
+      const context = {
+        activePolls,
+        persistPolls: () => { persisted = true; },
+        messageStore: new Map()
+      };
+
+      const dummyMsg = {
+        key: { remoteJid: 'test_chat@g.us', id: 'lineup_msg_789', fromMe: false }
+      };
+
+      await handleManualLineup(
+        dummySock,
+        'test_chat@g.us',
+        'Player8',
+        sevenPlayerLineup,
+        dummyMsg,
+        'Court 1: P1 & P2 vs P3 & P4, Court 2: P5 & P6 vs P7',
+        context
+      );
+
+      assert.equal(targetPoll.status, 'resolved');
+      assert.equal(sevenPlayerLineup.players.length, 8);
+      assert.ok(sevenPlayerLineup.players.includes('Player8'));
+      assert.deepEqual(sevenPlayerLineup.sets[0].courts[1].teamB, ['P7', 'Player8']);
+      assert.equal(persisted, true);
     });
   });
 
