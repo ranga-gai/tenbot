@@ -120,6 +120,7 @@ const SYSTEM_PROMPT =
   'When asked who is playing, who has voted, or how many spots are left, rely strictly on the provided "Players currently in/playing" list. ' +
   'Do NOT include the creator unless they actually voted or are explicitly listed in "Players currently in/playing". ' +
   'For polls starting at slot 1, extra players / creator are NEVER included while voting is still in progress (only when all vote slots are filled and count is invalid). ' +
+  'Always give preference to lineup messages in chats over lineups in polls. When users discuss, share, or ask questions about lineups, court assignments, teams, matchups, or who is playing whom, any lineup message posted by players in the group chat takes precedence over poll options, poll votes, or automated poll-generated matchups. ' +
   'When a user asks to generate matchups, create the draw, make teams, or rematch for ANY match poll (including manually created match polls, opt-in polls, or previously resolved polls), ' +
   'ALWAYS call the generate_matchups tool (or rematch tool). If the user asks to keep specific players on the same team or partner together (e.g. "keeping PlayerA and PlayerB in same team", "partner P1 with P2", "with X and Y together"), ALWAYS pass those players in fixedPairs as a 2D array of string pairs (e.g. fixedPairs: [["PlayerA", "PlayerB"]]) to generate_matchups or rematch. NEVER tell the user that a poll has ended, is closed, or is not active when they ask for matchups. ' +
   'If there are multiple polls or a specific poll is requested (e.g. "for 10am", "Tennis 8am"), pass pollId or pollName to generate_matchups. ' +
@@ -349,7 +350,10 @@ function buildContextBlurb(chatId) {
         }
         const creatorDesc = pollState.creator?.name ? ` (created by ${pollState.creator.name})` : '';
         const statusNote = pollState.status === 'resolved' ? 'status: resolved/drawn (can rematch)' : (pollState.status === 'stopped' ? 'status: stopped (voting stopped)' : (pollState.status === 'expired' ? 'status: expired (play time passed, can still generate matchups if requested)' : 'status: active'));
-        return `[Poll ${id}] a Yes/No opt-in poll${whenSuffix}${creatorDesc} is tracked with ${yesCount} "Yes" vote(s) (${yesNames.join(', ') || 'none yet'}). (${statusNote})`;
+        const manualLineupSnippet = (pollState.manualLineupPosted && pollState.manualLineupText)
+          ? ` Active lineup posted in chat: "${pollState.manualLineupText.replace(/\s+/g, ' ').trim()}" (preferred over poll votes).`
+          : '';
+        return `[Poll ${id}] a Yes/No opt-in poll${whenSuffix}${creatorDesc} is tracked with ${yesCount} "Yes" vote(s) (${yesNames.join(', ') || 'none yet'}).${manualLineupSnippet} (${statusNote})`;
       }
 
       if (pollState.isManual) {
@@ -371,7 +375,10 @@ function buildContextBlurb(chatId) {
           return `[Poll ${id}] a user-created manual match poll "${pollState.name || 'Match Poll'}" was cancelled`;
         }
         const statusNote = pollState.status === 'resolved' ? 'status: resolved/drawn (can generate matchups again / rematch)' : (pollState.status === 'filled' ? 'status: filled (all voting slots filled, waiting for matchup request)' : (pollState.status === 'stopped' ? 'status: stopped (voting stopped, call generate_matchups when ready)' : (pollState.status === 'expired' ? 'status: expired (play time passed, can still generate matchups if requested)' : 'status: active')));
-        return `[Poll ${id}] a user-created manual match poll "${pollState.name || 'Match Poll'}" (created by ${creatorName}) is tracked with ${interestedPlayers.length} vote(s): [${optionDetails.join('; ') || 'no votes yet'}]. Players currently in/playing (${playingPlayers.length}): ${playingPlayers.join(', ')}${additionSuffix}. (${statusNote} -- when asked to generate matchups or draw, call generate_matchups)`;
+        const manualLineupSnippet = (pollState.manualLineupPosted && pollState.manualLineupText)
+          ? ` Active lineup posted in chat: "${pollState.manualLineupText.replace(/\s+/g, ' ').trim()}" (preferred over poll votes).`
+          : '';
+        return `[Poll ${id}] a user-created manual match poll "${pollState.name || 'Match Poll'}" (created by ${creatorName}) is tracked with ${interestedPlayers.length} vote(s): [${optionDetails.join('; ') || 'no votes yet'}]. Players currently in/playing (${playingPlayers.length}): ${playingPlayers.join(', ')}${additionSuffix}.${manualLineupSnippet} (${statusNote} -- when asked to generate matchups or draw, call generate_matchups)`;
       }
 
       const { aggregated } = pollCommands.getPollVoters(id, pollState, mePn, messageStore);
@@ -385,7 +392,10 @@ function buildContextBlurb(chatId) {
         return `[Poll ${id}] a ${pollState.size}-spot poll${whenSuffix} was cancelled`;
       }
       const statusNote = pollState.status === 'resolved' ? 'status: resolved/drawn (can rematch)' : (pollState.status === 'filled' ? 'status: filled (all slots filled, waiting for matchup request)' : (pollState.status === 'stopped' ? 'status: stopped (voting stopped)' : (pollState.status === 'expired' ? 'status: expired (play time passed, can still generate matchups if requested)' : 'status: active')));
-      return `[Poll ${id}] a ${pollState.size}-spot poll${whenSuffix}${creatorSuffix}${prebookedSuffix} is tracked with ${filledCount}/${totalSlotsCount} slots filled. Players currently in/playing (${currentPlayers.length}): ${currentPlayers.join(', ')}. (${statusNote})`;
+      const manualLineupSnippet = (pollState.manualLineupPosted && pollState.manualLineupText)
+        ? ` Active lineup posted in chat: "${pollState.manualLineupText.replace(/\s+/g, ' ').trim()}" (preferred over poll votes).`
+        : '';
+      return `[Poll ${id}] a ${pollState.size}-spot poll${whenSuffix}${creatorSuffix}${prebookedSuffix} is tracked with ${filledCount}/${totalSlotsCount} slots filled. Players currently in/playing (${currentPlayers.length}): ${currentPlayers.join(', ')}.${manualLineupSnippet} (${statusNote})`;
     });
     pollText = pollDescriptions.join('; ');
   }
