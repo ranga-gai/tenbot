@@ -678,5 +678,65 @@ describe('pollSimulation', () => {
       const pollMsg = sock.sentMessages[0].msg.poll;
       assert.ok(pollCommands.hasSimulationPrefix(pollMsg.name));
     });
+
+    it("should print poll flags like lineup generation, slot check, reminders in direct poll simulation summary", async () => {
+      const sock = createMockSock();
+      const activePolls = new Map();
+      const context = { activePolls, recurringPolls: new Map() };
+
+      const res = await routeCommand(
+        sock,
+        "!simulatepoll 4 7pm tomorrow --lineup-generation=fallback --lineup-lead-time=45m --no-reminders --slotcheck",
+        "120363402559062529@g.us",
+        "Alice",
+        { key: { participant: "alice@s.whatsapp.net", remoteJid: "120363402559062529@g.us" } },
+        context
+      );
+
+      assert.match(res, /Mock Poll Simulation/i);
+      assert.match(res, /Lineup Generation:\*\s*Fallback if no manual lineups posted \(45 mins before play time\)/i);
+      assert.match(res, /Reminders:\*\s*Off/i);
+      assert.match(res, /Slot Check:\*\s*Enabled/i);
+    });
+
+    it("should print poll flags like lineup generation, slot check, reminders in recurring poll simulation summary", async () => {
+      const sock = createMockSock();
+      const activePolls = new Map();
+      const recurringPolls = new Map([
+        ["rec_sim_flags", {
+          id: "rec_sim_flags",
+          remoteJid: "120363402559062529@g.us",
+          matchTime: "7:00 PM",
+          matchDisplay: "7:00 PM",
+          days: "Fridays",
+          daysDisplay: "Fridays",
+          size: 4,
+          enabled: true,
+          checkCourts: false,
+          reminders: false,
+          slotCheck: true,
+          lineupGeneration: "none",
+          courtBookingType: "none",
+          lookAround: 60,
+          creator: { name: "Alice", jid: "alice@s.whatsapp.net" }
+        }]
+      ]);
+      const context = { activePolls, recurringPolls };
+
+      const res = await routeCommand(
+        sock,
+        "!simulaterecurring rec_sim_flags",
+        "120363402559062529@g.us",
+        "Alice",
+        { key: { participant: "alice@s.whatsapp.net", remoteJid: "120363402559062529@g.us" } },
+        context
+      );
+
+      assert.match(res, /Mock Poll Simulation/i);
+      assert.match(res, /Lineup Generation:\*\s*None \(manual only\)/i);
+      assert.match(res, /Reminders:\*\s*Off/i);
+      assert.match(res, /Slot Check:\*\s*Enabled/i);
+      assert.match(res, /Look Around:\*\s*1 hour/i);
+    });
   });
 });
