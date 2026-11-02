@@ -66,7 +66,8 @@ describe('recurringPolls', () => {
       const text = '8 Mon-Thu 7pm --no-matchups --courts --pre-book-courts=2 --court-booking-type=pre-book';
       const { flags, remainingText } = extractCommonFlags(text);
 
-      assert.equal(flags.noMatchups, true);
+      assert.equal(flags.lineupGeneration, 'none');
+      assert.equal(flags.noMatchups, undefined);
       assert.equal(flags.checkCourts, true);
       assert.equal(flags.preBookCourts, 2);
       assert.equal(flags.courtBookingType, 'pre-book');
@@ -1089,6 +1090,171 @@ describe('recurringPolls', () => {
       });
       assert.equal(sched.reminders, true);
       assert.ok(modRes.includes('Reminders for poll instances: *On*'));
+    });
+  });
+
+  describe('recurring poll lineup generation synchronization', () => {
+    it('should correctly set lineupGeneration none and remove legacy flags when scheduling', async () => {
+      const recurringPolls = new Map();
+      const res = await recurringPollsModule.scheduleRecurringPoll({
+        recurringPolls,
+        persistPolls: () => {},
+        targetChatId: '120363402559062529@g.us',
+        sender: 'Alice',
+        senderJid: 'alice@s.whatsapp.net',
+        params: {
+          size: 4,
+          matchTime: '7pm',
+          days: 'mon-thu',
+          lineupGeneration: 'none'
+        }
+      });
+      assert.ok(typeof res === 'string');
+      const sched = [...recurringPolls.values()][0];
+      assert.equal(sched.lineupGeneration, 'none');
+      assert.equal(sched.autoMatchups, undefined);
+      assert.equal(sched.noMatchups, undefined);
+      const card = recurringPollsModule.formatRecurringScheduleCard(sched);
+      assert.ok(card.includes('• *Lineup Generation:* None (manual only)'));
+      assert.ok(!card.includes('• *Matchups:*'));
+    });
+
+    it('should parse various no-matchup / none lineup flags correctly', () => {
+      const f1 = recurringPollsModule.extractCommonFlags('7pm mon --auto-matchups=false');
+      assert.equal(f1.flags.lineupGeneration, 'none');
+      assert.equal(f1.flags.autoMatchups, undefined);
+      assert.equal(f1.flags.noMatchups, undefined);
+
+      const f2 = recurringPollsModule.extractCommonFlags('7pm mon --matchups=none');
+      assert.equal(f2.flags.lineupGeneration, 'none');
+      assert.equal(f2.flags.autoMatchups, undefined);
+      assert.equal(f2.flags.noMatchups, undefined);
+
+      const f3 = recurringPollsModule.extractCommonFlags('7pm mon --lineups=none');
+      assert.equal(f3.flags.lineupGeneration, 'none');
+      assert.equal(f3.flags.autoMatchups, undefined);
+      assert.equal(f3.flags.noMatchups, undefined);
+
+      const f4 = recurringPollsModule.extractCommonFlags('7pm mon lineups=none');
+      assert.equal(f4.flags.lineupGeneration, 'none');
+      assert.equal(f4.flags.autoMatchups, undefined);
+      assert.equal(f4.flags.noMatchups, undefined);
+
+      const f5 = recurringPollsModule.extractCommonFlags('7pm mon manual lineups');
+      assert.equal(f5.flags.lineupGeneration, 'none');
+      assert.equal(f5.flags.autoMatchups, undefined);
+      assert.equal(f5.flags.noMatchups, undefined);
+    });
+
+    it('should create poll instance with lineupGeneration none when recurring schedule has lineupGeneration none', async () => {
+      const recurringPolls = new Map();
+      const activePolls = new Map();
+      const pollCommands = require('../lib/commands/pollCommands');
+
+      await recurringPollsModule.scheduleRecurringPoll({
+        recurringPolls,
+        persistPolls: () => {},
+        targetChatId: '120363402559062529@g.us',
+        sender: 'Alice',
+        senderJid: 'alice@s.whatsapp.net',
+        params: {
+          size: 4,
+          matchTime: '7pm',
+          postTime: '8am',
+          days: 'monday',
+          lineupGeneration: 'none'
+        }
+      });
+
+      const sched = [...recurringPolls.values()][0];
+      assert.equal(sched.lineupGeneration, 'none');
+
+      const mockSock = {
+        user: { id: 'tenbot@s.whatsapp.net' },
+        sendMessage: async (jid, content) => ({
+          key: { id: 'poll_inst_lineup_none', remoteJid: jid },
+          message: content
+        })
+      };
+
+      const context = {
+        activePolls,
+        messageStore: new Map(),
+        latestPollIdByChat: new Map(),
+        persistPolls: () => {}
+      };
+
+      await recurringPollsModule.checkAndPostRecurringPolls({
+        sock: mockSock,
+        recurringPolls,
+        persistPolls: () => {},
+        createMatchPoll: (...args) => pollCommands.createMatchPoll(...args, context),
+        getTargetGroupJid: async () => '120363402559062529@g.us',
+        customSanJoseParts: { year: 2026, month: 10, day: 2, weekday: 'mon', hour: 8, minute: 0 }
+      });
+
+      const pollState = activePolls.get('poll_inst_lineup_none');
+      assert.ok(pollState, 'Poll instance should be created');
+      assert.equal(pollState.lineupGeneration, 'none', 'Poll instance lineupGeneration must be none');
+      assert.equal(pollState.noMatchups, undefined, 'Poll instance noMatchups should be removed');
+      assert.equal(pollState.autoMatchups, undefined, 'Poll instance autoMatchups should be removed');
+    });
+
+    it('should update active poll instance when modifying recurring poll lineupGeneration to none', async () => {
+      const recurringPolls = new Map();
+      const activePolls = new Map();
+
+      const schedId = 'rec_mod_sync_test';
+      const sched = {
+        id: schedId,
+        remoteJid: '120363402559062529@g.us',
+        size: 4,
+        matchTime: '7:00 PM',
+        matchDisplay: '7:00 PM',
+        matchHour: 19,
+        matchMinute: 0,
+        postTime: '8:00 AM',
+        days: 'monday',
+        daysList: ['mon'],
+        autoMatchups: true,
+        noMatchups: false,
+        lineupGeneration: 'filled',
+        lineupLeadTime: 30,
+        enabled: true
+      };
+      recurringPolls.set(schedId, sched);
+
+      const existingPollId = 'poll_existing_inst';
+      const pollState = {
+        remoteJid: '120363402559062529@g.us',
+        name: '🎾 Today 7pm (4 slots / 4)',
+        scheduleId: schedId,
+        status: 'active',
+        lineupGeneration: 'filled',
+        noMatchups: false,
+        autoMatchups: true,
+        lineupLeadTime: 30
+      };
+      activePolls.set(existingPollId, pollState);
+
+      const modRes = await recurringPollsModule.modifyRecurringPoll({
+        recurringPolls,
+        persistPolls: () => {},
+        activePolls,
+        sender: 'Alice',
+        scheduleId: schedId,
+        updates: { lineupGeneration: 'none' }
+      });
+
+      assert.ok(modRes.includes('Lineup generation: *None (manual only)*'));
+      assert.equal(sched.lineupGeneration, 'none');
+      assert.equal(sched.noMatchups, undefined);
+      assert.equal(sched.autoMatchups, undefined);
+
+      // Verify active poll instance was synchronized and legacy flags removed
+      assert.equal(pollState.lineupGeneration, 'none');
+      assert.equal(pollState.noMatchups, undefined);
+      assert.equal(pollState.autoMatchups, undefined);
     });
   });
 

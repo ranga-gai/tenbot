@@ -3661,28 +3661,28 @@ describe('pollCommands', () => {
         assert.equal(legacyActivePoll1.lineupLeadTime, 30);
         assert.equal(legacyActivePoll1.lineupLeadTimeDisplay, "30 mins");
         assert.equal(legacyActivePoll1.manualLineupPosted, false);
-        assert.equal(legacyActivePoll1.noMatchups, true);
-        assert.equal(legacyActivePoll1.autoMatchups, false);
+        assert.equal(legacyActivePoll1.noMatchups, undefined);
+        assert.equal(legacyActivePoll1.autoMatchups, undefined);
 
         // Verify legacyActivePoll2
         assert.equal(legacyActivePoll2.lineupGeneration, "filled");
         assert.equal(legacyActivePoll2.lineupLeadTime, 30);
         assert.equal(legacyActivePoll2.lineupLeadTimeDisplay, "30 mins");
         assert.equal(legacyActivePoll2.manualLineupPosted, false);
-        assert.equal(legacyActivePoll2.noMatchups, false);
-        assert.equal(legacyActivePoll2.autoMatchups, true);
+        assert.equal(legacyActivePoll2.noMatchups, undefined);
+        assert.equal(legacyActivePoll2.autoMatchups, undefined);
 
         // Verify legacySched1
         assert.equal(legacySched1.lineupGeneration, "none");
         assert.equal(legacySched1.lineupLeadTime, 30);
-        assert.equal(legacySched1.noMatchups, true);
-        assert.equal(legacySched1.autoMatchups, false);
+        assert.equal(legacySched1.noMatchups, undefined);
+        assert.equal(legacySched1.autoMatchups, undefined);
 
         // Verify legacySched2
         assert.equal(legacySched2.lineupGeneration, "filled");
         assert.equal(legacySched2.lineupLeadTime, 30);
-        assert.equal(legacySched2.noMatchups, false);
-        assert.equal(legacySched2.autoMatchups, true);
+        assert.equal(legacySched2.noMatchups, undefined);
+        assert.equal(legacySched2.autoMatchups, undefined);
 
         // Verify modern items were preserved without changes
         assert.equal(modernActivePoll.lineupGeneration, "fallback");
