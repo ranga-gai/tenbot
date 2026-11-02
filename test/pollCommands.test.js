@@ -679,7 +679,7 @@ describe('pollCommands', () => {
           time: '10:30am',
           courts: [
             { court: 'Court 1', status: 'available', availableMinutes: 90 },
-            { court: 'Court 4', status: 'available', availableMinutes: 90 }
+            { court: 'Court 5', status: 'available', availableMinutes: 90 }
           ]
         }]
       });
@@ -4523,6 +4523,253 @@ describe('pollCommands', () => {
         assert.ok(newPoll, 'New poll should exist in activePolls');
         assert.equal(newPoll.maxCourts, 3);
         assert.equal(newPoll.options.length, 12);
+      } finally {
+        scvcc.checkCourtAvailability = origCheck;
+        scvcc.getCourtBookings = origBookings;
+        groupsConfig.getGroupConfig = origGetConfig;
+      }
+    });
+    it('should convert poll with > 12 slots to Yes/No opt-in poll as WhatsApp does not support > 12 options', async () => {
+      let sentPoll = null;
+      const mockSock = {
+        user: { id: 'tenbot@s.whatsapp.net' },
+        sendMessage: async (jid, payload) => {
+          sentPoll = payload;
+          return { key: { id: 'poll_16_slots', remoteJid: jid } };
+        }
+      };
+
+      const activePolls = new Map();
+      const messageStore = new Map();
+      const context = {
+        activePolls,
+        messageStore,
+        latestPollIdByChat: new Map(),
+        persistPolls: () => {}
+      };
+
+      // Creating a poll for 16 spots (which would otherwise produce 15 or 16 voting slots)
+      const res = await createMatchPoll(
+        mockSock,
+        'group1@g.us',
+        16,
+        'tomorrow 7pm',
+        'tomorrow',
+        '7pm',
+        'Alice',
+        'alice@s.whatsapp.net',
+        true,
+        null,
+        false,
+        true,
+        false,
+        false,
+        false,
+        false,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        context
+      );
+
+      assert.ok(res, 'Poll result should exist');
+      assert.equal(res.isOptIn, true, 'Should be converted to opt-in poll');
+      assert.deepEqual(res.options, ['Yes', 'No'], 'Options should be Yes and No');
+      assert.deepEqual(res.values, ['Yes', 'No'], 'Values should be Yes and No');
+      assert.equal(res.size, null, 'Opt-in poll size should be null');
+      assert.match(res.pollTitle, /\(Vote Yes\/No\)/, 'Poll title should indicate Vote Yes/No');
+
+      assert.ok(sentPoll?.poll, 'Poll message should have been sent');
+      assert.deepEqual(sentPoll.poll.values, ['Yes', 'No'], 'Sent poll options should be Yes and No');
+      assert.match(sentPoll.poll.name, /\(Vote Yes\/No\)/, 'Sent poll title should indicate Vote Yes/No');
+
+      const pollState = activePolls.get('poll_16_slots');
+      assert.ok(pollState, 'Poll state should be stored');
+      assert.equal(pollState.type, 'opt_in', 'Poll state type should be opt_in');
+      assert.deepEqual(pollState.options, ['Yes', 'No']);
+      assert.equal(pollState.size, null);
+    });
+
+    it('should convert auto poll with 4 courts (16 slots) to Yes/No opt-in poll', async () => {
+      let sentPoll = null;
+      const mockSock = {
+        user: { id: 'tenbot@s.whatsapp.net' },
+        sendMessage: async (jid, payload) => {
+          sentPoll = payload;
+          return { key: { id: 'poll_auto_4courts', remoteJid: jid } };
+        }
+      };
+
+      const activePolls = new Map();
+      const messageStore = new Map();
+      const context = {
+        activePolls,
+        messageStore,
+        latestPollIdByChat: new Map(),
+        persistPolls: () => {}
+      };
+
+      const preExistingBookings = {
+        advanceBookedCourts: [
+          { court: 'Court 1', player: 'Alice', time: '7pm' },
+          { court: 'Court 2', player: 'Bob', time: '7pm' },
+          { court: 'Court 3', player: 'Charlie', time: '7pm' },
+          { court: 'Court 4', player: 'Dave', time: '7pm' }
+        ]
+      };
+
+      const res = await createMatchPoll(
+        mockSock,
+        'group1@g.us',
+        'auto',
+        'tomorrow 7pm',
+        'tomorrow',
+        '7pm',
+        'Alice',
+        'alice@s.whatsapp.net',
+        false,
+        null,
+        false,
+        true,
+        false,
+        true,
+        false,
+        false,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        preExistingBookings,
+        context
+      );
+
+      assert.ok(res, 'Poll result should exist');
+      assert.equal(res.isOptIn, true, 'Should be converted to opt-in poll');
+      assert.deepEqual(res.options, ['Yes', 'No']);
+      assert.equal(res.size, null);
+      assert.match(res.pollTitle, /\(Vote Yes\/No\)/);
+      assert.ok(sentPoll?.poll);
+      assert.deepEqual(sentPoll.poll.values, ['Yes', 'No']);
+    });
+
+    it('dynamically creates an enumerated poll when 3 courts are available and converts to Yes/No poll when 4 courts are available (maxCourts: 4)', async () => {
+      const origCheck = scvcc.checkCourtAvailability;
+      const origBookings = scvcc.getCourtBookings;
+      const origGetConfig = groupsConfig.getGroupConfig;
+
+      try {
+        groupsConfig.getGroupConfig = () => ({ sport: 'tennis', courtConfig: 'SCVCC', maxCourts: 4 });
+        scvcc.getCourtBookings = async () => ({ bookings: [] });
+
+        let sentPolls = [];
+        const mockSock = {
+          user: { id: 'tenbot@s.whatsapp.net' },
+          sendMessage: async (jid, payload) => {
+            sentPolls.push(payload);
+            return { key: { id: `poll_${sentPolls.length}`, remoteJid: jid } };
+          }
+        };
+
+        const activePolls = new Map();
+        const messageStore = new Map();
+        const context = { activePolls, messageStore, latestPollIdByChat: new Map(), persistPolls: () => {} };
+
+        // Day A: Only 3 courts available
+        scvcc.checkCourtAvailability = async () => ({
+          slots: [{
+            time: '7pm',
+            courts: [
+              { court: 'Court 1', status: 'available', availableMinutes: 90 },
+              { court: 'Court 2', status: 'available', availableMinutes: 90 },
+              { court: 'Court 3', status: 'available', availableMinutes: 90 }
+            ]
+          }]
+        });
+
+        const res3 = await createMatchPoll(
+          mockSock,
+          'group1@g.us',
+          'auto',
+          'tomorrow 7pm',
+          'tomorrow',
+          '7pm',
+          'Alice',
+          'alice@s.whatsapp.net',
+          false,
+          null,
+          false,
+          true,
+          false,
+          true,
+          false,
+          true,
+          'rec_schedule_1',
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          { maxCourts: 4 },
+          context
+        );
+
+        assert.equal(res3.isOptIn, false, '3 courts (12 slots) should remain a regular enumerated poll');
+        assert.equal(res3.options.length, 12, 'Should have 12 player slots');
+        assert.match(res3.pollTitle, /\(12 slots \/ 12\)/);
+        assert.equal(sentPolls[0].poll.values.length, 12);
+
+        // Day B: 4 courts available
+        scvcc.checkCourtAvailability = async () => ({
+          slots: [{
+            time: '7pm',
+            courts: [
+              { court: 'Court 1', status: 'available', availableMinutes: 90 },
+              { court: 'Court 2', status: 'available', availableMinutes: 90 },
+              { court: 'Court 3', status: 'available', availableMinutes: 90 },
+              { court: 'Court 5', status: 'available', availableMinutes: 90 }
+            ]
+          }]
+        });
+
+        const res4 = await createMatchPoll(
+          mockSock,
+          'group1@g.us',
+          'auto',
+          'tomorrow 7pm',
+          'tomorrow',
+          '7pm',
+          'Alice',
+          'alice@s.whatsapp.net',
+          false,
+          null,
+          false,
+          true,
+          false,
+          true,
+          false,
+          true,
+          'rec_schedule_2',
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          { maxCourts: 4 },
+          context
+        );
+
+        assert.equal(res4.isOptIn, true, '4 courts (16 slots) should convert to a Yes/No opt-in poll');
+        assert.deepEqual(res4.options, ['Yes', 'No']);
+        assert.match(res4.pollTitle, /\(Vote Yes\/No\)/);
+        assert.deepEqual(sentPolls[1].poll.values, ['Yes', 'No']);
       } finally {
         scvcc.checkCourtAvailability = origCheck;
         scvcc.getCourtBookings = origBookings;
