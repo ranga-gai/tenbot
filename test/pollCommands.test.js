@@ -3494,6 +3494,69 @@ describe('pollCommands', () => {
       assert.equal(pollState.lineupGeneration, "none");
     });
 
+    it("should update lineup generation in-place for manual tracked polls without creating a new poll", async () => {
+      let createPollCalled = false;
+      const mockSock = {
+        sendMessage: async () => {
+          createPollCalled = true;
+          return { key: { id: "new_poll" } };
+        }
+      };
+
+      const manualPollState = {
+        name: "Sunday Tennis 9am",
+        isManual: true,
+        status: "active",
+        when: "Sunday 9am",
+        lineupGeneration: "none",
+        lineupLeadTime: 30,
+        remoteJid: "group1@g.us",
+        creator: { name: "Alice", jid: "alice@s.whatsapp.net" },
+        voteBuffer: new Map()
+      };
+      const activePolls = new Map([["manual_poll_1", manualPollState]]);
+      let persisted = false;
+      const context = {
+        activePolls,
+        recurringPolls: new Map(),
+        latestPollIdByChat: new Map([["group1@g.us", "manual_poll_1"]]),
+        persistPolls: () => { persisted = true; }
+      };
+
+      // 1. Update lineup generation to filled on manual poll
+      const cmd1 = parseModifyInstanceCommand('!modifypoll manual_poll_1 lineupGeneration=filled');
+      assert.equal(cmd1.updates.lineupGeneration, "filled");
+
+      const res1 = await handleModifyPollInstance(mockSock, "group1@g.us", "Alice", "alice@s.whatsapp.net", cmd1.targetId, cmd1.updates, context);
+      assert.match(res1, /Updated configuration for manual poll/i);
+      assert.match(res1, /Lineup generation:.*Filled/i);
+      assert.match(res1, /WhatsApp poll message was kept intact/i);
+      assert.equal(manualPollState.lineupGeneration, "filled");
+      assert.equal(createPollCalled, false, "createMatchPoll should not be called for manual polls");
+      assert.equal(persisted, true);
+
+      // 2. Update lineup generation with natural language syntax "lineup generation to fallback"
+      const cmd2 = parseModifyInstanceCommand('!modifypoll manual_poll_1 lineup generation to fallback');
+      assert.equal(cmd2.updates.lineupGeneration, "fallback");
+
+      const res2 = await handleModifyPollInstance(mockSock, "group1@g.us", "Alice", "alice@s.whatsapp.net", cmd2.targetId, cmd2.updates, context);
+      assert.match(res2, /Updated configuration for manual poll/i);
+      assert.match(res2, /Lineup generation:.*Fallback/i);
+      assert.equal(manualPollState.lineupGeneration, "fallback");
+      assert.equal(createPollCalled, false);
+
+      // 3. Omitting targetId when only 1 active poll exists
+      const cmd3 = parseModifyInstanceCommand('!modifypoll lineup generation none');
+      assert.equal(cmd3.targetId, null);
+      assert.equal(cmd3.updates.lineupGeneration, "none");
+
+      const res3 = await handleModifyPollInstance(mockSock, "group1@g.us", "Alice", "alice@s.whatsapp.net", cmd3.targetId, cmd3.updates, context);
+      assert.match(res3, /Updated configuration for manual poll/i);
+      assert.match(res3, /Lineup generation:.*None/i);
+      assert.equal(manualPollState.lineupGeneration, "none");
+      assert.equal(createPollCalled, false);
+    });
+
     it("should display lineup generation status in pollStatusText", () => {
       const pollState = {
         name: "Tennis Match",

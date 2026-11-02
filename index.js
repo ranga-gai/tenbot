@@ -145,8 +145,11 @@ const SYSTEM_PROMPT =
   'When cancelling or deleting a poll upon user request (e.g. "@tenbot cancel poll" or "@tenbot delete poll"), ' +
   'call cancel_poll, which will also delete the poll message from WhatsApp. ' +
   'If a poll is deleted directly in WhatsApp by a user or admin, it is automatically removed from tracking. ' +
-  'If the user requests changes to an existing poll (e.g. changing the time, number of players, or day) and a new poll is created, ' +
-  'set cancelExisting: true (or pass replacePollId) in create_poll so the older poll is automatically deleted from WhatsApp and replaced. ' +
+  'When a user asks to modify or update settings on an existing active poll (such as lineup generation, slot check, reminders, or look around), ' +
+  'ALWAYS call the modify_poll_instance tool (do NOT create a new poll with create_poll). ' +
+  'For manual tracked polls or non-structural poll settings (lineup generation, slot check, reminders), ' +
+  'modify_poll_instance updates the configuration in-place keeping the WhatsApp poll message intact. ' +
+  'Only call create_poll with cancelExisting: true when a user explicitly asks to recreate or replace a bot poll with new time, day, or size. ' +
   'For fixed-spot polls, by default the user asking to create the poll is Player 1 ' +
   'unless they explicitly state they are not playing or they already have another match poll scheduled within less than 90 minutes of the resolved play time. ' +
   'When a message contains a request alongside other questions, execute the appropriate tools and answer naturally.';
@@ -1260,6 +1263,7 @@ async function startBot() {
             createdAt: new Date().toISOString(),
             status: 'active',
             isManual: true,
+            lineupGeneration: 'none',
             slotCheck: Boolean(interpretation.slotCheck),
             creator: { name: creatorName, jid: creatorJid },
             lastConflictSignature: null,
