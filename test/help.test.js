@@ -73,6 +73,20 @@ describe('help', () => {
     assert.match(text, /`\[duration\]` — Length of booking/);
   });
 
+  it('should return detailed help for "!help modifycourt" including option descriptions', () => {
+    const text = helpText('modifycourt', false);
+    assert.match(text, /Modify Court Booking/);
+    assert.match(text, /Options:/);
+    assert.match(text, /`<reservationId>`/);
+    assert.match(text, /to \[Court <N>\]/);
+    assert.match(text, /\[time\]/);
+    assert.match(text, /Examples:/);
+
+    // Also test alias
+    const aliasText = helpText('updatecourt', false);
+    assert.equal(aliasText, text);
+  });
+
   it('should return detailed help for "!help modifyinstance" including option descriptions', () => {
     const text = helpText('modifyinstance', false);
     assert.match(text, /Modify Poll Instance/);
