@@ -9,6 +9,7 @@ const {
   getFirstSlotNumber,
   extractFixedPairsFromText,
   parsePollCreationText,
+  extractNamedPlayersFromTitle,
   resolveManualPollPlayers,
   buildPollReminderText,
   formatReminderHours,
@@ -209,8 +210,54 @@ describe('pollCommands', () => {
   });
 
   describe('resolveManualPollPlayers', () => {
-    it('should prepend leading creator players if first slot > 1', () => {
+    it('should extract named players from title (VJ, Vik, Deepak) and record Vijay Parthasarathy, Vik and DD', () => {
       const pollState = {
+        name: 'Tennis at 5 PM Tuesday with VJ, Vik, Deepak',
+        type: 'manual',
+        size: 4,
+        options: ['Player 4'],
+        creator: { name: 'Vijay Parthasarathy', jid: '278081952608440@lid' }
+      };
+
+      // Before anyone votes on the free slot
+      const resultNoVotes = resolveManualPollPlayers(pollState, []);
+      assert.deepEqual(resultNoVotes.players, ['Vijay Parthasarathy', 'Vik', 'DD']);
+      assert.deepEqual(resultNoVotes.addedFromLabel, ['Vijay Parthasarathy', 'Vik', 'DD']);
+
+      // When a 4th player votes on the open slot
+      const resultWithVote = resolveManualPollPlayers(pollState, ['Shan']);
+      assert.deepEqual(resultWithVote.players, ['Vijay Parthasarathy', 'Vik', 'DD', 'Shan']);
+    });
+
+    it('should handle 1 free voting slot when slot is not numbered', () => {
+      const pollState = {
+        name: 'Tennis at 5 PM Tuesday with VJ, Vik, Deepak',
+        type: 'manual',
+        size: 4,
+        options: ['1 free slot'],
+        creator: { name: 'Vijay Parthasarathy', jid: '278081952608440@lid' }
+      };
+
+      const result = resolveManualPollPlayers(pollState, []);
+      assert.deepEqual(result.players, ['Vijay Parthasarathy', 'Vik', 'DD']);
+    });
+
+    it('should prepend creator if creator not explicitly named in with clause', () => {
+      const pollState = {
+        name: 'Tennis Tuesday 5pm with Vik, Deepak',
+        type: 'manual',
+        size: 4,
+        options: ['Player 4'],
+        creator: { name: 'Vijay Parthasarathy', jid: '278081952608440@lid' }
+      };
+
+      const result = resolveManualPollPlayers(pollState, []);
+      assert.deepEqual(result.players, ['Vijay Parthasarathy', 'Vik', 'DD']);
+    });
+
+    it('should prepend leading creator players if first slot > 1 and no names in title', () => {
+      const pollState = {
+        name: 'Tennis 7pm',
         type: 'manual',
         size: 4,
         options: ['Player 3', 'Player 4'],

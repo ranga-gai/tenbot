@@ -367,7 +367,7 @@ function buildContextBlurb(chatId) {
         const creatorName = pollState.creator?.name || 'Someone';
 
         let additionNotes = [];
-        if (addedFromLabel.length > 0) additionNotes.push(`[${addedFromLabel.join(', ')}] from poll slot labels`);
+        if (addedFromLabel.length > 0) additionNotes.push(`[${addedFromLabel.join(', ')}] from poll slot labels / title`);
         if (addedFromValidCount.length > 0) additionNotes.push(`[${addedFromValidCount.join(', ')}] to reach valid player count`);
         const additionSuffix = additionNotes.length > 0 ? ` (includes ${additionNotes.join(' and ')})` : '';
 
@@ -1254,7 +1254,31 @@ async function startBot() {
           }
 
           const pollType = interpretation.type || (options.some((opt) => /^yes$/i.test(opt.trim())) ? 'opt_in' : 'manual');
-          const pollSize = interpretation.size !== undefined && interpretation.size !== null ? interpretation.size : (pollType === 'opt_in' ? null : (options.length > 0 ? options.length : null));
+          const extractedNamedPlayers = pollCommands.extractNamedPlayersFromTitle ? pollCommands.extractNamedPlayersFromTitle(pollName, creatorName, remoteJid) : [];
+          const llmNamed = Array.isArray(interpretation.namedPlayers) ? interpretation.namedPlayers : [];
+          const combinedNamed = [...extractedNamedPlayers];
+          for (const p of llmNamed) {
+            const match = namesStore.findIdByNameOrAlias(p, remoteJid);
+            const resolved = match ? (match.entry.name || match.entry.fullName) : p;
+            if (!combinedNamed.some((existing) => ratings.keyFor(existing) === ratings.keyFor(resolved))) {
+              combinedNamed.push(resolved);
+            }
+          }
+
+          const firstSlotNum = pollCommands.getFirstSlotNumber ? pollCommands.getFirstSlotNumber(options) : null;
+          let naturalPollSize = interpretation.size;
+          if (typeof naturalPollSize !== 'number') {
+            if (pollType === 'opt_in') {
+              naturalPollSize = null;
+            } else if (firstSlotNum && firstSlotNum > 1) {
+              naturalPollSize = (firstSlotNum - 1) + options.length;
+            } else if (combinedNamed.length > 0 && options.length > 0) {
+              naturalPollSize = combinedNamed.length + options.length;
+            } else {
+              naturalPollSize = options.length > 0 ? options.length : null;
+            }
+          }
+          const pollSize = naturalPollSize;
           const initialManualHours = playAt ? ((playAt.getTime() - Date.now()) / (60 * 60 * 1000)) : 0;
           const manualSentReminders = playAt
             ? [1, 2, 4, 8, 16, 24, 32, 64].filter((h) => h > initialManualHours && h > 1)
@@ -1274,6 +1298,7 @@ async function startBot() {
             status: 'active',
             isManual: true,
             lineupGeneration: 'none',
+            namedPlayers: combinedNamed,
             slotCheck: Boolean(interpretation.slotCheck),
             creator: { name: creatorName, jid: creatorJid },
             lastConflictSignature: null,
@@ -1294,6 +1319,18 @@ async function startBot() {
               jid: creatorJid,
               lid: creatorLid && creatorLid.endsWith('@lid') ? creatorLid : null
             }]).catch(() => {});
+          }
+          for (const p of combinedNamed) {
+            if (p && !ratings.isPlaceholder(p) && !GENERIC_NAMES.has(ratings.keyFor(p))) {
+              const match = namesStore.findIdByNameOrAlias(p, remoteJid);
+              const pLid = match?.id?.endsWith('@lid') ? match.id : null;
+              const pPn = match?.entry?.pn || (match?.id?.endsWith('@s.whatsapp.net') ? match.id : null);
+              ratings.ensureRated([{
+                name: p,
+                jid: pPn || (pLid ? pLid.replace('@lid', '@s.whatsapp.net') : null),
+                lid: pLid
+              }]).catch(() => {});
+            }
           }
           console.log(`[poll] LLM verified & passively tracking manually-created match poll ${pollId} ("${pollName}", when: "${resolvedWhen}", type: ${pollType}, size: ${pollSize}) by ${creatorName} in ${remoteJid}`);
 
@@ -1482,6 +1519,7 @@ module.exports = {
   decryptMessageEdit,
   tryDecryptMessageEdit,
   extractText,
+  extractNamedPlayersFromTitle: pollCommands.extractNamedPlayersFromTitle,
   resolveManualPollPlayers: pollCommands.resolveManualPollPlayers,
   hasTimeSpecifiedInTitle: pollCommands.hasTimeSpecifiedInTitle,
   handleGroupLineup,
