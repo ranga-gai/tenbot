@@ -485,4 +485,199 @@ describe('handleModifyPollInstance with advanceBookedCourts', () => {
       scvcc.modifyCourtBooking = originalModify;
     }
   });
+
+  describe("parseModifyCourtCommand group parameter", () => {
+    it("should parse --group flag", () => {
+      const parsed = scvcc.parseModifyCourtCommand("!modifycourt 194617 Court 1 --group=\"Bot-testing\"");
+      assert.equal(parsed.reservationId, "194617");
+      assert.equal(parsed.court, "Court 1");
+      assert.equal(parsed.group, "Bot-testing");
+    });
+
+    it("should parse -g flag", () => {
+      const parsed = scvcc.parseModifyCourtCommand("!modifycourt 194617 to Court 2 7pm -g Bot-testing");
+      assert.equal(parsed.reservationId, "194617");
+      assert.equal(parsed.court, "Court 2");
+      assert.equal(parsed.time, "7pm");
+      assert.equal(parsed.group, "Bot-testing");
+    });
+
+    it("should parse for group syntax", () => {
+      const parsed = scvcc.parseModifyCourtCommand("!modifycourt Court 2 tomorrow to Court 1 for group \"Tennis Club\"");
+      assert.equal(parsed.targetCourt, "Court 2");
+      assert.equal(parsed.court, "Court 1");
+      assert.equal(parsed.when, "tomorrow");
+      assert.equal(parsed.group, "Tennis Club");
+    });
+
+    it("should parse group <name> syntax", () => {
+      const parsed = scvcc.parseModifyCourtCommand("!modifycourt 194617 7:30pm group Bot-testing with Alice, Bob");
+      assert.equal(parsed.reservationId, "194617");
+      assert.equal(parsed.time, "7:30pm");
+      assert.equal(parsed.group, "Bot-testing");
+      assert.deepEqual(parsed.players, ["Alice", "Bob"]);
+    });
+  });
+
+  describe("resolveTargetChatId and group admin permission checks", () => {
+    const mockSock = {
+      groupMetadata: async (jid) => ({
+        id: jid,
+        subject: "Bot-testing",
+        participants: [
+          { id: "admin_user@s.whatsapp.net", admin: "admin" },
+          { id: "regular_user@s.whatsapp.net", admin: null }
+        ]
+      }),
+      sendMessage: async () => {}
+    };
+
+    it("should resolve target group by name in groups.json", async () => {
+      const res = await courtCommands.resolveTargetChatId(mockSock, "dm_chat", "admin_user@s.whatsapp.net", "Bot-testing");
+      assert.equal(res.targetChatId, "120363403838804497@g.us");
+      assert.equal(res.error, undefined);
+    });
+
+    it("should return error if group is not found", async () => {
+      const res = await courtCommands.resolveTargetChatId(mockSock, "dm_chat", "admin_user@s.whatsapp.net", "NonExistentGroup123");
+      assert.ok(res.error);
+      assert.match(res.error, /Group "NonExistentGroup123" was not found/);
+    });
+
+    it("should reject if sender is not an admin of the target group", async () => {
+      const res = await courtCommands.resolveTargetChatId(mockSock, "other_chat", "regular_user@s.whatsapp.net", "Bot-testing");
+      assert.ok(res.error);
+      assert.match(res.error, /Only group admins or the bot superadmin can modify court bookings/);
+    });
+
+    it("should allow if sender is superadmin", async () => {
+      const res = await courtCommands.resolveTargetChatId(mockSock, "dm_chat", "90611059302558@lid", "Bot-testing");
+      assert.equal(res.targetChatId, "120363403838804497@g.us");
+      assert.equal(res.error, undefined);
+    });
+
+    it("should allow admin running !modifycourt with --group to update target group", async () => {
+      const originalModify = scvcc.modifyCourtBooking;
+      let modifyCalledWith = null;
+      scvcc.modifyCourtBooking = async (params) => {
+        modifyCalledWith = params;
+        return {
+          success: true,
+          court: "Court 1",
+          time: "7:00 PM",
+          date: "11/4/2026",
+          players: ["Pramod"],
+          message: "Updated"
+        };
+      };
+
+      const targetGroupJid = "120363403838804497@g.us";
+      const otherGroupJid = "other_group@g.us";
+
+      const targetPollState = {
+        remoteJid: targetGroupJid,
+        name: "🎾 Tuesday 7pm\n\nCourt 2 - Booked\n",
+        queryTime: "7pm",
+        advanceBookedCourts: [
+          { court: "Court 2", reservationId: "194617", date: "11/4/2026", time: "7:00 PM" }
+        ],
+        prebookedCourts: [
+          { court: "Court 2", player: "Pramod", time: "7:00 PM" }
+        ]
+      };
+
+      const otherPollState = {
+        remoteJid: otherGroupJid,
+        name: "🎾 Tuesday 7pm\n\nCourt 2 - Booked\n",
+        queryTime: "7pm",
+        advanceBookedCourts: [
+          { court: "Court 2", reservationId: "999999", date: "11/4/2026", time: "7:00 PM" }
+        ]
+      };
+
+      const context = {
+        activePolls: new Map([
+          ["p_target", targetPollState],
+          ["p_other", otherPollState]
+        ]),
+        recurringPolls: new Map(),
+        persistPolls: () => {}
+      };
+
+      try {
+        // Run from DM as admin specifying group Bot-testing
+        const res = await courtCommands.handleCourtCommand(
+          mockSock,
+          "!modifycourt 194617 to Court 1 --group=\"Bot-testing\"",
+          "dm_chat_user",
+          "Admin",
+          "admin_user@s.whatsapp.net",
+          null,
+          context
+        );
+
+        assert.equal(res, "Updated");
+        assert.ok(modifyCalledWith);
+        assert.equal(modifyCalledWith.chatId, targetGroupJid);
+        assert.equal(modifyCalledWith.court, "Court 1");
+
+        // Target poll state should be updated to Court 1
+        assert.equal(targetPollState.advanceBookedCourts[0].court, "Court 1");
+        assert.ok(targetPollState.name.includes("Court 1 - Booked"));
+
+        // Other group poll state must NOT be touched
+        assert.equal(otherPollState.advanceBookedCourts[0].court, "Court 2");
+      } finally {
+        scvcc.modifyCourtBooking = originalModify;
+      }
+    });
+
+    it("should allow modify_court_reservation tool with group parameter", async () => {
+      const originalModify = scvcc.modifyCourtBooking;
+      let modifyCalledWith = null;
+      scvcc.modifyCourtBooking = async (params) => {
+        modifyCalledWith = params;
+        return {
+          success: true,
+          court: "Court 3",
+          time: "7:00 PM",
+          date: "11/4/2026",
+          message: "Tool Updated"
+        };
+      };
+
+      const targetGroupJid = "120363403838804497@g.us";
+      const targetPollState = {
+        remoteJid: targetGroupJid,
+        advanceBookedCourts: [
+          { court: "Court 2", reservationId: "194617", date: "11/4/2026", time: "7:00 PM" }
+        ]
+      };
+
+      const context = {
+        activePolls: new Map([["p_target", targetPollState]]),
+        recurringPolls: new Map(),
+        persistPolls: () => {}
+      };
+
+      try {
+        const res = await courtCommands.executeCourtTool(
+          mockSock,
+          "modify_court_reservation",
+          { reservationId: "194617", court: "Court 3", group: "Bot-testing" },
+          "Admin",
+          "dm_chat",
+          "admin_user@s.whatsapp.net",
+          context
+        );
+
+        assert.equal(res, "Tool Updated");
+        assert.equal(modifyCalledWith.chatId, targetGroupJid);
+        assert.equal(modifyCalledWith.court, "Court 3");
+        assert.equal(targetPollState.advanceBookedCourts[0].court, "Court 3");
+      } finally {
+        scvcc.modifyCourtBooking = originalModify;
+      }
+    });
+  });
 });
