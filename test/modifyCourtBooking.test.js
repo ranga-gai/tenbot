@@ -632,6 +632,241 @@ describe('handleModifyPollInstance with advanceBookedCourts', () => {
       }
     });
 
+    it("should handle modifying just time without repeating court name (!modifycourt Court 3 tomorrow 6:30pm to 7pm)", async () => {
+      const originalModify = scvcc.modifyCourtBooking;
+      let modifyCalledWith = null;
+      scvcc.modifyCourtBooking = async (params) => {
+        modifyCalledWith = params;
+        return {
+          success: true,
+          court: "Court 3",
+          time: "7:00 PM",
+          date: "11/4/2026",
+          message: "Updated to 7pm"
+        };
+      };
+
+      const pollState = {
+        remoteJid: "test_chat@g.us",
+        name: "🎾 Wednesday 6:30pm\n\nCourt 3 - Booked\n",
+        when: "Wednesday 6:30pm",
+        queryTime: "6:30pm",
+        advanceBookedCourts: [
+          { court: "Court 3", reservationId: "194618", date: "11/4/2026", time: "6:30 PM" }
+        ],
+        prebookedCourts: [
+          { court: "Court 3", time: "6:30 PM" }
+        ]
+      };
+
+      const context = {
+        activePolls: new Map([["p_wed", pollState]]),
+        recurringPolls: new Map(),
+        persistPolls: () => {}
+      };
+
+      try {
+        const res = await courtCommands.handleCourtCommand(
+          mockSock,
+          "!modifycourt Court 3 tomorrow 6:30pm to 7pm",
+          "test_chat@g.us",
+          "Admin",
+          "admin_user@s.whatsapp.net",
+          null,
+          context
+        );
+
+        assert.equal(res, "Updated to 7pm");
+        assert.ok(modifyCalledWith);
+        assert.equal(modifyCalledWith.reservationId, "194618");
+        assert.equal(modifyCalledWith.court, "Court 3");
+        assert.equal(modifyCalledWith.time, "7pm");
+        assert.equal(pollState.advanceBookedCourts[0].time, "7:00 PM");
+      } finally {
+        scvcc.modifyCourtBooking = originalModify;
+      }
+    });
+
+    it("should handle modifying court with only day specified (!modifycourt Court 3 Thursday to 7pm)", async () => {
+      const originalModify = scvcc.modifyCourtBooking;
+      let modifyCalledWith = null;
+      scvcc.modifyCourtBooking = async (params) => {
+        modifyCalledWith = params;
+        return {
+          success: true,
+          court: "Court 3",
+          time: "7:00 PM",
+          date: "11/5/2026",
+          message: "Updated Thursday to 7pm"
+        };
+      };
+
+      const pollState = {
+        remoteJid: "test_chat@g.us",
+        name: "🎾 Thursday 6:30pm\n\nCourt 3 - Booked\n",
+        when: "Thursday 6:30pm",
+        queryTime: "6:30pm",
+        advanceBookedCourts: [
+          { court: "Court 3", reservationId: "194618", date: "11/5/2026", time: "6:30 PM" }
+        ],
+        prebookedCourts: [
+          { court: "Court 3", time: "6:30 PM" }
+        ]
+      };
+
+      const context = {
+        activePolls: new Map([["p_thu", pollState]]),
+        recurringPolls: new Map(),
+        persistPolls: () => {}
+      };
+
+      try {
+        const res = await courtCommands.handleCourtCommand(
+          mockSock,
+          "!modifycourt Court 3 Thursday to 7pm",
+          "test_chat@g.us",
+          "Admin",
+          "admin_user@s.whatsapp.net",
+          null,
+          context
+        );
+
+        assert.equal(res, "Updated Thursday to 7pm");
+        assert.ok(modifyCalledWith);
+        assert.equal(modifyCalledWith.reservationId, "194618");
+        assert.equal(modifyCalledWith.court, "Court 3");
+        assert.equal(modifyCalledWith.time, "7pm");
+        assert.equal(pollState.advanceBookedCourts[0].time, "7:00 PM");
+      } finally {
+        scvcc.modifyCourtBooking = originalModify;
+      }
+    });
+
+    it("should move all court bookings for a day to new time preserving court numbers (!modifycourt Thursday to 7pm)", async () => {
+      const originalModify = scvcc.modifyCourtBooking;
+      const modifiedCourts = [];
+      scvcc.modifyCourtBooking = async (params) => {
+        modifiedCourts.push(params);
+        return {
+          success: true,
+          court: params.court,
+          time: "7:00 PM",
+          date: params.date,
+          reservationId: params.reservationId,
+          message: `Updated ${params.court} to 7pm`
+        };
+      };
+
+      const pollState = {
+        remoteJid: "test_chat@g.us",
+        name: "🎾 Thursday 6:30pm\n\nCourt 2 - Booked\nCourt 3 - Booked\n",
+        when: "Thursday 6:30pm",
+        queryTime: "6:30pm",
+        advanceBookedCourts: [
+          { court: "Court 2", reservationId: "194617", date: "11/5/2026", time: "6:30 PM" },
+          { court: "Court 3", reservationId: "194618", date: "11/5/2026", time: "6:30 PM" }
+        ],
+        prebookedCourts: [
+          { court: "Court 2", time: "6:30 PM" },
+          { court: "Court 3", time: "6:30 PM" }
+        ]
+      };
+
+      const context = {
+        activePolls: new Map([["p_thu_all", pollState]]),
+        recurringPolls: new Map(),
+        persistPolls: () => {}
+      };
+
+      try {
+        const res = await courtCommands.handleCourtCommand(
+          mockSock,
+          "!modifycourt Thursday to 7pm",
+          "test_chat@g.us",
+          "Admin",
+          "admin_user@s.whatsapp.net",
+          null,
+          context
+        );
+
+        assert.ok(res.includes("Successfully moved 2 court reservation(s)"));
+        assert.ok(res.includes("Court 2") && res.includes("7:00 PM"));
+        assert.ok(res.includes("Court 3") && res.includes("7:00 PM"));
+        assert.equal(modifiedCourts.length, 2);
+
+        // Court 2 preserved as Court 2
+        assert.equal(modifiedCourts[0].court, "Court 2");
+        assert.equal(modifiedCourts[0].time, "7pm");
+        // Court 3 preserved as Court 3
+        assert.equal(modifiedCourts[1].court, "Court 3");
+        assert.equal(modifiedCourts[1].time, "7pm");
+
+        // Both advance bookings in pollState updated to 7:00 PM
+        assert.equal(pollState.advanceBookedCourts[0].time, "7:00 PM");
+        assert.equal(pollState.advanceBookedCourts[1].time, "7:00 PM");
+      } finally {
+        scvcc.modifyCourtBooking = originalModify;
+      }
+    });
+
+    it("should not send duplicate notifications to command caller who receives the direct reply", async () => {
+      const originalModify = scvcc.modifyCourtBooking;
+      scvcc.modifyCourtBooking = async () => ({
+        success: true,
+        court: "Court 1",
+        time: "7:00 PM",
+        date: "11/4/2026",
+        message: "Updated"
+      });
+
+      const sentMessages = [];
+      const notifSock = {
+        groupMetadata: async () => ({ participants: [{ id: "admin@lid", admin: "admin" }] }),
+        sendMessage: async (jid, msg) => {
+          sentMessages.push({ jid, msg });
+        }
+      };
+
+      // Mock groupsConfig.getBookingNotifications to return admin@lid and other@lid
+      const originalNotifs = require("../lib/groupsConfig").getBookingNotifications;
+      require("../lib/groupsConfig").getBookingNotifications = () => ["admin@lid", "other@lid"];
+
+      const pollState = {
+        remoteJid: "120363402559062529@g.us",
+        advanceBookedCourts: [
+          { court: "Court 2", reservationId: "194617", date: "11/4/2026", time: "6:30 PM" }
+        ]
+      };
+
+      const context = {
+        activePolls: new Map([["p_target", pollState]]),
+        recurringPolls: new Map(),
+        persistPolls: () => {}
+      };
+
+      try {
+        // Admin calls from DM "admin@lid"
+        const res = await courtCommands.handleCourtCommand(
+          notifSock,
+          "!modifycourt 194617 to Court 1 7pm --group=120363402559062529@g.us",
+          "admin@lid",
+          "Admin",
+          "admin@lid",
+          null,
+          context
+        );
+
+        assert.equal(res, "Updated");
+        // sentMessages should only contain other@lid, NOT admin@lid (who receives res directly)
+        const recipientJids = sentMessages.map(m => m.jid);
+        assert.ok(recipientJids.includes("other@lid"));
+        assert.ok(!recipientJids.includes("admin@lid"), "admin@lid should not receive duplicate notification");
+      } finally {
+        scvcc.modifyCourtBooking = originalModify;
+        require("../lib/groupsConfig").getBookingNotifications = originalNotifs;
+      }
+    });
+
     it("should allow modify_court_reservation tool with group parameter", async () => {
       const originalModify = scvcc.modifyCourtBooking;
       let modifyCalledWith = null;
@@ -677,6 +912,142 @@ describe('handleModifyPollInstance with advanceBookedCourts', () => {
         assert.equal(targetPollState.advanceBookedCourts[0].court, "Court 3");
       } finally {
         scvcc.modifyCourtBooking = originalModify;
+      }
+    });
+
+    it("should allow admin to modify all court bookings for a group by day from DM (!modifycourt Thursday to 7pm --group=\"Bot-testing\")", async () => {
+      const originalModify = scvcc.modifyCourtBooking;
+      const modifiedCourts = [];
+      scvcc.modifyCourtBooking = async (params) => {
+        modifiedCourts.push(params);
+        return {
+          success: true,
+          court: params.court,
+          time: "7:00 PM",
+          date: params.date,
+          reservationId: params.reservationId,
+          message: `Updated ${params.court} to 7pm`
+        };
+      };
+
+      const targetGroupJid = "120363403838804497@g.us";
+      const otherGroupJid = "other_group@g.us";
+
+      const targetPollState = {
+        remoteJid: targetGroupJid,
+        name: "🎾 Thursday 6:30pm\n\nCourt 2 - Booked\nCourt 3 - Booked\n",
+        when: "Thursday 6:30pm",
+        queryTime: "6:30pm",
+        advanceBookedCourts: [
+          { court: "Court 2", reservationId: "194617", date: "11/5/2026", time: "6:30 PM" },
+          { court: "Court 3", reservationId: "194618", date: "11/5/2026", time: "6:30 PM" }
+        ],
+        prebookedCourts: [
+          { court: "Court 2", time: "6:30 PM" },
+          { court: "Court 3", time: "6:30 PM" }
+        ]
+      };
+
+      const otherPollState = {
+        remoteJid: otherGroupJid,
+        name: "🎾 Thursday 6:30pm\n\nCourt 2 - Booked\n",
+        when: "Thursday 6:30pm",
+        advanceBookedCourts: [
+          { court: "Court 2", reservationId: "999999", date: "11/5/2026", time: "6:30 PM" }
+        ]
+      };
+
+      const context = {
+        activePolls: new Map([
+          ["p_thu_target", targetPollState],
+          ["p_thu_other", otherPollState]
+        ]),
+        recurringPolls: new Map(),
+        persistPolls: () => {}
+      };
+
+      try {
+        const res = await courtCommands.handleCourtCommand(
+          mockSock,
+          "!modifycourt Thursday to 7pm --group=\"Bot-testing\"",
+          "dm_chat_user",
+          "Admin",
+          "admin_user@s.whatsapp.net",
+          null,
+          context
+        );
+
+        assert.ok(res.includes("Successfully moved 2 court reservation(s)"));
+        assert.ok(res.includes("Court 2") && res.includes("7:00 PM"));
+        assert.ok(res.includes("Court 3") && res.includes("7:00 PM"));
+        assert.equal(modifiedCourts.length, 2);
+
+        // All modifications applied to target group
+        assert.equal(modifiedCourts[0].chatId, targetGroupJid);
+        assert.equal(modifiedCourts[0].court, "Court 2");
+        assert.equal(modifiedCourts[1].chatId, targetGroupJid);
+        assert.equal(modifiedCourts[1].court, "Court 3");
+
+        // Target poll state updated
+        assert.equal(targetPollState.advanceBookedCourts[0].time, "7:00 PM");
+        assert.equal(targetPollState.advanceBookedCourts[1].time, "7:00 PM");
+
+        // Other group poll untouched
+        assert.equal(otherPollState.advanceBookedCourts[0].time, "6:30 PM");
+      } finally {
+        scvcc.modifyCourtBooking = originalModify;
+      }
+    });
+
+    it("should fallback to getMyReservations if court booking is not found in poll memory", async () => {
+      const originalModify = scvcc.modifyCourtBooking;
+      const originalGetMy = scvcc.getMyReservations;
+      let modifyCalledWith = null;
+
+      scvcc.getMyReservations = async (chatId) => ({
+        success: true,
+        reservations: [
+          { id: "194625", date: "11/5/2026", time: "6:30 PM", court: "Court 3" }
+        ]
+      });
+
+      scvcc.modifyCourtBooking = async (params) => {
+        modifyCalledWith = params;
+        return {
+          success: true,
+          court: "Court 3",
+          time: "7:00 PM",
+          date: "11/5/2026",
+          reservationId: params.reservationId,
+          message: "Updated via SCVCC lookup"
+        };
+      };
+
+      const context = {
+        activePolls: new Map(),
+        recurringPolls: new Map(),
+        persistPolls: () => {}
+      };
+
+      try {
+        const res = await courtCommands.handleCourtCommand(
+          mockSock,
+          "!modifycourt Court 3 Thursday to 7pm --group=\"Bot-testing\"",
+          "dm_chat_user",
+          "Admin",
+          "admin_user@s.whatsapp.net",
+          null,
+          context
+        );
+
+        assert.equal(res, "Updated via SCVCC lookup");
+        assert.ok(modifyCalledWith);
+        assert.equal(modifyCalledWith.reservationId, "194625");
+        assert.equal(modifyCalledWith.court, "Court 3");
+        assert.equal(modifyCalledWith.time, "7pm");
+      } finally {
+        scvcc.modifyCourtBooking = originalModify;
+        scvcc.getMyReservations = originalGetMy;
       }
     });
   });
