@@ -175,13 +175,11 @@ describe('pollStore subfolder & multi-file architecture', () => {
     };
     fs.writeFileSync(legacyMessagesFile, JSON.stringify(legacyData, null, 2), 'utf-8');
 
-    // Calling loadGroup should prune the expired message, keeping only the recent one
+    // Calling loadGroup should prune the expired message, keeping only the recent one,
+    // and immediately migrate messages.json to messages.jsonl on startup without waiting for a save!
     const loaded = pollStore.loadGroup(testChatId);
     assert.equal(loaded.messageStore.has(`${testChatId}:msg_expired`), false);
     assert.equal(loaded.messageStore.has(`${testChatId}:msg_recent`), true);
-
-    // Saving group state converts to messages.jsonl and removes legacy messages.json
-    pollStore.save(loaded, testChatId);
     assert.equal(fs.existsSync(legacyMessagesFile), false);
     assert.ok(fs.existsSync(path.join(testGroupDir, 'messages.jsonl')));
 
@@ -189,6 +187,8 @@ describe('pollStore subfolder & multi-file architecture', () => {
     assert.equal(lines.length, 1);
     const parsed = JSON.parse(lines[0]);
     assert.equal(parsed.key, `${testChatId}:msg_recent`);
+    assert.ok(parsed.date);
+    assert.ok(parsed.timestamp);
   });
 
   it('should automatically delete individual poll file when poll is removed from activePolls', () => {
