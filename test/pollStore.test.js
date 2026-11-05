@@ -20,7 +20,7 @@ describe('pollStore subfolder & multi-file architecture', () => {
     }
   });
 
-  it('should save state in subfolder with recurring.json, meta.json, and individual polls/*.json files', () => {
+  it('should save state in subfolder with recurring.json, meta.json, individual polls/*.json, and messages.jsonl', () => {
     const pollId1 = 'poll_test_001';
     const pollId2 = 'poll_test_002';
 
@@ -71,7 +71,17 @@ describe('pollStore subfolder & multi-file architecture', () => {
     assert.ok(fs.existsSync(path.join(testGroupDir, 'meta.json')));
     assert.ok(fs.existsSync(path.join(testGroupDir, 'recurring.json')));
     assert.ok(fs.existsSync(path.join(testGroupDir, 'polls')));
-    assert.ok(fs.existsSync(path.join(testGroupDir, 'messages.json'))); // has general_alert
+    assert.ok(fs.existsSync(path.join(testGroupDir, 'messages.jsonl'))); // has general_alert in JSONL format
+
+    // Verify JSONL line contents
+    const jsonlContent = fs.readFileSync(path.join(testGroupDir, 'messages.jsonl'), 'utf-8').trim();
+    const lines = jsonlContent.split('\n');
+    assert.equal(lines.length, 1);
+    const parsedLine = JSON.parse(lines[0]);
+    assert.equal(parsedLine.key, `${testChatId}:general_alert`);
+    assert.ok(parsedLine.date);
+    assert.ok(parsedLine.timestamp);
+    assert.equal(parsedLine.message.text, 'Tennis alert');
 
     // Verify individual poll instance files
     const pollFile1 = path.join(testGroupDir, 'polls', `${pollId1}.json`);
@@ -142,6 +152,43 @@ describe('pollStore subfolder & multi-file architecture', () => {
 
     // Verify latest poll ID
     assert.equal(reloaded.latestPollIdByChat.get(testChatId), pollId);
+  });
+
+  it('should prune messages older than 14 days and migrate legacy messages.json to messages.jsonl', () => {
+    const now = Date.now();
+    const sixteenDaysAgoSec = Math.floor((now - 16 * 24 * 60 * 60 * 1000) / 1000);
+    const twoDaysAgoSec = Math.floor((now - 2 * 24 * 60 * 60 * 1000) / 1000);
+
+    // Setup legacy messages.json with one expired message and one recent message
+    fs.mkdirSync(testGroupDir, { recursive: true });
+    const legacyMessagesFile = path.join(testGroupDir, 'messages.json');
+    const legacyData = {
+      chatId: testChatId,
+      updatedAt: new Date(now).toISOString(),
+      messageStore: {
+        __type: 'Map',
+        entries: [
+          [`${testChatId}:msg_expired`, { text: 'Old alert', messageTimestamp: String(sixteenDaysAgoSec) }],
+          [`${testChatId}:msg_recent`, { text: 'Recent alert', messageTimestamp: String(twoDaysAgoSec) }]
+        ]
+      }
+    };
+    fs.writeFileSync(legacyMessagesFile, JSON.stringify(legacyData, null, 2), 'utf-8');
+
+    // Calling loadGroup should prune the expired message, keeping only the recent one
+    const loaded = pollStore.loadGroup(testChatId);
+    assert.equal(loaded.messageStore.has(`${testChatId}:msg_expired`), false);
+    assert.equal(loaded.messageStore.has(`${testChatId}:msg_recent`), true);
+
+    // Saving group state converts to messages.jsonl and removes legacy messages.json
+    pollStore.save(loaded, testChatId);
+    assert.equal(fs.existsSync(legacyMessagesFile), false);
+    assert.ok(fs.existsSync(path.join(testGroupDir, 'messages.jsonl')));
+
+    const lines = fs.readFileSync(path.join(testGroupDir, 'messages.jsonl'), 'utf-8').trim().split('\n');
+    assert.equal(lines.length, 1);
+    const parsed = JSON.parse(lines[0]);
+    assert.equal(parsed.key, `${testChatId}:msg_recent`);
   });
 
   it('should automatically delete individual poll file when poll is removed from activePolls', () => {
