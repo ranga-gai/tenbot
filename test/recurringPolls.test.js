@@ -604,6 +604,76 @@ describe('recurringPolls', () => {
   });
 
 
+  describe('pruneExpiredAdvanceBookings after match playtime passes', () => {
+    it('should prune advanceBookings whose match playtime has passed and retain future ones', () => {
+      const { pruneExpiredAdvanceBookings } = recurringPollsModule;
+      const sched = {
+        id: 'rec_prune_test',
+        remoteJid: 'test@g.us',
+        matchTime: '7:00 PM',
+        advanceBookings: {
+          '2026-11-04': {
+            targetDateMDY: '11/4/2026',
+            matchTime: '7:00 PM',
+            autoBookedCourts: [{ court: 'Court 2', time: '7:00 PM' }]
+          },
+          '2026-11-06': {
+            targetDateMDY: '11/6/2026',
+            matchTime: '7:00 PM',
+            autoBookedCourts: [{ court: 'Court 3', time: '7:00 PM' }]
+          }
+        }
+      };
+
+      const recurringPolls = new Map([['rec_prune_test', sched]]);
+      let persistCalled = false;
+      const persistPolls = () => { persistCalled = true; };
+
+      // Current time: Nov 5th 2026 8:00 AM (Nov 4th match at 7pm has passed, Nov 6th is in future)
+      const nov5Morning = { year: 2026, month: 10, day: 5, weekday: 'thu', hour: 8, minute: 0 };
+      const prunedCount = pruneExpiredAdvanceBookings(recurringPolls, null, persistPolls, nov5Morning);
+
+      assert.equal(prunedCount, 1);
+      assert.equal(persistCalled, true);
+      // 2026-11-04 is pruned
+      assert.equal(sched.advanceBookings['2026-11-04'], undefined);
+      // 2026-11-06 is kept
+      assert.ok(sched.advanceBookings['2026-11-06']);
+    });
+
+    it('should prune expired advanceBookings when cleanupExpiredPolls is called', () => {
+      const pollCommands = require('../lib/commands/pollCommands');
+      const sched = {
+        id: 'rec_cleanup_test',
+        remoteJid: 'test@g.us',
+        matchTime: '6:30 PM',
+        advanceBookings: {
+          '2026-11-04': {
+            targetDateMDY: '11/4/2026',
+            matchTime: '6:30 PM'
+          }
+        }
+      };
+
+      const recurringPolls = new Map([['rec_cleanup_test', sched]]);
+      let persistCalled = false;
+      const context = {
+        activePolls: new Map(),
+        messageStore: new Map(),
+        latestPollIdByChat: new Map(),
+        recurringPolls,
+        persistPolls: () => { persistCalled = true; }
+      };
+
+      // Run cleanup on Nov 5th (Nov 4th playtime has passed)
+      const nov5Time = new Date('2026-11-05T12:00:00-08:00').getTime();
+      pollCommands.cleanupExpiredPolls(context, nov5Time);
+
+      assert.equal(sched.advanceBookings['2026-11-04'], undefined);
+      assert.equal(persistCalled, true);
+    });
+  });
+
   describe('checkAndPostRecurringPolls retry and notification handling when no courts available', () => {
     it('should retry a couple of times before sending a single failure notification and marking handled', async () => {
       const scheduleId = 'sched_retry_test';
