@@ -3915,6 +3915,77 @@ describe('pollCommands', () => {
       assert.match(msg, /• \*Court 2\* \(auto booked\) \(Doubles, 90 Minutes\) — ID: `12345`/);
       assert.match(msg, /• \*Court 3\* \(manually booked by Kejal\)/);
     });
+
+    it("should properly structure autoBookedCourts and manuallyBookedCourts in createMatchPoll", async () => {
+      const activePolls = new Map();
+      const mockSock = { sendMessage: async () => ({ key: { id: "p_struct_test", remoteJid: "test@g.us" } }) };
+
+      const res = await createMatchPoll(
+        mockSock,
+        "test@g.us",
+        8,
+        "tomorrow 7pm",
+        "Wednesday",
+        "7:00 PM",
+        "Alice",
+        "alice@lid",
+        false,
+        null,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        {
+          advanceBookedCourts: [
+            { court: "Court 2", reservationId: "194617", players: ["Alice", "Bob"], duration: "90 Minutes", partySize: "Doubles" }
+          ],
+          prebookedCourts: [
+            { court: "Court 3", player: "Charlie", fullName: "Charlie, Dave", time: "7:00 PM", bookingType: "manual" }
+          ]
+        },
+        { activePolls, messageStore: new Map() }
+      );
+
+      const pollState = activePolls.get("p_struct_test");
+      assert.ok(pollState);
+
+      // 1. autoBookedCourts has reservation details, bookedAt, bookedSource, no date, no bookingType
+      assert.equal(pollState.autoBookedCourts.length, 1);
+      assert.equal(pollState.autoBookedCourts[0].court, "Court 2");
+      assert.equal(pollState.autoBookedCourts[0].reservationId, "194617");
+      assert.equal(pollState.autoBookedCourts[0].bookedSource, "advance");
+      assert.ok(pollState.autoBookedCourts[0].bookedAt);
+      assert.equal(pollState.autoBookedCourts[0].date, undefined);
+      assert.equal(pollState.autoBookedCourts[0].bookingType, undefined);
+
+      // 2. advanceBookedCourts aliases autoBookedCourts
+      assert.equal(pollState.advanceBookedCourts, pollState.autoBookedCourts);
+
+      // 3. manuallyBookedCourts has court, time, players and no bookingType, date, reservationId, bookedAt, bookedSource
+      assert.equal(pollState.manuallyBookedCourts.length, 1);
+      assert.equal(pollState.manuallyBookedCourts[0].court, "Court 3");
+      assert.equal(pollState.manuallyBookedCourts[0].bookingType, undefined);
+      assert.equal(pollState.manuallyBookedCourts[0].date, undefined);
+      assert.equal(pollState.manuallyBookedCourts[0].reservationId, undefined);
+      assert.equal(pollState.manuallyBookedCourts[0].bookedAt, undefined);
+      assert.equal(pollState.manuallyBookedCourts[0].bookedSource, undefined);
+      assert.deepEqual(pollState.manuallyBookedCourts[0].players, ["Charlie", "Dave"]);
+
+      // 4. prebookedCourts has both auto and manual combined
+      assert.equal(pollState.prebookedCourts.length, 2);
+      assert.equal(pollState.prebookedCourts[0].court, "Court 2");
+      assert.equal(pollState.prebookedCourts[0].bookingType, "auto");
+      assert.equal(pollState.prebookedCourts[1].court, "Court 3");
+      assert.equal(pollState.prebookedCourts[1].bookingType, "manual");
+    });
   });
   describe("tentative courts support", () => {
     it("should format tentative court title line correctly", () => {

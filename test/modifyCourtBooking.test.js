@@ -652,7 +652,7 @@ describe('handleModifyPollInstance with advanceBookedCourts', () => {
         when: "Wednesday 6:30pm",
         queryTime: "6:30pm",
         advanceBookedCourts: [
-          { court: "Court 3", reservationId: "194618", date: "11/4/2026", time: "6:30 PM" }
+          { court: "Court 3", reservationId: "194618", date: scvcc.resolveDateToMDY("tomorrow"), time: "6:30 PM" }
         ],
         prebookedCourts: [
           { court: "Court 3", time: "6:30 PM" }
