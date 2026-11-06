@@ -1750,12 +1750,12 @@ describe('pollCommands', () => {
       assert.equal(pollState.courtReleasesDone.includes(70), true);
       assert.equal(pollState.prebookedCourts.length, 2, 'Court 3 should be cancelled');
       assert.equal(pollState.prebookedCourts.map(c => c.court).includes('Court 3'), false);
-      assert.equal(pollState.slotLimit, 8);
-      assert.equal(pollState.size, 8);
+      assert.equal(pollState.slotLimit, undefined);
+      assert.equal(pollState.size, 12);
 
       const cancelMsg = messagesSent.find((m) => m.msg.text.includes('Court 3') && m.msg.text.includes('has been cancelled'));
       assert.ok(cancelMsg, 'Cancellation message should be sent for Court 3');
-      assert.match(cancelMsg.msg.text, /8 voting slots/);
+      assert.equal(cancelMsg.msg.text.includes('voting slots'), false);
     });
 
     it('should not cancel court at 70% mark if players heed warning and fill slots before checkpoint', async () => {
@@ -1881,7 +1881,7 @@ describe('pollCommands', () => {
       await checkCourtReleasesForPoll(mockSock, 'poll_ex2', pollState, context, t0 + 420 * 60 * 1000);
       assert.equal(pollState.prebookedCourts.length, 2);
       assert.deepEqual(pollState.prebookedCourts.map(c => c.court), ['Court 1', 'Court 2']);
-      assert.equal(pollState.slotLimit, 8);
+      assert.equal(pollState.slotLimit, undefined);
 
       // At 80% warning (T0 + 475 mins) -> sends warning for Court 2
       await checkCourtReleasesForPoll(mockSock, 'poll_ex2', pollState, context, t0 + 475 * 60 * 1000);
@@ -1893,7 +1893,7 @@ describe('pollCommands', () => {
       await checkCourtReleasesForPoll(mockSock, 'poll_ex2', pollState, context, t0 + 480 * 60 * 1000);
       assert.equal(pollState.prebookedCourts.length, 1);
       assert.deepEqual(pollState.prebookedCourts.map(c => c.court), ['Court 1']);
-      assert.equal(pollState.slotLimit, 4);
+      assert.equal(pollState.slotLimit, undefined);
 
       // At 90% checkpoint (T0 + 540 mins) -> 3 players need 1 court, Court 1 stays!
       await checkCourtReleasesForPoll(mockSock, 'poll_ex2', pollState, context, t0 + 540 * 60 * 1000);
@@ -1968,7 +1968,7 @@ describe('pollCommands', () => {
       assert.equal(pollState.prebookedCourts.length, 2);
       assert.equal(pollState.courtReleasesDone.includes(80), true);
       assert.deepEqual(pollState.prebookedCourts.map(c => c.court), ['Court 1', 'Court 2']);
-      assert.equal(pollState.slotLimit, 8);
+      assert.equal(pollState.slotLimit, undefined);
     });
 
     it('should cancel one court each at 70%, 80%, and 90% if 3 courts booked and 0 votes (Example 4)', async () => {
@@ -2023,7 +2023,7 @@ describe('pollCommands', () => {
       await checkCourtReleasesForPoll(mockSock, 'poll_ex4', pollState, context, t0 + 540 * 60 * 1000);
       assert.equal(pollState.prebookedCourts.length, 0);
       assert.equal(pollState.status, 'stopped');
-      assert.equal(pollState.slotLimit, 0);
+      assert.equal(pollState.slotLimit, undefined);
     });
 
     it('should ensure no extra courts remaining at 90% by cancelling multiple courts at once (Example 5)', async () => {
@@ -2078,7 +2078,7 @@ describe('pollCommands', () => {
       await checkCourtReleasesForPoll(mockSock, 'poll_multi', pollState, context, t0 + 540 * 60 * 1000);
       assert.equal(pollState.prebookedCourts.length, 1);
       assert.deepEqual(pollState.prebookedCourts.map(c => c.court), ['Court 1']);
-      assert.equal(pollState.slotLimit, 4);
+      assert.equal(pollState.slotLimit, undefined);
 
       const cancelMsg = messagesSent.find((m) => m.msg.text.includes('Court 3 and Court 2') || (m.msg.text.includes('Court 3') && m.msg.text.includes('Court 2')));
       assert.ok(cancelMsg, 'Cancellation message mentions multiple courts');
@@ -2192,7 +2192,7 @@ describe('pollCommands', () => {
 
         assert.equal(bookCourtCalled, true);
         assert.equal(pollState.prebookedCourts.length, 3);
-        assert.equal(pollState.slotLimit, 12);
+        assert.equal(pollState.slotLimit, undefined);
         assert.equal(pollState.size, 12);
         assert.equal(pollState.releasedCourts.length, 0);
 
@@ -2257,6 +2257,128 @@ describe('pollCommands', () => {
         assert.match(failQuoteMsg.msg.text, /all \*8 voting slots\* are filled/);
         assert.match(failQuoteMsg.msg.text, /Your vote will not be considered/);
         assert.equal(failQuoteMsg.opts?.quoted?.key?.id, 'voteMsg9');
+      } finally {
+        scvcc.bookCourt = originalBookCourt;
+        scvcc.checkCourtAvailability = originalCheckAvail;
+      }
+    });
+
+    it('should not limit slots on auto-cancellation, and only limit slots and warn voter if rebooking fails upon voting', async () => {
+      const originalBookCourt = scvcc.bookCourt;
+      const originalCheckAvail = scvcc.checkCourtAvailability;
+
+      // Mock SCVCC re-booking to fail
+      scvcc.checkCourtAvailability = async () => ({
+        slots: [{ time: '10:00am', courts: [{ court: 'Court 3', status: 'unavailable' }] }]
+      });
+      scvcc.bookCourt = async () => ({ success: false, message: 'Court unavailable' });
+
+      const messagesSent = [];
+      const mockSock = {
+        sendMessage: async (jid, msg, opts) => { messagesSent.push({ jid, msg, opts }); }
+      };
+
+      const t0 = Date.now();
+      const playAt = t0 + 600 * 60 * 1000;
+      const pollState = {
+        remoteJid: 'group1@g.us',
+        createdAt: new Date(t0).toISOString(),
+        playAt: new Date(playAt).toISOString(),
+        options: Array.from({ length: 12 }, (_, i) => `Player ${i + 1}`),
+        size: 12,
+        type: 'fixed',
+        status: 'active',
+        prebookedCourts: [
+          { court: 'Court 1', player: 'P1' },
+          { court: 'Court 2', player: 'P2' },
+          { court: 'Court 3', player: 'P3' }
+        ],
+        advanceBookedCourts: [
+          { court: 'Court 1', reservationId: 'res-1' },
+          { court: 'Court 2', reservationId: 'res-2' },
+          { court: 'Court 3', reservationId: 'res-3' }
+        ],
+        courtReleaseWarningsSent: [],
+        courtReleasesDone: [],
+        releasedCourts: [],
+        invalidSlotVotesNotified: [],
+        voteBuffer: new Map()
+      };
+
+      // 4 voters vote for Court 1
+      for (let i = 1; i <= 4; i++) {
+        pollState.voteBuffer.set(`voter${i}@s.whatsapp.net`, {
+          pollUpdateMessageKey: { remoteJid: 'group1@g.us', participant: `voter${i}@s.whatsapp.net` },
+          vote: { selectedOptions: [makeOptHash(`Player ${i}`)] }
+        });
+      }
+
+      const messageStore = new Map();
+      messageStore.set('group1@g.us:poll_e2e_rebook', {
+        pollCreationMessage: {
+          options: pollState.options.map((o) => ({ optionName: o }))
+        }
+      });
+      const context = {
+        messageStore,
+        activePolls: new Map([['poll_e2e_rebook', pollState]]),
+        persistPolls: () => {}
+      };
+
+      try {
+        // Step 1: Auto cancel Court 3 at 70% checkpoint
+        await checkCourtReleasesForPoll(mockSock, 'poll_e2e_rebook', pollState, context, t0 + 420 * 60 * 1000);
+
+        // Court 3 is cancelled and recorded in releasedCourts
+        assert.equal(pollState.prebookedCourts.length, 2);
+        assert.equal(pollState.releasedCourts.length, 1);
+        assert.equal(pollState.releasedCourts[0].court, 'Court 3');
+        // Voting slots must NOT be limited!
+        assert.equal(pollState.slotLimit, undefined, 'slotLimit should not be set on auto cancellation');
+        assert.equal(pollState.size, 12, 'size should not be shrunk on auto cancellation');
+
+        // Cancellation message does not mention slot limits
+        const cancelMsg = messagesSent.find(m => m.msg.text && m.msg.text.includes('Court 3') && m.msg.text.includes('has been cancelled'));
+        assert.ok(cancelMsg);
+        assert.equal(cancelMsg.msg.text.includes('voting slots'), false);
+
+        // Step 2: Now voters 5, 6, 7, 8 vote (filling Court 2). No invalid slot warnings!
+        for (let i = 5; i <= 8; i++) {
+          pollState.voteBuffer.set(`voter${i}@s.whatsapp.net`, {
+            pollUpdateMessageKey: { remoteJid: 'group1@g.us', participant: `voter${i}@s.whatsapp.net` },
+            vote: { selectedOptions: [makeOptHash(`Player ${i}`)] }
+          });
+        }
+        assert.equal(pollState.slotLimit, undefined);
+
+        // Step 3: Voter 9 votes! Triggers rebooking which fails.
+        const aggregated = [];
+        for (let i = 1; i <= 9; i++) {
+          aggregated.push({ name: `Player ${i}`, voters: [`voter${i}@s.whatsapp.net`] });
+          if (!pollState.voteBuffer.has(`voter${i}@s.whatsapp.net`)) {
+            pollState.voteBuffer.set(`voter${i}@s.whatsapp.net`, {
+              pollUpdateMessageKey: { remoteJid: 'group1@g.us', participant: `voter${i}@s.whatsapp.net`, id: `voteMsg${i}` },
+              vote: { selectedOptions: [makeOptHash(`Player ${i}`)] },
+              senderTimestampMs: 1000 + i
+            });
+          }
+        }
+
+        await handleOnDemandCourtBooking(mockSock, 'poll_e2e_rebook', pollState, aggregated, context, {
+          isRebooking: true,
+          targetCourt: pollState.releasedCourts[0],
+          triggeringVoterJid: 'voter9@s.whatsapp.net',
+          triggeringVoteMsgKey: { remoteJid: 'group1@g.us', id: 'voteMsg9' }
+        });
+
+        // ONLY NOW should slotLimit and size be set to 8
+        assert.equal(pollState.slotLimit, 8, 'slotLimit should only be limited after rebooking fails');
+        assert.equal(pollState.size, 8, 'size should be reduced after rebooking fails');
+
+        // And voter 9 receives warning message quoting their vote
+        const failMsg = messagesSent.find(m => m.msg.text && m.msg.text.includes('Your vote will not be considered') && (m.msg.text.includes('@9') || m.opts?.quoted?.key?.id === 'voteMsg9'));
+        assert.ok(failMsg, 'Voter 9 should receive rejection message');
+        assert.match(failMsg.msg.text, /all \*8 voting slots\* are filled and no additional courts could be booked/);
       } finally {
         scvcc.bookCourt = originalBookCourt;
         scvcc.checkCourtAvailability = originalCheckAvail;
