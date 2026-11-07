@@ -1209,8 +1209,11 @@ async function startBot() {
         recordName(remoteJid, msg.pushName, remoteJid.endsWith('@s.whatsapp.net') ? remoteJid : null);
       }
 
+      // Unwrapped content (handles disappearing / ephemeral messages, view-once, etc.)
+      const content = normalizeMessageContent(msg.message);
+
       // Poll creation message detection
-      const pollCreation = msg.message?.pollCreationMessage || msg.message?.pollCreationMessageV2 || msg.message?.pollCreationMessageV3;
+      const pollCreation = content?.pollCreationMessage || content?.pollCreationMessageV2 || content?.pollCreationMessageV3;
       if (pollCreation) {
         const pollId = msg.key.id;
 
@@ -1311,6 +1314,7 @@ async function startBot() {
           });
           latestPollIdByChat.set(remoteJid, pollId);
           persistPolls();
+          await pollCommands.flushPendingPollVotes(pollId, sock, getPollContext());
 
           if (creatorName && !ratings.isPlaceholder(creatorName) && !GENERIC_NAMES.has(ratings.keyFor(creatorName))) {
             const creatorLid = creatorJid ? namesStore.resolveCanonicalId(creatorJid) : null;
@@ -1353,19 +1357,27 @@ async function startBot() {
       }
 
       // Poll vote event
-      if (msg.message?.pollUpdateMessage) {
-        const pollUpdateMessage = msg.message.pollUpdateMessage;
+      const pollUpdateMessage = content?.pollUpdateMessage;
+      if (pollUpdateMessage) {
         const pollKey = pollUpdateMessage.pollCreationMessageKey;
-        if (pollKey && activePolls.has(pollKey.id)) {
-          console.log(`[poll] Vote received via messages.upsert for poll ${pollKey?.id || '(unknown)'}`);
-          try {
-            await pollCommands.processPollVoteEvent(sock, pollKey, [{
-              pollUpdateMessageKey: msg.key,
-              vote: pollUpdateMessage.vote,
-              senderTimestampMs: msg.messageTimestamp
-            }], getPollContext());
-          } catch (err) {
-            console.error('Error handling poll vote (upsert path):', err && err.message ? err.message : err);
+        if (pollKey?.id) {
+          const updateEntry = {
+            pollUpdateMessageKey: msg.key,
+            vote: pollUpdateMessage.vote,
+            senderTimestampMs: msg.messageTimestamp
+          };
+          if (activePolls.has(pollKey.id)) {
+            console.log(`[poll] Vote received via messages.upsert for poll ${pollKey.id}`);
+            try {
+              await pollCommands.processPollVoteEvent(sock, pollKey, [updateEntry], getPollContext());
+            } catch (err) {
+              console.error('Error handling poll vote (upsert path):', err && err.message ? err.message : err);
+            }
+          } else {
+            console.log(`[poll] Vote received via messages.upsert for poll ${pollKey.id}, but poll is not yet in activePolls. Buffering vote to retry...`);
+            pollCommands.bufferPendingVote(pollKey.id, pollKey, updateEntry, sock, getPollContext()).catch((err) => {
+              console.error(`[poll] Error in bufferPendingVote for poll ${pollKey.id}:`, err.message);
+            });
           }
         }
         continue;
@@ -1424,13 +1436,36 @@ async function startBot() {
           }
         }
 
-        if (!update.pollUpdates) continue;
-        if (!activePolls.has(key.id)) continue;
-        console.log(`[poll] Vote received via messages.update for poll ${key.id} (${update.pollUpdates.length} entry/entries)`);
-        try {
-          await pollCommands.processPollVoteEvent(sock, key, update.pollUpdates, getPollContext());
-        } catch (err) {
-          console.error('Error handling poll update:', err && err.message ? err.message : err);
+        const unwrappedUpdateMsg = normalizeMessageContent(update?.message);
+        let pollUpdates = update.pollUpdates;
+        let targetKey = key;
+        if (!pollUpdates && unwrappedUpdateMsg?.pollUpdateMessage) {
+          const pum = unwrappedUpdateMsg.pollUpdateMessage;
+          targetKey = pum.pollCreationMessageKey || key;
+          pollUpdates = [{
+            pollUpdateMessageKey: key,
+            vote: pum.vote,
+            senderTimestampMs: update.messageTimestamp || Date.now()
+          }];
+        }
+
+        if (pollUpdates && targetKey?.id) {
+          if (activePolls.has(targetKey.id)) {
+            console.log(`[poll] Vote received via messages.update for poll ${targetKey.id} (${pollUpdates.length} entry/entries)`);
+            try {
+              await pollCommands.processPollVoteEvent(sock, targetKey, pollUpdates, getPollContext());
+            } catch (err) {
+              console.error('Error handling poll update:', err && err.message ? err.message : err);
+            }
+          } else {
+            console.log(`[poll] Vote received via messages.update for poll ${targetKey.id}, but poll is not yet in activePolls. Buffering vote to retry...`);
+            for (const pu of pollUpdates) {
+              pollCommands.bufferPendingVote(targetKey.id, targetKey, pu, sock, getPollContext()).catch((err) => {
+                console.error(`[poll] Error in bufferPendingVote for poll ${targetKey.id}:`, err.message);
+              });
+            }
+          }
+          continue;
         }
       }
     } catch (err) {

@@ -43,7 +43,11 @@ const {
   handlePauseReminders,
   handleResumeReminders,
   formatCourtTentativeTitleLine,
-  cleanupExpiredPolls
+  cleanupExpiredPolls,
+  bufferPendingVote,
+  flushPendingPollVotes,
+  pendingPollVotes,
+  getMessageSecret
 } = require('../lib/commands/pollCommands');
 const { sanitizeActivePolls } = require('../lib/pollStore');
 const { extractCommonFlags } = require('../lib/recurringPolls');
@@ -5078,6 +5082,135 @@ describe('pollCommands', () => {
         scvcc.getCourtBookings = origBookings;
         groupsConfig.getGroupConfig = origGetConfig;
       }
+    });
+  });
+
+  describe("Pending poll vote buffering and robust secret extraction", () => {
+    it("should buffer a vote when poll is not yet in activePolls and process it as soon as poll is registered", async () => {
+      const crypto = require("crypto");
+      function makeOptHash(name) {
+        return crypto.createHash("sha256").update(name).digest();
+      }
+
+      const activePolls = new Map();
+      const messageStore = new Map();
+      const mockSock = { sendMessage: async () => {} };
+      const context = { activePolls, messageStore, persistPolls: () => {} };
+
+      const pollId = "poll_early_vote_test";
+      const pollKey = { id: pollId, remoteJid: "group1@g.us" };
+      const updateEntry = {
+        pollUpdateMessageKey: { participant: "voter1@s.whatsapp.net", id: "vote_early_1" },
+        vote: { selectedOptions: [makeOptHash("Player 1")] },
+        senderTimestampMs: Date.now()
+      };
+
+      // Vote arrives BEFORE poll is in activePolls
+      assert.equal(activePolls.has(pollId), false);
+      const bufferPromise = bufferPendingVote(pollId, pollKey, updateEntry, mockSock, context);
+
+      assert.equal(pendingPollVotes.has(pollId), true);
+      assert.equal(pendingPollVotes.get(pollId).length, 1);
+
+      // Simulate poll creation completing 100ms later (e.g. LLM verification finished)
+      await new Promise((r) => setTimeout(r, 100));
+
+      const pollState = {
+        remoteJid: "group1@g.us",
+        name: "Tennis Today 7pm",
+        options: ["Player 1", "Player 2", "Player 3", "Player 4"],
+        size: 4,
+        type: "fixed",
+        status: "active",
+        isManual: true,
+        voteBuffer: new Map()
+      };
+      activePolls.set(pollId, pollState);
+      messageStore.set("group1@g.us:" + pollId, {
+        pollCreationMessage: {
+          options: pollState.options.map((o) => ({ optionName: o }))
+        }
+      });
+
+      // Flush pending votes
+      await flushPendingPollVotes(pollId, mockSock, context);
+      await bufferPromise;
+
+      // The early vote must be recorded in voteBuffer!
+      assert.equal(pollState.voteBuffer.size, 1);
+      assert.equal(pendingPollVotes.has(pollId), false);
+    });
+
+    it("should extract messageSecret from WebMessageInfo, inner message, and ephemeralMessage wrappers", () => {
+      const secretBytes = Buffer.from("01234567890123456789012345678901");
+
+      // Case A: Flat message object
+      const flatMsg = {
+        messageContextInfo: { messageSecret: secretBytes }
+      };
+      assert.deepEqual(getMessageSecret(flatMsg), secretBytes);
+
+      // Case B: WebMessageInfo structure (msg.message.messageContextInfo)
+      const webMsg = {
+        key: { id: "123", remoteJid: "group@g.us" },
+        message: {
+          messageContextInfo: { messageSecret: secretBytes }
+        }
+      };
+      assert.deepEqual(getMessageSecret(webMsg), secretBytes);
+
+      // Case C: Disappearing / Ephemeral message structure
+      const ephemeralMsg = {
+        key: { id: "123", remoteJid: "group@g.us" },
+        message: {
+          ephemeralMessage: {
+            message: {
+              messageContextInfo: { messageSecret: secretBytes }
+            }
+          }
+        }
+      };
+      assert.deepEqual(getMessageSecret(ephemeralMsg), secretBytes);
+
+      // Case D: Null / missing secret returns null
+      assert.equal(getMessageSecret(null), null);
+      assert.equal(getMessageSecret({ message: {} }), null);
+    });
+
+    it("getPollVoters should aggregate votes when creationMessage in messageStore is WebMessageInfo", () => {
+      const crypto = require("crypto");
+      function makeOptHash(name) {
+        return crypto.createHash("sha256").update(name).digest();
+      }
+
+      const pollId = "poll_webmsg_agg_test";
+      const pollState = {
+        remoteJid: "group1@g.us",
+        options: ["Player 1", "Player 2"],
+        type: "fixed",
+        voteBuffer: new Map([
+          ["111@s.whatsapp.net", {
+            pollUpdateMessageKey: { participant: "111@s.whatsapp.net" },
+            vote: { selectedOptions: [makeOptHash("Player 1")] }
+          }]
+        ])
+      };
+
+      const messageStore = new Map([
+        ["group1@g.us:" + pollId, {
+          key: { id: pollId, remoteJid: "group1@g.us" },
+          message: {
+            pollCreationMessage: {
+              name: "Match",
+              options: [{ optionName: "Player 1" }, { optionName: "Player 2" }]
+            }
+          }
+        }]
+      ]);
+
+      const { aggregated, interestedPlayers } = getPollVoters(pollId, pollState, "bot@s.whatsapp.net", messageStore);
+      assert.equal(aggregated.length, 2);
+      assert.equal(interestedPlayers.length, 1);
     });
   });
 });

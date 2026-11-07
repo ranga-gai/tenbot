@@ -683,7 +683,12 @@ describe('pollSimulation', () => {
       const sock = createMockSock();
       const activePolls = new Map();
       const context = { activePolls, recurringPolls: new Map() };
+      const origAvail = scvcc.checkCourtAvailability;
+      scvcc.checkCourtAvailability = async () => ({
+        slots: [{ time: "7:00pm", courts: [{ court: "Court 1", status: "available", availableMinutes: 90 }] }]
+      });
 
+      try {
       const res = await routeCommand(
         sock,
         "!simulatepoll 4 7pm tomorrow --lineup-generation=fallback --lineup-lead-time=45m --no-reminders --slotcheck",
@@ -697,6 +702,9 @@ describe('pollSimulation', () => {
       assert.match(res, /Lineup Generation:\*\s*Fallback if no manual lineups posted \(45 mins before play time\)/i);
       assert.match(res, /Reminders:\*\s*Off/i);
       assert.match(res, /Slot Check:\*\s*Enabled/i);
+      } finally {
+        scvcc.checkCourtAvailability = origAvail;
+      }
     });
 
     it("should print poll flags like lineup generation, slot check, reminders in recurring poll simulation summary", async () => {

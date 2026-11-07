@@ -1007,7 +1007,7 @@ describe('handleModifyPollInstance with advanceBookedCourts', () => {
       scvcc.getMyReservations = async (chatId) => ({
         success: true,
         reservations: [
-          { id: "194625", date: "11/5/2026", time: "6:30 PM", court: "Court 3" }
+          { id: "194625", date: scvcc.resolveDateToMDY("Thursday") || "11/5/2026", time: "6:30 PM", court: "Court 3" }
         ]
       });
 
