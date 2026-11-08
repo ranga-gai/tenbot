@@ -7,7 +7,7 @@ describe('claudeTools', () => {
     assert(Array.isArray(CLAUDE_TOOLS));
     assert(Array.isArray(CACHED_CLAUDE_TOOLS));
     assert.equal(CLAUDE_TOOLS.length, CACHED_CLAUDE_TOOLS.length);
-    assert.equal(CLAUDE_TOOLS.length, 41);
+    assert.equal(CLAUDE_TOOLS.length, 44);
   });
 
   it('should ensure each tool has name, description, and valid input_schema', () => {
@@ -75,7 +75,10 @@ describe('claudeTools', () => {
       'add_group',
       'remove_group',
       'update_group_config',
-      'get_group_config'
+      'get_group_config',
+      'get_player_activity',
+      'get_latest_activity',
+      'get_inactive_players'
     ];
 
     for (const exp of expected) {

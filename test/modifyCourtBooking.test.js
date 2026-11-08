@@ -827,8 +827,10 @@ describe('handleModifyPollInstance with advanceBookedCourts', () => {
         }
       };
 
-      // Mock groupsConfig.getBookingNotifications to return admin@lid and other@lid
-      const originalNotifs = require("../lib/groupsConfig").getBookingNotifications;
+      // Mock groupsConfig.getNotifications to return admin@lid and other@lid
+      const originalNotifs = require("../lib/groupsConfig").getNotifications;
+      const originalBookingNotifs = require("../lib/groupsConfig").getBookingNotifications;
+      require("../lib/groupsConfig").getNotifications = () => ["admin@lid", "other@lid"];
       require("../lib/groupsConfig").getBookingNotifications = () => ["admin@lid", "other@lid"];
 
       const pollState = {
@@ -863,7 +865,8 @@ describe('handleModifyPollInstance with advanceBookedCourts', () => {
         assert.ok(!recipientJids.includes("admin@lid"), "admin@lid should not receive duplicate notification");
       } finally {
         scvcc.modifyCourtBooking = originalModify;
-        require("../lib/groupsConfig").getBookingNotifications = originalNotifs;
+        require("../lib/groupsConfig").getNotifications = originalNotifs;
+        require("../lib/groupsConfig").getBookingNotifications = originalBookingNotifs;
       }
     });
 

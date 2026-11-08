@@ -4,6 +4,7 @@
     "courtBookingEnabled": true,
     "autoMatchups": true,
     "preBookCourts": 1,
+    "inactivityPeriod": 12,
     "tentativeBookingTitles": [
       "Clinic",
       "Club Event",
@@ -29,7 +30,7 @@
       "directCourtBookingAccounts": [
         "Player 1"
       ],
-      "bookingNotifications": [
+      "notifications": [
         "xxxxxxxx@lid"
       ],
       "bookingCourtPreference": [

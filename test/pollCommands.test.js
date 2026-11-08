@@ -461,7 +461,7 @@ describe('pollCommands', () => {
   });
 
   describe('handleOnDemandCourtBooking', () => {
-    it('should successfully book an on-demand court, sending a simple one liner to group and DMs to bookingNotifications', async () => {
+    it('should successfully book an on-demand court, sending a simple one liner to group and DMs to notifications', async () => {
       const originalBookCourt = scvcc.bookCourt;
       const originalCheckAvail = scvcc.checkCourtAvailability;
 
@@ -522,7 +522,7 @@ describe('pollCommands', () => {
         // Verify detailed booking notification (with reservation details) was NOT sent to group chat
         assert.equal(messagesSent.some((m) => m.jid === '120363403838804497@g.us' && m.msg?.text?.includes('booked successfully')), false);
 
-        // Verify DMs were sent only to those in bookingNotifications
+        // Verify DMs were sent only to those in notifications
         const dmMessages = messagesSent.filter((m) => m.jid.endsWith('@lid'));
         assert.ok(dmMessages.length > 0, 'Booking notifications must be sent as DMs to configured notification LIDs');
         for (const dm of dmMessages) {
@@ -686,7 +686,9 @@ describe('pollCommands', () => {
         { name: 'Player 9', voters: ['1234567890@s.whatsapp.net'] }
       ];
 
+      const origGetNotifs = groupsConfig.getNotifications;
       const origGetBookingNotifs = groupsConfig.getBookingNotifications;
+      groupsConfig.getNotifications = () => ['admin1@s.whatsapp.net'];
       groupsConfig.getBookingNotifications = () => ['admin1@s.whatsapp.net'];
 
       try {
@@ -705,9 +707,9 @@ describe('pollCommands', () => {
         assert.equal(courtFailMsgsInGroup.length, 1, 'Court unavailable message must be sent to the group chat exactly once after all retries');
         assert.equal(courtFailMsgsInGroup[0].msg.text, '⚠️ *Court 1* is no longer available. Only *8 voting slots* are valid for this match poll.');
 
-        // Message MUST be sent to bookingNotifications list
+        // Message MUST be sent to notifications list
         const notifMsg = messagesSent.find(m => m.jid === 'admin1@s.whatsapp.net' && m.msg?.text?.includes('Court 1') && m.msg?.text?.includes('8 voting slots'));
-        assert.ok(notifMsg, 'Recipient in bookingNotifications list was notified');
+        assert.ok(notifMsg, 'Recipient in notifications list was notified');
         assert.equal(notifMsg.msg.text, '⚠️ *Court 1* is no longer available. Only *8 voting slots* are valid for this match poll.');
 
         // Voter on Player 9 was tagged that slot is no longer valid
@@ -717,6 +719,7 @@ describe('pollCommands', () => {
       } finally {
         scvcc.bookCourt = originalBookCourt;
         scvcc.checkCourtAvailability = originalCheckAvail;
+        groupsConfig.getNotifications = origGetNotifs;
         groupsConfig.getBookingNotifications = origGetBookingNotifs;
       }
     });

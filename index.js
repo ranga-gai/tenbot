@@ -33,15 +33,18 @@ process.on('beforeExit', (code) => {
 
 process.on('exit', (code) => {
   console.log(`ℹ️ [${new Date().toISOString()}] Process exited with code: ${code}`);
+  try { playerActivity.save(); } catch (e) {}
 });
 
 process.on('SIGINT', () => {
   console.log(`\n🛑 [${new Date().toISOString()}] Received SIGINT (Ctrl+C). Terminating gracefully.`);
+  try { playerActivity.save(); } catch (e) {}
   process.exit(0);
 });
 
 process.on('SIGTERM', () => {
   console.log(`\n🛑 [${new Date().toISOString()}] Received SIGTERM. Terminating gracefully.`);
+  try { playerActivity.save(); } catch (e) {}
   process.exit(0);
 });
 
@@ -68,6 +71,7 @@ const messageHistory = require('./lib/messageHistory');
 const recurringPollsModule = require('./lib/recurringPolls');
 const groupsConfig = require('./lib/groupsConfig');
 const courtsConfig = require('./lib/courtsConfig');
+const playerActivity = require('./lib/playerActivity');
 const anthropic = require('./lib/anthropic');
 const pollTime = require('./lib/pollTime');
 const { parseLineup } = require('./lib/lineupParser');
@@ -819,6 +823,9 @@ async function handleEditedMessage(sock, msg, editDetails, groupName) {
     editDetails.timestamp || Date.now(),
     Boolean(targetKey.fromMe)
   );
+  if (!targetKey.fromMe && senderJid) {
+    playerActivity.recordMessaged(senderJid, editDetails.timestamp || Date.now(), targetJid);
+  }
 
   console.log(`[${groupName}] ${sender} (edited message ${targetId}): ${text}`);
 
@@ -944,6 +951,19 @@ if (require.main === module) {
       ratings.refreshPeriodicRatings().catch((err) => console.error('Error in periodic ratings sweep:', err));
     }, RATINGS_REFRESH_CHECK_INTERVAL_MS);
   }, 20 * 1000);
+
+  // Persist player activity to disk once a day and check inactivity milestones
+  const DAILY_ACTIVITY_SAVE_INTERVAL_MS = 24 * 60 * 60 * 1000;
+  setInterval(async () => {
+    playerActivity.save();
+    if (botSock) {
+      try {
+        await playerActivity.checkInactivityMilestonesForAllGroups(botSock, getPollContext());
+      } catch (err) {
+        console.error('Error in periodic inactivity milestones check:', err.message);
+      }
+    }
+  }, DAILY_ACTIVITY_SAVE_INTERVAL_MS);
 }
 
 async function startBot() {
@@ -1001,6 +1021,14 @@ async function startBot() {
         if (name && c.id && isTargetGroupContact(c.id)) {
           const cPn = c.id.endsWith('@s.whatsapp.net') ? jidNormalizedUser(c.id) : (c.pn ? jidNormalizedUser(c.pn) : null);
           recordName(c.id, name, cPn);
+        }
+      }
+
+      if (!msg.key?.fromMe) {
+        const senderId = msg.key?.participant || (!remoteJid?.endsWith('@g.us') ? remoteJid : null);
+        if (senderId) {
+          const msgTimestampMs = msg.messageTimestamp ? Number(msg.messageTimestamp) * 1000 : Date.now();
+          playerActivity.recordMessaged(senderId, msgTimestampMs, remoteJid);
         }
       }
     } catch (err) {
