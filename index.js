@@ -1023,14 +1023,6 @@ async function startBot() {
           recordName(c.id, name, cPn);
         }
       }
-
-      if (!msg.key?.fromMe) {
-        const senderId = msg.key?.participant || (!remoteJid?.endsWith('@g.us') ? remoteJid : null);
-        if (senderId) {
-          const msgTimestampMs = msg.messageTimestamp ? Number(msg.messageTimestamp) * 1000 : Date.now();
-          playerActivity.recordMessaged(senderId, msgTimestampMs, remoteJid);
-        }
-      }
     } catch (err) {
       console.error(`⚠️ [${new Date().toISOString()}] Error in contacts.upsert:`, err);
     }
@@ -1235,6 +1227,14 @@ async function startBot() {
         recordName(msg.key.participant, msg.pushName, senderPn);
       } else if (msg.pushName && !msg.key?.fromMe && remoteJid && !remoteJid.endsWith('@g.us')) {
         recordName(remoteJid, msg.pushName, remoteJid.endsWith('@s.whatsapp.net') ? remoteJid : null);
+      }
+
+      if (!msg.key?.fromMe) {
+        const senderId = msg.key?.participant || (!remoteJid?.endsWith('@g.us') ? remoteJid : null);
+        if (senderId) {
+          const msgTimestampMs = msg.messageTimestamp ? Number(msg.messageTimestamp) * 1000 : Date.now();
+          playerActivity.recordMessaged(senderId, msgTimestampMs, remoteJid);
+        }
       }
 
       // Unwrapped content (handles disappearing / ephemeral messages, view-once, etc.)
