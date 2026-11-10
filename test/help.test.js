@@ -7,9 +7,11 @@ describe('help', () => {
     const text = helpText(null, false);
     assert.match(text, /Tennis Group Bot Commands:/);
     assert.match(text, /!poll/);
+    assert.match(text, /!simulatepoll/);
     assert.match(text, /!matchups/);
     assert.match(text, /!score/);
     assert.match(text, /!ratings/);
+    assert.match(text, /!checkinactivity/);
     // When isSuper is false, superadmin group commands should not appear
     assert.equal(text.includes('!groups – (Superadmin only via DM)'), false);
   });
@@ -25,16 +27,16 @@ describe('help', () => {
     assert.match(text, /Create Match Poll \(!poll\)/);
     assert.match(text, /Usage:/);
     assert.match(text, /Options:/);
-    assert.match(text, /`--courts` — Check SCVCC court availability/);
+    assert.match(text, /`--courts` \/ `--check-courts` \/ `--no-courts`/);
     assert.equal(text.includes('`--no-matchups`'), false);
+    assert.match(text, /`--single-vote` \/ `--multi-vote`/);
+    assert.match(text, /`--single-session` \/ `--independent-sessions`/);
     assert.match(text, /`--lineups=filled\|fallback\|none` — Lineup generation mode/);
     assert.match(text, /`--lineup-lead-time=<duration>` — Lead time before play time/);
     assert.match(text, /`--slot-check` \/ `--no-slot-check` — Enable or disable slot conflict checking/);
     assert.match(text, /`--pre-allocate-slots` — Include pre-allocated court slots/);
     assert.match(text, /`--reminders` \/ `--no-reminders`/);
-    assert.match(text, /`--reminders` \/ `--no-reminders`/);
-    assert.match(text, /`--reminders` \/ `--no-reminders`/);
-    assert.match(text, /`--court-booking-type=pre-book\|none` — Automatically pre-book courts/);
+    assert.match(text, /`--court-booking-type=pre-book\|none` \(or `--court-booking=pre-book\|none`\) — Automatically pre-book courts/);
     assert.match(text, /`--look-around="<window>"` — Time window to search/);
     assert.match(text, /Examples:/);
   });
@@ -57,11 +59,27 @@ describe('help', () => {
     assert.match(text, /`<matchTime>` — Scheduled match play time/);
     assert.match(text, /`\[at <postTime>\]` — When to post the poll/);
     assert.match(text, /`\[days\]` — Days of the week to post/);
+    assert.match(text, /`--single-vote` \/ `--multi-vote`/);
+    assert.match(text, /`--single-session` \/ `--independent-sessions`/);
     assert.match(text, /`--booking-strategy=advanced\|standard` — Booking strategy/);
     assert.match(text, /`--booking-schedule="<offset>"` — Advance booking trigger schedule/);
     assert.match(text, /`--look-around="<window>"`/);
     assert.match(text, /`--pre-allocate-slots` — Include pre-allocated court slots/);
     assert.match(text, /advance court pre-booking/i);
+  });
+
+  it('should return detailed help for "!help setslots" including multi-time slot limits', () => {
+    const text = helpText('setslots', false);
+    assert.match(text, /Limit Poll Slots \(!setslots\)/);
+    assert.match(text, /`<slotTime> <count\/unlimited>`/);
+    assert.match(text, /!setslots 9:30am 4/);
+    assert.match(text, /!setslots 9:30am unlimited/);
+  });
+
+  it('should return detailed help for "!help checkinactivity" alias', () => {
+    const text = helpText('checkinactivity', false);
+    assert.match(text, /Inactive Players & Milestone Checks/);
+    assert.match(text, /`!checkinactivity`/);
   });
 
   it('should return detailed help for "!help bookcourt" including option descriptions', () => {
@@ -92,6 +110,8 @@ describe('help', () => {
     assert.match(text, /Modify Poll Instance/);
     assert.match(text, /Options:/);
     assert.match(text, /`<scheduleId\/pollId>` — Target poll ID/);
+    assert.match(text, /`--single-vote` \/ `--multi-vote`/);
+    assert.match(text, /`--single-session` \/ `--independent-sessions`/);
     assert.match(text, /`--lineups=filled\|fallback\|none`/);
     assert.match(text, /`--pre-allocate-slots` — Include pre-allocated court slots/);
   });
