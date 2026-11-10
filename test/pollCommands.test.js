@@ -1502,6 +1502,40 @@ describe('pollCommands', () => {
         scvcc.bookCourt = originalBookCourt;
       }
     });
+
+    it('should default pre-book courts to maxCourts when preBookCourts is not specified on an auto poll', async () => {
+      const originalBookCourt = scvcc.bookCourt;
+      let bookCallCount = 0;
+
+      scvcc.bookCourt = async (params) => {
+        bookCallCount++;
+        return {
+          success: true,
+          court: `Court ${bookCallCount}`,
+          players: params.players,
+          date: params.date,
+          time: params.time,
+          reservationId: `res-maxfallback-${bookCallCount}`,
+          message: `Court ${bookCallCount} booked`
+        };
+      };
+
+      try {
+        const res = await preBookCourtsForMatch({
+          remoteJid: '120363403838804497@g.us',
+          targetDateMDY: '10/22/2026',
+          queryTime: '9:00 AM',
+          size: 'auto',
+          isAuto: true,
+          maxCourts: 2
+        });
+
+        assert.equal(bookCallCount, 2, 'Should pre-book 2 courts when maxCourts=2 and preBookCourts is omitted');
+        assert.equal(res.advanceBookedCourts.length, 2);
+      } finally {
+        scvcc.bookCourt = originalBookCourt;
+      }
+    });
   });
   describe('Yes/No opt-in poll reminder with creator Yes vote', () => {
     const crypto = require('crypto');

@@ -143,6 +143,39 @@ describe('recurringPolls', () => {
       const parsedModNone = parseRecurringPollText('!modifyrecurringpoll rec_1 --max-courts=none');
       assert.ok(parsedModNone);
       assert.equal(parsedModNone.updates.maxCourts, null);
+
+      const parsedModOther = parseRecurringPollText('!modifyrecurringpoll rec_1 7:30pm');
+      assert.ok(parsedModOther);
+      assert.equal(parsedModOther.updates.maxCourts, undefined);
+    });
+
+    it('should display Max Courts in recurring schedule card and preserve it when modifying other fields', async () => {
+      const { scheduleRecurringPoll, modifyRecurringPoll, listRecurringPolls } = require('../lib/recurringPolls');
+      const recurringPolls = new Map();
+      const parsedCreate = parseRecurringPollText('!recurringpoll auto 7pm mon-thu --max-courts=3');
+      const createMsg = await scheduleRecurringPoll({
+        recurringPolls,
+        persistPolls: () => {},
+        targetChatId: 'group1@g.us',
+        sender: 'Pramod',
+        senderJid: 'pramod@lid',
+        params: parsedCreate
+      });
+      assert.match(createMsg, /• \*Max Courts:\* 3/);
+
+      const schedId = [...recurringPolls.keys()][0];
+      const parsedMod = parseRecurringPollText(`!modifyrecurringpoll ${schedId} 7:30pm`);
+      const modMsg = await modifyRecurringPoll({
+        recurringPolls,
+        persistPolls: () => {},
+        sender: 'Pramod',
+        scheduleId: schedId,
+        updates: parsedMod.updates
+      });
+      assert.match(modMsg, /• \*Max Courts:\* 3/);
+
+      const listMsg = listRecurringPolls({ recurringPolls, chatId: 'group1@g.us' });
+      assert.match(listMsg, /• \*Max Courts:\* 3/);
     });
 
     it('should parse recurring poll creation command', () => {
