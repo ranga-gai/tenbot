@@ -10,7 +10,13 @@ const {
   pauseCourtBookings,
   resumeCourtBookings,
   isTentativeBookingTitle,
-  matchesTentativePattern
+  matchesTentativePattern,
+  getGroupConfig,
+  updateGroupConfig,
+  formatGroupConfig,
+  formatAllGroupsConfig,
+  getQuietHours,
+  parseQuietHours
 } = require('../lib/groupsConfig');
 
 describe('groupsConfig', () => {
@@ -193,6 +199,39 @@ describe('groupsConfig', () => {
       } finally {
         groupsConfig.getGroupConfig = origGetConfig;
       }
+    });
+  });
+
+  describe("quietHours in groupsConfig", () => {
+    it("should include quietHours in getGroupConfig", () => {
+      const cfg = getGroupConfig("Bot-testing");
+      assert.ok(cfg.quietHours);
+      assert.ok(cfg.quietHoursParsed);
+      assert.ok(cfg.reminderQuietHours);
+      assert.equal(cfg.quietHours, "22:00-07:00");
+      assert.equal(cfg.reminderQuietHours, "10:00 PM – 7:00 AM");
+    });
+
+    it("should update quietHours in updateGroupConfig", () => {
+      const origConfig = JSON.parse(JSON.stringify(loadRawConfig() || {}));
+      try {
+        const updated = updateGroupConfig("Bot-testing", { quietHours: "11pm to 6am" });
+        assert.ok(updated);
+        assert.equal(updated.quietHours, "23:00-06:00");
+        const cfg = getGroupConfig("Bot-testing");
+        assert.equal(cfg.quietHours, "23:00-06:00");
+        assert.equal(cfg.reminderQuietHours, "11:00 PM – 6:00 AM");
+      } finally {
+        saveRawConfig(origConfig);
+      }
+    });
+
+    it("should display quietHours in formatGroupConfig and formatAllGroupsConfig", () => {
+      const formatted = formatGroupConfig("Bot-testing");
+      assert.match(formatted, /\*Reminder Quiet Hours:\* 10:00 PM – 7:00 AM/);
+
+      const allFormatted = formatAllGroupsConfig();
+      assert.match(allFormatted, /• Reminder Quiet Hours: 10:00 PM – 7:00 AM/);
     });
   });
 });

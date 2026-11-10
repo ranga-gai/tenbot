@@ -29,6 +29,7 @@ const {
   getPollDayWord,
   checkAndSendPollReminders,
   handleTriggerReminder,
+  handleQuietHoursCommand,
   pollStatusText,
   createMatchPoll,
   checkAndNotifySlotConflicts,
@@ -2665,6 +2666,85 @@ describe('pollCommands', () => {
         assert.equal(messagesSent.length, 0, "Should not send reminder before 12pm on day before");
       });
 
+      it("should suppress reminders during quiet hours before 7:00 AM and send them at or after 7:00 AM", async () => {
+        const messagesSent = [];
+        const mockSock = {
+          user: { id: "1234567890@s.whatsapp.net" },
+          sendMessage: async (jid, msg) => { messagesSent.push({ jid, msg }); }
+        };
+
+        // Match play time at 11:00 AM PDT on Saturday Oct 24
+        // 4 hours before is 7:00 AM PDT (14:00Z)
+        const playAt = new Date("2026-10-24T18:00:00.000Z").toISOString(); // 11:00 AM PDT
+        const createdAt = new Date("2026-10-23T18:00:00.000Z").toISOString(); // day before
+
+        const activePolls = new Map();
+        activePolls.set("poll_quiet", {
+          name: "Tennis Saturday 11am",
+          isManual: false,
+          status: "active",
+          remoteJid: "group1@g.us",
+          when: "Saturday 11am",
+          playAt,
+          createdAt,
+          options: ["Player 1", "Player 2", "Player 3", "Player 4"],
+          size: 4,
+          type: "fixed",
+          sentReminders: [16, 8],
+          voteBuffer: new Map()
+        });
+
+        const messageStore = new Map();
+        messageStore.set("group1@g.us:poll_quiet", {
+          pollCreationMessage: { name: "Tennis Saturday 11am", options: [{ optionName: "Player 1" }] }
+        });
+
+        // 1. Check at 6:45 AM PDT (13:45Z) -> within quiet hours (< 7am), should NOT send
+        const time645am = new Date("2026-10-24T13:45:00.000Z").getTime();
+        await checkAndSendPollReminders(mockSock, {
+          activePolls,
+          persistPolls: () => {},
+          messageStore
+        }, time645am);
+
+        assert.equal(messagesSent.length, 0, "Should suppress reminders before 7:00 AM");
+
+        // 2. Check at 7:05 AM PDT (14:05Z) -> quiet hours ended at 7:00 AM, SHOULD send 4h reminder
+        const time705am = new Date("2026-10-24T14:05:00.000Z").getTime();
+        await checkAndSendPollReminders(mockSock, {
+          activePolls,
+          persistPolls: () => {},
+          messageStore
+        }, time705am);
+
+        assert.equal(messagesSent.length, 1, "Should send reminder at or after 7:00 AM");
+        assert.ok(activePolls.get("poll_quiet").sentReminders.includes(4));
+
+        // 3. Check at 10:15 PM PDT (Sunday 05:15Z) -> quiet hours (>= 10pm / 22:00), should NOT send
+        messagesSent.length = 0;
+        activePolls.set("poll_night", {
+          name: "Tennis Sunday 8am",
+          isManual: false,
+          status: "active",
+          remoteJid: "group1@g.us",
+          when: "Sunday 8am",
+          playAt: new Date("2026-10-25T15:00:00.000Z").toISOString(),
+          createdAt,
+          options: ["Player 1", "Player 2"],
+          size: 2,
+          type: "fixed",
+          sentReminders: [],
+          voteBuffer: new Map()
+        });
+        const time1015pm = new Date("2026-10-25T05:15:00.000Z").getTime();
+        await checkAndSendPollReminders(mockSock, {
+          activePolls,
+          persistPolls: () => {},
+          messageStore
+        }, time1015pm);
+        assert.equal(messagesSent.length, 0, "Should suppress reminders at or after 10:00 PM");
+      });
+
       it("should return explanation when user explicitly triggers reminder for manual poll with no day and no time", async () => {
         const activePolls = new Map();
         activePolls.set("poll_noday", {
@@ -5248,6 +5328,327 @@ describe('pollCommands', () => {
       const { aggregated, interestedPlayers } = getPollVoters(pollId, pollState, "bot@s.whatsapp.net", messageStore);
       assert.equal(aggregated.length, 2);
       assert.equal(interestedPlayers.length, 1);
+    });
+  });
+
+  describe("configurable quiet hours for reminders", () => {
+    describe("parseQuietHours", () => {
+      it("should parse 12-hour format strings (10pm-7am, 10pm to 7am)", () => {
+        const qh1 = groupsConfig.parseQuietHours("10pm-7am");
+        assert.ok(qh1);
+        assert.equal(qh1.enabled, true);
+        assert.equal(qh1.start, "22:00");
+        assert.equal(qh1.end, "07:00");
+        assert.equal(qh1.startHour, 22);
+        assert.equal(qh1.startMinute, 0);
+        assert.equal(qh1.endHour, 7);
+        assert.equal(qh1.endMinute, 0);
+        assert.equal(qh1.raw, "22:00-07:00");
+        assert.equal(qh1.display, "10:00 PM – 7:00 AM");
+
+        const qh2 = groupsConfig.parseQuietHours("10pm to 7am");
+        assert.ok(qh2);
+        assert.equal(qh2.raw, "22:00-07:00");
+      });
+
+      it("should parse times with minutes (10:30pm to 6:30am)", () => {
+        const qh = groupsConfig.parseQuietHours("10:30pm to 6:30am");
+        assert.ok(qh);
+        assert.equal(qh.enabled, true);
+        assert.equal(qh.start, "22:30");
+        assert.equal(qh.end, "06:30");
+        assert.equal(qh.startHour, 22);
+        assert.equal(qh.startMinute, 30);
+        assert.equal(qh.endHour, 6);
+        assert.equal(qh.endMinute, 30);
+        assert.equal(qh.raw, "22:30-06:30");
+        assert.equal(qh.display, "10:30 PM – 6:30 AM");
+      });
+
+      it("should parse 24-hour format strings (22:00-07:00)", () => {
+        const qh = groupsConfig.parseQuietHours("22:00-07:00");
+        assert.ok(qh);
+        assert.equal(qh.enabled, true);
+        assert.equal(qh.start, "22:00");
+        assert.equal(qh.end, "07:00");
+        assert.equal(qh.raw, "22:00-07:00");
+        assert.equal(qh.display, "10:00 PM – 7:00 AM");
+      });
+
+      it("should parse off / none / disable / disabled as disabled", () => {
+        const qhOff = groupsConfig.parseQuietHours("off");
+        assert.ok(qhOff);
+        assert.equal(qhOff.enabled, false);
+        assert.equal(qhOff.raw, "off");
+        assert.equal(qhOff.display, "Disabled (Off)");
+
+        const qhNone = groupsConfig.parseQuietHours("none");
+        assert.equal(qhNone.enabled, false);
+
+        const qhDisable = groupsConfig.parseQuietHours("disable");
+        assert.equal(qhDisable.enabled, false);
+
+        const qhFalse = groupsConfig.parseQuietHours(false);
+        assert.equal(qhFalse.enabled, false);
+      });
+
+      it("should return default 22:00-07:00 for undefined or null", () => {
+        const def = groupsConfig.parseQuietHours(null);
+        assert.ok(def);
+        assert.equal(def.enabled, true);
+        assert.equal(def.raw, "22:00-07:00");
+        assert.equal(def.display, "10:00 PM – 7:00 AM");
+      });
+
+      it("should return null for invalid formats", () => {
+        assert.equal(groupsConfig.parseQuietHours("invalid"), null);
+        assert.equal(groupsConfig.parseQuietHours("hello-world"), null);
+        assert.equal(groupsConfig.parseQuietHours(""), null);
+      });
+    });
+
+    describe("isInQuietHours & isQuietHoursWakeUpWindow", () => {
+      it("should check isInQuietHours for default 10:00 PM - 7:00 AM window", () => {
+        // Saturday Oct 24, 2026: San Jose is in PDT (UTC-7)
+        // 21:59 PDT = 04:59 UTC
+        const t959pm = new Date("2026-10-25T04:59:00Z").getTime();
+        assert.equal(groupsConfig.isInQuietHours(t959pm, "group_default@g.us"), false);
+
+        // 22:00 PDT = 05:00 UTC
+        const t1000pm = new Date("2026-10-25T05:00:00Z").getTime();
+        assert.equal(groupsConfig.isInQuietHours(t1000pm, "group_default@g.us"), true);
+
+        // 23:30 PDT = 06:30 UTC
+        const t1130pm = new Date("2026-10-25T06:30:00Z").getTime();
+        assert.equal(groupsConfig.isInQuietHours(t1130pm, "group_default@g.us"), true);
+
+        // 06:59 PDT = 13:59 UTC
+        const t659am = new Date("2026-10-25T13:59:00Z").getTime();
+        assert.equal(groupsConfig.isInQuietHours(t659am, "group_default@g.us"), true);
+
+        // 07:00 PDT = 14:00 UTC
+        const t700am = new Date("2026-10-25T14:00:00Z").getTime();
+        assert.equal(groupsConfig.isInQuietHours(t700am, "group_default@g.us"), false);
+
+        // 12:00 PM PDT
+        const t1200pm = new Date("2026-10-25T19:00:00Z").getTime();
+        assert.equal(groupsConfig.isInQuietHours(t1200pm, "group_default@g.us"), false);
+      });
+
+      it("should check isQuietHoursWakeUpWindow for 7:00 AM end time", () => {
+        // 06:59 PDT (before end)
+        const t659am = new Date("2026-10-25T13:59:00Z").getTime();
+        assert.equal(groupsConfig.isQuietHoursWakeUpWindow(t659am, "group_default@g.us"), false);
+
+        // 07:00 PDT (exact end time -> wake up window starts)
+        const t700am = new Date("2026-10-25T14:00:00Z").getTime();
+        assert.equal(groupsConfig.isQuietHoursWakeUpWindow(t700am, "group_default@g.us"), true);
+
+        // 07:45 PDT (within 60m window)
+        const t745am = new Date("2026-10-25T14:45:00Z").getTime();
+        assert.equal(groupsConfig.isQuietHoursWakeUpWindow(t745am, "group_default@g.us"), true);
+
+        // 08:00 PDT (60m window ended)
+        const t800am = new Date("2026-10-25T15:00:00Z").getTime();
+        assert.equal(groupsConfig.isQuietHoursWakeUpWindow(t800am, "group_default@g.us"), false);
+      });
+
+      it("should evaluate custom quiet hours per group", () => {
+        const origGetConfig = groupsConfig.getGroupConfig;
+        try {
+          groupsConfig.getGroupConfig = (jid) => {
+            if (jid === "group_custom@g.us") {
+              return { name: "Custom Group", quietHours: "23:00-06:00" };
+            }
+            if (jid === "group_off@g.us") {
+              return { name: "No Quiet Group", quietHours: "off" };
+            }
+            return { name: "Default Group", quietHours: "22:00-07:00" };
+          };
+
+          // At 22:15 PDT:
+          // Default group is in quiet hours (>= 22:00)
+          // Custom group is NOT in quiet hours (< 23:00)
+          // Off group is NOT in quiet hours
+          const t1015pm = new Date("2026-10-25T05:15:00Z").getTime();
+          assert.equal(groupsConfig.isInQuietHours(t1015pm, "group_default@g.us"), true);
+          assert.equal(groupsConfig.isInQuietHours(t1015pm, "group_custom@g.us"), false);
+          assert.equal(groupsConfig.isInQuietHours(t1015pm, "group_off@g.us"), false);
+
+          // At 06:15 PDT:
+          // Default group is in quiet hours (< 07:00)
+          // Custom group is NOT in quiet hours (>= 06:00)
+          const t615am = new Date("2026-10-25T13:15:00Z").getTime();
+          assert.equal(groupsConfig.isInQuietHours(t615am, "group_default@g.us"), true);
+          assert.equal(groupsConfig.isInQuietHours(t615am, "group_custom@g.us"), false);
+          // Custom group wake-up window is 06:00 - 06:59
+          assert.equal(groupsConfig.isQuietHoursWakeUpWindow(t615am, "group_custom@g.us"), true);
+          assert.equal(groupsConfig.isQuietHoursWakeUpWindow(t615am, "group_default@g.us"), false);
+        } finally {
+          groupsConfig.getGroupConfig = origGetConfig;
+        }
+      });
+    });
+
+    describe("handleQuietHoursCommand", () => {
+      const { getGroupMetadataCache } = require("../lib/commands/groupCommands");
+
+      it("should display current quiet hours when called with no arguments in group chat", async () => {
+        getGroupMetadataCache().clear();
+        const mockSock = {
+          user: { id: "bot@s.whatsapp.net" }
+        };
+        const res = await handleQuietHoursCommand(mockSock, "120363403838804497@g.us", "Alice", "alice@s.whatsapp.net", "!quiethours", {});
+        assert.match(res, /Reminder quiet hours for \*Bot-testing\*:/i);
+        assert.match(res, /10:00 PM – 7:00 AM/i);
+        assert.match(res, /Match reminder notifications are paused during this window/i);
+      });
+
+      it("should reject non-admin attempt to update quiet hours", async () => {
+        getGroupMetadataCache().clear();
+        const mockSock = {
+          user: { id: "bot@s.whatsapp.net" },
+          groupMetadata: async () => ({
+            participants: [{ id: "bob@s.whatsapp.net", admin: null }]
+          })
+        };
+        const res = await handleQuietHoursCommand(mockSock, "120363403838804497@g.us", "Bob", "bob@s.whatsapp.net", "!quiethours 11pm-6am", {});
+        assert.match(res, /⚠️ Only group admins or the bot superadmin can change reminder quiet hours/i);
+      });
+
+      it("should allow group admin to update quiet hours", async () => {
+        getGroupMetadataCache().clear();
+        const mockSock = {
+          user: { id: "bot@s.whatsapp.net" },
+          groupMetadata: async () => ({
+            participants: [{ id: "admin@s.whatsapp.net", admin: "admin" }]
+          })
+        };
+        const res = await handleQuietHoursCommand(mockSock, "120363403838804497@g.us", "Admin", "admin@s.whatsapp.net", "!quiethours 11pm-6am", {});
+        assert.match(res, /✅ Reminder quiet hours for \*Bot-testing\* updated to \*11:00 PM – 6:00 AM\*/i);
+        assert.match(res, /23:00-06:00/);
+
+        // Verify updated in groupsConfig
+        const qh = groupsConfig.getQuietHours("120363403838804497@g.us");
+        assert.equal(qh.raw, "23:00-06:00");
+        assert.equal(qh.display, "11:00 PM – 6:00 AM");
+
+        // Restore back to default 22:00-07:00
+        getGroupMetadataCache().clear();
+        await handleQuietHoursCommand(mockSock, "120363403838804497@g.us", "Admin", "admin@s.whatsapp.net", "!quiethours 10pm-7am", {});
+        const qhRestored = groupsConfig.getQuietHours("120363403838804497@g.us");
+        assert.equal(qhRestored.raw, "22:00-07:00");
+      });
+
+      it("should allow disabling quiet hours with !quiethours off", async () => {
+        getGroupMetadataCache().clear();
+        const mockSock = {
+          user: { id: "bot@s.whatsapp.net" },
+          groupMetadata: async () => ({
+            participants: [{ id: "admin@s.whatsapp.net", admin: "admin" }]
+          })
+        };
+        const res = await handleQuietHoursCommand(mockSock, "120363403838804497@g.us", "Admin", "admin@s.whatsapp.net", "!quiethours off", {});
+        assert.match(res, /have been \*disabled\*/i);
+        assert.match(res, /sent at any hour/i);
+
+        const qh = groupsConfig.getQuietHours("120363403838804497@g.us");
+        assert.equal(qh.enabled, false);
+
+        // Restore
+        getGroupMetadataCache().clear();
+        await handleQuietHoursCommand(mockSock, "120363403838804497@g.us", "Admin", "admin@s.whatsapp.net", "!quiethours 22:00-07:00", {});
+      });
+
+      it("should return helpful format error on invalid time range", async () => {
+        getGroupMetadataCache().clear();
+        const mockSock = {
+          user: { id: "bot@s.whatsapp.net" },
+          groupMetadata: async () => ({
+            participants: [{ id: "admin@s.whatsapp.net", admin: "admin" }]
+          })
+        };
+        const res = await handleQuietHoursCommand(mockSock, "120363403838804497@g.us", "Admin", "admin@s.whatsapp.net", "!quiethours invalid-time", {});
+        assert.match(res, /⚠️ Invalid quiet hours format/i);
+        assert.match(res, /!quiethours 10pm-7am/i);
+      });
+    });
+
+    describe("checkAndSendPollReminders with per-group quiet hours", () => {
+      it("should suppress reminder for group in quiet hours while sending for group outside quiet hours", async () => {
+        const messagesSent = [];
+        const mockSock = {
+          user: { id: "bot@s.whatsapp.net" },
+          sendMessage: async (jid, msg) => { messagesSent.push({ jid, msg }); }
+        };
+
+        const origGetConfig = groupsConfig.getGroupConfig;
+        try {
+          groupsConfig.getGroupConfig = (jid) => {
+            if (jid === "group_custom@g.us") {
+              return { name: "Custom Group", quietHours: "23:00-06:00" };
+            }
+            return { name: "Default Group", quietHours: "22:00-07:00" };
+          };
+
+          const playAt = new Date("2026-10-25T15:00:00Z").toISOString();
+          const createdAt = new Date("2026-10-24T18:00:00Z").toISOString();
+
+          const activePolls = new Map();
+          // Poll in Default group (quiet hours 22:00 - 07:00)
+          activePolls.set("poll_def", {
+            name: "Tennis Default Group",
+            status: "active",
+            remoteJid: "group_default@g.us",
+            when: "Sunday 8am",
+            playAt,
+            createdAt,
+            options: ["Player 1", "Player 2"],
+            size: 2,
+            type: "fixed",
+            sentReminders: [],
+            voteBuffer: new Map()
+          });
+
+          // Poll in Custom group (quiet hours 23:00 - 06:00)
+          activePolls.set("poll_cust", {
+            name: "Tennis Custom Group",
+            status: "active",
+            remoteJid: "group_custom@g.us",
+            when: "Sunday 8am",
+            playAt,
+            createdAt,
+            options: ["Player 1", "Player 2"],
+            size: 2,
+            type: "fixed",
+            sentReminders: [],
+            voteBuffer: new Map()
+          });
+
+          const messageStore = new Map([
+            ["group_default@g.us:poll_def", { pollCreationMessage: { name: "Poll Def", options: [{ optionName: "Player 1" }] } }],
+            ["group_custom@g.us:poll_cust", { pollCreationMessage: { name: "Poll Cust", options: [{ optionName: "Player 1" }] } }]
+          ]);
+
+          // Time: 10:15 PM PDT (05:15Z on Oct 25)
+          // Default group is in quiet hours (>= 22:00) -> suppressed!
+          // Custom group is NOT in quiet hours (< 23:00) -> sent!
+          const time1015pm = new Date("2026-10-25T05:15:00Z").getTime();
+
+          await checkAndSendPollReminders(mockSock, {
+            activePolls,
+            persistPolls: () => {},
+            messageStore
+          }, time1015pm);
+
+          assert.equal(messagesSent.length, 1);
+          assert.equal(messagesSent[0].jid, "group_custom@g.us");
+          assert.ok(activePolls.get("poll_cust").sentReminders.includes(16));
+          assert.equal(activePolls.get("poll_def").sentReminders.length, 0);
+        } finally {
+          groupsConfig.getGroupConfig = origGetConfig;
+        }
+      });
     });
   });
 });
