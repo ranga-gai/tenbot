@@ -476,6 +476,11 @@ describe('courtCommands', () => {
     function teardownMocks() {
       groupsConfig.isSuperAdmin = origIsSuper;
       groupsConfig.saveRawConfig(origConfig);
+      const namesStore = require('../lib/names');
+      if (typeof namesStore.getGroupMembers === 'function') {
+        const gm = namesStore.getGroupMembers(testChatId);
+        if (gm) gm.clear();
+      }
     }
 
     it('should reject non-admin from pausing court bookings for a group', async () => {
@@ -717,6 +722,88 @@ describe('courtCommands', () => {
         assert.equal(sentMessages[1].content.caption.includes("player.php"), false);
       } finally {
         restore();
+      }
+    });
+  });
+
+  describe("checkCourtAvailability untitled blocked courts (⚪)", () => {
+    const origAuthFetch = scvcc.authFetch;
+    const testChatId = "120363403838804497@g.us";
+
+    const buildMockSheetHtml = () => `
+      <tr>
+        <td><div class="tscell">6:30 PM</div></td>
+        <td class="rbm_TimeSlotPanelSlotAvailable"><div class="ncCourtNum">Court 1</div></td>
+        <td rowspan="3">
+          <div class="ncCourtNum">Court 2</div>
+          <img title="Doubles" />
+          <div class="playerName" title="Immaneni, Pramod">Pramod Immaneni</div>
+        </td>
+        <td><div class="ncCourtNum">Court 3</div><div class="blockTitle">3.0+ Live Ball Clinic</div></td>
+        <td><div class="ncCourtNum">Court 5</div></td>
+        <td><div class="ncCourtNum">Court 6</div><div class="playerName" title="Doe, John">John Doe</div></td>
+      </tr>
+      <tr>
+        <td><div class="tscell">7:00 PM</div></td>
+        <td class="rbm_TimeSlotPanelSlotAvailable"><div class="ncCourtNum">Court 1</div></td>
+        <td><div class="ncCourtNum">Court 3</div><div class="blockTitle">3.0+ Live Ball Clinic</div></td>
+        <td><div class="ncCourtNum">Court 5</div></td>
+        <td><div class="ncCourtNum">Court 6</div><div class="playerName" title="Doe, John">John Doe</div></td>
+      </tr>
+      <tr>
+        <td><div class="tscell">7:30 PM</div></td>
+        <td class="rbm_TimeSlotPanelSlotAvailable"><div class="ncCourtNum">Court 1</div></td>
+        <td><div class="ncCourtNum">Court 3</div><div class="blockTitle">3.0+ Live Ball Clinic</div></td>
+        <td><div class="ncCourtNum">Court 5</div></td>
+        <td><div class="ncCourtNum">Court 6</div><div class="playerName" title="Doe, John">John Doe</div></td>
+      </tr>
+    `;
+
+    it("should include untitled blocked courts with ⚪ icon in specific time queries while excluding titled blocked courts", async () => {
+      const namesStore = require('../lib/names');
+      namesStore.addGroupMember(testChatId, { id: '90611059302558@lid', name: 'PI', fullName: 'Pramod Immaneni' });
+      scvcc.authFetch = async () => ({
+        ok: true,
+        text: async () => buildMockSheetHtml()
+      });
+
+      try {
+        const res = await scvcc.checkCourtAvailability({
+          when: "today",
+          time: "6:30pm",
+          chatId: testChatId
+        });
+        assert.equal(res.success, true);
+        assert.match(res.message, /🟢 \*Court 1\* \(90 minutes\)/);
+        assert.match(res.message, /🔵 \*Court 2\* \(Booked: PI, 90m\)/);
+        assert.match(res.message, /⚪ \*Court 5\* \(Blocked: 90 minutes\)/);
+        assert.equal(res.message.includes("Court 3"), false, "Titled blocked court (Clinic) should not be listed");
+        assert.equal(res.message.includes("Court 6"), false, "Other member booked court should not be listed");
+      } finally {
+        scvcc.authFetch = origAuthFetch;
+      }
+    });
+
+    it("should include untitled blocked courts with ⚪ icon in multi-slot queries", async () => {
+      const namesStore = require('../lib/names');
+      namesStore.addGroupMember(testChatId, { id: '90611059302558@lid', name: 'PI', fullName: 'Pramod Immaneni' });
+      scvcc.authFetch = async () => ({
+        ok: true,
+        text: async () => buildMockSheetHtml()
+      });
+
+      try {
+        const res = await scvcc.checkCourtAvailability({
+          when: "today",
+          time: "evening",
+          chatId: testChatId
+        });
+        assert.equal(res.success, true);
+        assert.match(res.message, /• \*6:30 PM\*: 🟢 Court 1 \(90m\) \| 🔵 Court 2 \(Booked: PI, 90m\) \| ⚪ Court 5 \(Blocked: 90m\)/);
+        assert.equal(res.message.includes("Court 3"), false);
+        assert.equal(res.message.includes("Court 6"), false);
+      } finally {
+        scvcc.authFetch = origAuthFetch;
       }
     });
   });
