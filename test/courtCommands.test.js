@@ -80,6 +80,53 @@ describe('courtCommands', () => {
         scvcc.bookCourt = originalBookCourt;
       }
     });
+
+    it('should handle singular !courtbooking and !booking in group chat', async () => {
+      let getBookingsCalled = false;
+      const originalGetBookings = scvcc.getCourtBookings;
+      scvcc.getCourtBookings = async (args) => {
+        getBookingsCalled = true;
+        assert.equal(args.chatId, '120363403838804497@g.us');
+        return { success: true, message: 'Court bookings list' };
+      };
+
+      try {
+        const res1 = await handleCourtCommand(null, '!courtbooking tomorrow', '120363403838804497@g.us', 'Alice');
+        assert.equal(getBookingsCalled, true);
+        assert.equal(res1, 'Court bookings list');
+
+        getBookingsCalled = false;
+        const res2 = await handleCourtCommand(null, '!booking tomorrow 6pm', '120363403838804497@g.us', 'Alice');
+        assert.equal(getBookingsCalled, true);
+        assert.equal(res2, 'Court bookings list');
+      } finally {
+        scvcc.getCourtBookings = originalGetBookings;
+      }
+    });
+
+    it('should handle !book and !reserve aliases for court booking in group chat', async () => {
+      let bookCalled = false;
+      const originalBookCourt = scvcc.bookCourt;
+      scvcc.bookCourt = async (args) => {
+        bookCalled = true;
+        assert.equal(args.chatId, '120363403838804497@g.us');
+        assert.equal(args.time, '9am');
+        return { success: true, message: 'Court booked successfully' };
+      };
+
+      try {
+        const res1 = await handleCourtCommand(null, '!book Court 2 9am tomorrow', '120363403838804497@g.us', 'Alice');
+        assert.equal(bookCalled, true);
+        assert.equal(res1, 'Court booked successfully');
+
+        bookCalled = false;
+        const res2 = await handleCourtCommand(null, '!reserve Court 3 9am tomorrow', '120363403838804497@g.us', 'Alice');
+        assert.equal(bookCalled, true);
+        assert.equal(res2, 'Court booked successfully');
+      } finally {
+        scvcc.bookCourt = originalBookCourt;
+      }
+    });
   });
 
   describe('executeCourtTool', () => {
