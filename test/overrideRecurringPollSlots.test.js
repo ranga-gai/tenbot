@@ -849,4 +849,568 @@ describe('overrideRecurringPollSlots', () => {
       assert.equal(persisted, true);
     });
   });
+
+  describe("skip court for recurring poll instance", () => {
+    describe("overrideRecurringPollInstanceCourtSkip handler", () => {
+      it("should set skipped court for upcoming instance and format card with skip note", async () => {
+        const recurringPolls = new Map();
+        const schedId = "rec_court_skip_test";
+        const sched = {
+          id: schedId,
+          remoteJid: "120363402559062529@g.us",
+          matchTime: "7pm",
+          matchDisplay: "7 PM",
+          days: "friday",
+          daysList: [5],
+          size: "auto",
+          enabled: true,
+          creator: { name: "Alice", jid: "alice@s.whatsapp.net" }
+        };
+        recurringPolls.set(schedId, sched);
+
+        let persisted = false;
+        const res = await recurringPollsModule.overrideRecurringPollInstanceCourtSkip({
+          recurringPolls,
+          activePolls: new Map(),
+          persistPolls: () => { persisted = true; },
+          scheduleId: schedId,
+          targetDayOrDate: "Friday",
+          courts: ["Court 3"],
+          action: "set",
+          customSanJoseParts: { year: 2026, month: 10, day: 10, hour: 12, minute: 0, weekday: "tue" }, // Nov 10 -> Friday is Nov 13
+          chatId: "120363402559062529@g.us",
+          sender: "Alice"
+        });
+
+        assert.equal(persisted, true);
+        assert.match(res, /Future Instance Court Skip Set/i);
+        assert.match(res, /Court 3/);
+        assert.match(res, /2026-11-13/);
+        assert.deepEqual(sched.instanceCourtSkips["2026-11-13"], ["Court 3"]);
+
+        // Format card check
+        const card = recurringPollsModule.formatRecurringScheduleCard(sched, "120363402559062529@g.us");
+        assert.match(card, /Skipped Court\(s\):/i);
+        assert.match(card, /Skip Court 3/);
+      });
+
+      it("should append another skipped court without duplicates", async () => {
+        const sched = {
+          id: "rec_court_append",
+          remoteJid: "120363402559062529@g.us",
+          matchTime: "7pm",
+          days: "friday",
+          daysList: [5],
+          instanceCourtSkips: { "2026-11-13": ["Court 3"] }
+        };
+        const recurringPolls = new Map([[sched.id, sched]]);
+
+        await recurringPollsModule.overrideRecurringPollInstanceCourtSkip({
+          recurringPolls,
+          activePolls: new Map(),
+          persistPolls: () => {},
+          scheduleId: sched.id,
+          targetDayOrDate: "Friday",
+          courts: ["5", "Court 3"],
+          action: "set",
+          customSanJoseParts: { year: 2026, month: 10, day: 10, hour: 12, minute: 0, weekday: "tue" },
+          chatId: "120363402559062529@g.us",
+          sender: "Alice"
+        });
+
+        assert.deepEqual(sched.instanceCourtSkips["2026-11-13"], ["Court 3", "Court 5"]);
+      });
+
+      it("should remove a skipped court when action is remove", async () => {
+        const sched = {
+          id: "rec_court_remove",
+          remoteJid: "120363402559062529@g.us",
+          matchTime: "7pm",
+          days: "friday",
+          daysList: [5],
+          instanceCourtSkips: { "2026-11-13": ["Court 3", "Court 5"] }
+        };
+        const recurringPolls = new Map([[sched.id, sched]]);
+
+        const res = await recurringPollsModule.overrideRecurringPollInstanceCourtSkip({
+          recurringPolls,
+          activePolls: new Map(),
+          persistPolls: () => {},
+          scheduleId: sched.id,
+          targetDayOrDate: "Friday",
+          courts: ["Court 3"],
+          action: "remove",
+          customSanJoseParts: { year: 2026, month: 10, day: 10, hour: 12, minute: 0, weekday: "tue" },
+          chatId: "120363402559062529@g.us",
+          sender: "Alice"
+        });
+
+        assert.match(res, /Updated Court Skips/i);
+        assert.deepEqual(sched.instanceCourtSkips["2026-11-13"], ["Court 5"]);
+      });
+
+      it("should clear all skipped courts when action is clear or removing the last court", async () => {
+        const sched = {
+          id: "rec_court_clear",
+          remoteJid: "120363402559062529@g.us",
+          matchTime: "7pm",
+          days: "friday",
+          daysList: [5],
+          instanceCourtSkips: { "2026-11-13": ["Court 5"] }
+        };
+        const recurringPolls = new Map([[sched.id, sched]]);
+
+        const res = await recurringPollsModule.overrideRecurringPollInstanceCourtSkip({
+          recurringPolls,
+          activePolls: new Map(),
+          persistPolls: () => {},
+          scheduleId: sched.id,
+          targetDayOrDate: "Friday",
+          action: "clear",
+          customSanJoseParts: { year: 2026, month: 10, day: 10, hour: 12, minute: 0, weekday: "tue" },
+          chatId: "120363402559062529@g.us",
+          sender: "Alice"
+        });
+
+        assert.match(res, /Cleared Skipped Courts/i);
+        assert.equal(sched.instanceCourtSkips, undefined);
+      });
+    });
+
+    describe("extractCommonFlags court skipping options", () => {
+      it("should extract --skip-court and --skip-courts", () => {
+        const res1 = recurringPollsModule.extractCommonFlags("7pm friday --skip-court 3");
+        assert.deepEqual(res1.flags.skipCourt, ["Court 3"]);
+
+        const res2 = recurringPollsModule.extractCommonFlags("7pm friday --skip-courts 3, 5");
+        assert.deepEqual(res2.flags.skipCourt, ["Court 3", "Court 5"]);
+
+        const res3 = recurringPollsModule.extractCommonFlags("7pm friday --exclude-court=Court 2");
+        assert.deepEqual(res3.flags.skipCourt, ["Court 2"]);
+
+        const res4 = recurringPollsModule.extractCommonFlags("7pm friday skip court 4");
+        assert.deepEqual(res4.flags.skipCourt, ["Court 4"]);
+      });
+
+      it("should extract --unskip-court and --clear-skipped-courts", () => {
+        const res1 = recurringPollsModule.extractCommonFlags("7pm friday --unskip-court 3");
+        assert.deepEqual(res1.flags.unskipCourt, ["Court 3"]);
+
+        const res2 = recurringPollsModule.extractCommonFlags("7pm friday --clear-skipped-courts");
+        assert.equal(res2.flags.unskipCourt, "all");
+
+        const res3 = recurringPollsModule.extractCommonFlags("7pm friday unskip court 3");
+        assert.deepEqual(res3.flags.unskipCourt, ["Court 3"]);
+      });
+    });
+
+    describe("command routing via !modifyinstance and !recurringpoll skipcourt", () => {
+      it("should delegate !modifyinstance Friday --skip-court 3 to recurring schedule court skip", async () => {
+        const schedId = "rec_mod_skipcourt";
+        const sched = {
+          id: schedId,
+          remoteJid: "120363402559062529@g.us",
+          matchTime: "7pm",
+          days: "friday",
+          daysList: [5],
+          size: "auto",
+          enabled: true,
+          creator: { name: "Alice", jid: "alice@s.whatsapp.net" }
+        };
+        const recurringPolls = new Map([[schedId, sched]]);
+        const context = { recurringPolls, activePolls: new Map(), persistPolls: () => {} };
+
+        const cmd = pollCommands.parseModifyInstanceCommand("!modifyinstance Friday --skip-court 3");
+        assert.deepEqual(cmd.updates.skipCourt, ["Court 3"]);
+
+        const res = await pollCommands.handleModifyPollInstance(
+          null,
+          "120363402559062529@g.us",
+          "Alice",
+          "alice@s.whatsapp.net",
+          cmd.targetId,
+          cmd.updates,
+          context
+        );
+
+        assert.match(res, /Future Instance Court Skip Set/i);
+        assert.match(res, /Court 3/);
+        assert.deepEqual(sched.instanceCourtSkips["2026-11-13"], ["Court 3"]);
+      });
+
+      it("should handle !recurringpoll skipcourt Friday 3 and unskipcourt Friday 3", async () => {
+        const schedId = "rec_direct_skipcourt";
+        const sched = {
+          id: schedId,
+          remoteJid: "120363402559062529@g.us",
+          matchTime: "7pm",
+          days: "friday",
+          daysList: [5],
+          size: "auto",
+          enabled: true,
+          creator: { name: "Alice", jid: "alice@s.whatsapp.net" }
+        };
+        const recurringPolls = new Map([[schedId, sched]]);
+        const context = { recurringPolls, activePolls: new Map(), persistPolls: () => {} };
+
+        const mockSock = {
+          user: { id: "bot@s.whatsapp.net" },
+          sendMessage: async (jid, content) => ({ key: { id: "msg_skip" }, message: content })
+        };
+
+        const resSkip = await recurringCommands.handleRecurringCommand(
+          mockSock,
+          "!recurringpoll skipcourt Friday 3",
+          "120363402559062529@g.us",
+          "Alice",
+          "alice@s.whatsapp.net",
+          context
+        );
+        assert.match(resSkip, /Future Instance Court Skip Set/i);
+        assert.deepEqual(sched.instanceCourtSkips["2026-11-13"], ["Court 3"]);
+
+        const resUnskip = await recurringCommands.handleRecurringCommand(
+          mockSock,
+          "!recurringpoll unskipcourt Friday 3",
+          "120363402559062529@g.us",
+          "Alice",
+          "alice@s.whatsapp.net",
+          context
+        );
+        assert.match(resUnskip, /Updated Court Skips/i);
+        assert.equal(sched.instanceCourtSkips, undefined);
+      });
+
+      it("should update active poll skippedCourts and recurring schedule in-place when active poll exists", async () => {
+        const schedId = "rec_active_poll_skip";
+        const sched = {
+          id: schedId,
+          remoteJid: "120363402559062529@g.us",
+          matchTime: "7pm",
+          days: "friday",
+          daysList: [5],
+          size: "auto",
+          enabled: true,
+          creator: { name: "Alice", jid: "alice@s.whatsapp.net" }
+        };
+        const activePollId = "poll_friday_active";
+        const activePoll = {
+          id: activePollId,
+          name: "Tennis Friday 7pm",
+          when: "Friday 7pm",
+          scheduleId: schedId,
+          status: "active",
+          targetDateKey: "2026-11-13",
+          remoteJid: "120363402559062529@g.us",
+          skippedCourts: []
+        };
+        const recurringPolls = new Map([[schedId, sched]]);
+        const activePolls = new Map([[activePollId, activePoll]]);
+        const context = { recurringPolls, activePolls, persistPolls: () => {} };
+
+        const cmd = pollCommands.parseModifyInstanceCommand("!modifyinstance Friday --skip-court 3");
+        const res = await pollCommands.handleModifyPollInstance(
+          null,
+          "120363402559062529@g.us",
+          "Alice",
+          "alice@s.whatsapp.net",
+          cmd.targetId,
+          cmd.updates,
+          context
+        );
+
+        assert.match(res, /Skipped Courts.*Court 3/i);
+        assert.deepEqual(activePoll.skippedCourts, ["Court 3"]);
+        assert.deepEqual(sched.instanceCourtSkips["2026-11-13"], ["Court 3"]);
+      });
+    });
+
+    describe("court exclusion in advance bookings and manual player bookings", () => {
+      it("detectManualPlayerBookings should ignore bookings on skipped courts", async () => {
+        const origBookings = scvcc.getCourtBookings;
+        const origAvail = scvcc.checkCourtAvailability;
+        const origDetect = scvcc.detectPrebookedCourt;
+
+        try {
+          scvcc.checkCourtAvailability = async () => ({ slots: [] });
+          scvcc.getCourtBookings = async () => ({
+            bookings: [
+              { court: "Court 3", durationMins: 90, prebookedBy: "Player X" },
+              { court: "Court 2", durationMins: 90, prebookedBy: "Player Y" }
+            ]
+          });
+          scvcc.detectPrebookedCourt = (b) => ({ player: b.prebookedBy });
+
+          // When Court 3 is skipped
+          const res = await recurringPollsModule.detectManualPlayerBookings({
+            remoteJid: "120363402559062529@g.us",
+            targetDateMDY: "11/13/2026",
+            queryTime: "7pm",
+            sport: "tennis",
+            skippedCourts: ["Court 3"]
+          });
+
+          // Only Court 2 should be detected, Court 3 ignored
+          assert.equal(res.length, 1);
+          assert.equal(res[0].court, "Court 2");
+        } finally {
+          scvcc.getCourtBookings = origBookings;
+          scvcc.checkCourtAvailability = origAvail;
+          scvcc.detectPrebookedCourt = origDetect;
+        }
+      });
+    });
+
+    describe("court exclusion in createMatchPoll", () => {
+      it("should exclude skipped courts from available/tentative courts and voting slots", async () => {
+        const origCheck = scvcc.checkCourtAvailability;
+        const origBookings = scvcc.getCourtBookings;
+        const origGetConfig = groupsConfig.getGroupConfig;
+
+        try {
+          groupsConfig.getGroupConfig = () => ({
+            name: "Test Group",
+            sport: "tennis",
+            courtBookingEnabled: true,
+            bookingCourtPreference: [2, 3, 1]
+          });
+
+          // Courts 2, 3, 1 available
+          scvcc.checkCourtAvailability = async () => ({
+            slots: [{
+              time: "7:00 PM",
+              courts: [
+                { court: "Court 2", status: "available", availableMinutes: 90 },
+                { court: "Court 3", status: "available", availableMinutes: 90 },
+                { court: "Court 1", status: "available", availableMinutes: 90 }
+              ]
+            }]
+          });
+          scvcc.getCourtBookings = async () => ({ bookings: [] });
+
+          let sentPoll = null;
+          const mockSock = {
+            sendMessage: async (jid, content) => {
+              if (content.poll) sentPoll = content.poll;
+              return { key: { id: "poll_skip_court_live", remoteJid: jid }, message: content };
+            }
+          };
+          const activePolls = new Map();
+          const context = { activePolls, recurringPolls: new Map(), messageStore: new Map(), latestPollIdByChat: new Map(), persistPolls: () => {} };
+
+          // Create auto poll skipping Court 3
+          const res = await pollCommands.createMatchPoll(
+            mockSock,
+            "group1@g.us",
+            "auto",
+            "Tomorrow 7pm",
+            null,
+            null,
+            "Alice",
+            "alice@s.whatsapp.net",
+            false,
+            null,
+            false,
+            false,
+            false,
+            true, // checkCourts
+            false,
+            false,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            context,
+            { maxCourts: 3, skippedCourts: ["Court 3"] }
+          );
+
+          assert.ok(sentPoll);
+          // Court 3 must NOT be mentioned in title as available
+          assert.doesNotMatch(sentPoll.name, /Court 3/);
+          assert.match(sentPoll.name, /Court 2 - Available/);
+          assert.match(sentPoll.name, /Court 1 - Available/);
+
+          // Only 2 courts (Court 2 & Court 1) -> 8 slots
+          assert.equal(sentPoll.values.length, 8);
+          assert.equal(res.size, 8);
+
+          const pollState = activePolls.get(res.pollId);
+          assert.deepEqual(pollState.skippedCourts, ["Court 3"]);
+          assert.equal(pollState.unbookedCourts.some(c => c.court === "Court 3"), false);
+        } finally {
+          scvcc.checkCourtAvailability = origCheck;
+          scvcc.getCourtBookings = origBookings;
+          groupsConfig.getGroupConfig = origGetConfig;
+        }
+      });
+    });
+
+    describe("14-day retention and deletion lifecycle for skipped courts", () => {
+      it("should retain instance skipped courts for 14 days and prune them when poll is deleted by cleanupExpiredPolls", () => {
+        const schedId = "rec_cleanup_skip_court_test";
+        const sched = {
+          id: schedId,
+          remoteJid: "120363402559062529@g.us",
+          matchTime: "7:00 PM",
+          instanceCourtSkips: {
+            "2026-10-25": ["Court 3"],
+            "2026-11-05": ["Court 5"]
+          }
+        };
+        const recurringPolls = new Map([[schedId, sched]]);
+
+        // Poll instance for Oct 25 (exceeded 14 days relative to Nov 10 -> will be deleted)
+        const oldPollId = "poll_old_skip";
+        const oldPoll = {
+          name: "Tennis Match Oct 25",
+          status: "expired",
+          scheduleId: schedId,
+          targetDateKey: "2026-10-25",
+          playAt: "2026-10-26T02:00:00.000Z",
+          remoteJid: "120363402559062529@g.us"
+        };
+
+        // Poll instance for Nov 5 (within 14 days -> retained)
+        const recentPollId = "poll_recent_skip";
+        const recentPoll = {
+          name: "Tennis Match Nov 5",
+          status: "active",
+          scheduleId: schedId,
+          targetDateKey: "2026-11-05",
+          playAt: "2026-11-06T03:00:00.000Z",
+          remoteJid: "120363402559062529@g.us"
+        };
+
+        const activePolls = new Map([
+          [oldPollId, oldPoll],
+          [recentPollId, recentPoll]
+        ]);
+
+        let persisted = false;
+        const context = {
+          activePolls,
+          recurringPolls,
+          messageStore: new Map(),
+          latestPollIdByChat: new Map([["120363402559062529@g.us", recentPollId]]),
+          persistPolls: () => { persisted = true; }
+        };
+
+        const nowMs = new Date("2026-11-10T20:00:00Z").getTime();
+        const removed = pollCommands.cleanupExpiredPolls(context, nowMs);
+
+        assert.deepEqual(removed, [oldPollId]);
+        assert.equal(activePolls.has(oldPollId), false);
+        assert.equal(activePolls.has(recentPollId), true);
+
+        // Oct 25 court skip pruned, Nov 5 retained
+        assert.equal(sched.instanceCourtSkips["2026-10-25"], undefined, "Oct 25 skipped court must be pruned when poll is deleted");
+        assert.deepEqual(sched.instanceCourtSkips["2026-11-05"], ["Court 5"], "Nov 5 skipped court must be retained during 14-day grace period");
+        assert.equal(persisted, true);
+      });
+    
+    describe("already booked court when skip court command is issued", () => {
+      it("should note existing advance booking and reservation ID when skipping a court already booked", async () => {
+        const schedId = "rec_already_booked";
+        const sched = {
+          id: schedId,
+          remoteJid: "120363402559062529@g.us",
+          matchTime: "7pm",
+          days: "friday",
+          daysList: [5],
+          advanceBookings: {
+            "2026-11-13": {
+              autoBookedCourts: [
+                { court: "Court 3", reservationId: "194888", time: "7pm" },
+                { court: "Court 2", reservationId: "194889", time: "7pm" }
+              ]
+            }
+          }
+        };
+        const recurringPolls = new Map([[schedId, sched]]);
+
+        const res = await recurringPollsModule.overrideRecurringPollInstanceCourtSkip({
+          recurringPolls,
+          activePolls: new Map(),
+          persistPolls: () => {},
+          scheduleId: schedId,
+          targetDayOrDate: "Friday",
+          courts: ["Court 3"],
+          action: "set",
+          customSanJoseParts: { year: 2026, month: 10, day: 10, hour: 12, minute: 0, weekday: "tue" },
+          chatId: "120363402559062529@g.us",
+          sender: "Alice"
+        });
+
+        assert.match(res, /Existing Booking Note:/i);
+        assert.match(res, /Court 3/);
+        assert.match(res, /194888/);
+        assert.match(res, /!cancelcourt/);
+        assert.deepEqual(sched.instanceCourtSkips["2026-11-13"], ["Court 3"]);
+      });
+
+      it("createMatchPoll should exclude skipped court even if present in preExistingBookings", async () => {
+        const preExistingBookings = {
+          autoBookedCourts: [
+            { court: "Court 3", reservationId: "194888", time: "7pm" },
+            { court: "Court 2", reservationId: "194889", time: "7pm" }
+          ],
+          prebookedCourts: [
+            { court: "Court 3", player: "Member" },
+            { court: "Court 2", player: "Member" }
+          ]
+        };
+
+        let sentPoll = null;
+        const mockSock = {
+          sendMessage: async (jid, content) => {
+            if (content.poll) sentPoll = content.poll;
+            return { key: { id: "p_preexist_skip", remoteJid: jid } };
+          }
+        };
+
+        const activePolls = new Map();
+        const context = { activePolls, messageStore: new Map(), persistPolls: () => {} };
+
+        const res = await pollCommands.createMatchPoll(
+          mockSock,
+          "group1@g.us",
+          8,
+          "Friday 7pm",
+          "Friday",
+          "7pm",
+          "Alice",
+          "alice@lid",
+          false,
+          null,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          preExistingBookings,
+          context,
+          { skippedCourts: ["Court 3"] }
+        );
+
+        const pollState = activePolls.get("p_preexist_skip");
+        assert.ok(pollState);
+        // Only Court 2 should be in prebooked / advanceBooked courts, Court 3 excluded
+        assert.equal(pollState.advanceBookedCourts.length, 1);
+        assert.equal(pollState.advanceBookedCourts[0].court, "Court 2");
+        assert.equal(pollState.prebookedCourts.length, 1);
+        assert.equal(pollState.prebookedCourts[0].court, "Court 2");
+      });
+    });
+});
+  });
 });
