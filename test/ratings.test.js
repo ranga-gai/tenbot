@@ -118,7 +118,7 @@ describe('ratings', () => {
       ratings.setBotSocket(null);
     }
 
-    it("should set tennisRecord: false and rating to 3.49 and alert superadmin when profile not found", async () => {
+    it("should set tennisRecord: false and rating to 3.0 and alert superadmin when profile not found", async () => {
       tennisRecord.fetchTennisRecordRating = async () => ({
         success: false,
         tennisRecord: false,
@@ -139,7 +139,7 @@ describe('ratings', () => {
 
       try {
         const res = await ratings.updateRatingFromFullName("test_player_not_found", "Unknown Person", { sock: mockSock });
-        assert.equal(res.rating, 3.49);
+        assert.equal(res.rating, 3.0);
         assert.equal(res.tennisRecord, false);
         assert.equal(res.failureReason, "not_found");
 
@@ -152,7 +152,7 @@ describe('ratings', () => {
       }
     });
 
-    it("should set tennisRecord: false, rating to 3.49 and alert superadmin when not in San Jose or nearby areas", async () => {
+    it("should set tennisRecord: false, rating to 3.0 and alert superadmin when not in San Jose or nearby areas", async () => {
       tennisRecord.fetchTennisRecordRating = async () => ({
         success: false,
         tennisRecord: false,
@@ -174,7 +174,7 @@ describe('ratings', () => {
 
       try {
         const res = await ratings.updateRatingFromFullName("test_player_tx", "Texas Player", { sock: mockSock });
-        assert.equal(res.rating, 3.49);
+        assert.equal(res.rating, 3.0);
         assert.equal(res.tennisRecord, false);
         assert.equal(res.failureReason, "not_in_area");
 
@@ -186,7 +186,7 @@ describe('ratings', () => {
       }
     });
 
-    it("should set tennisRecord: false, rating to 3.49 and alert superadmin when multiple players found in San Jose", async () => {
+    it("should set tennisRecord: false, rating to 3.0 and alert superadmin when multiple players found in San Jose", async () => {
       tennisRecord.fetchTennisRecordRating = async () => ({
         success: false,
         tennisRecord: false,
@@ -214,7 +214,7 @@ describe('ratings', () => {
 
       try {
         const res = await ratings.updateRatingFromFullName("test_player_multiple", "David Lee", { sock: mockSock });
-        assert.equal(res.rating, 3.49);
+        assert.equal(res.rating, 3.0);
         assert.equal(res.tennisRecord, false);
         assert.equal(res.failureReason, "multiple_in_san_jose");
 
@@ -267,7 +267,7 @@ describe('ratings', () => {
 
       const data = ratings.load();
       data.players["mock_false_tr@lid"] = {
-        rating: 3.49,
+        rating: 3.0,
         locallyModified: false,
         tennisRecord: false,
         tennisRecordUrl: null,
@@ -280,6 +280,37 @@ describe('ratings', () => {
         assert.equal(fetchedNames.includes("mock_false_tr@lid"), false, "Should NOT call fetchTennisRecordRating for player with tennisRecord: false");
       } finally {
         delete data.players["mock_false_tr@lid"];
+        restore();
+      }
+    });
+
+    it("should update player rating when includePaused is true in refreshPeriodicRatings", async () => {
+      const namesStore = require("../lib/names");
+      namesStore.setName("mock_paused_tr@lid", "Paused Player");
+
+      const fetchedNames = [];
+      tennisRecord.fetchTennisRecordRating = async (name) => {
+        fetchedNames.push(name);
+        return { success: true, tennisRecord: true, rating: 4.0, profileUrl: "https://example.com/paused" };
+      };
+
+      const data = ratings.load();
+      data.players["mock_paused_tr@lid"] = {
+        rating: 3.0,
+        locallyModified: false,
+        tennisRecord: false,
+        tennisRecordUrl: null,
+        tennisRecordLocation: null,
+        lastRefreshedAt: "2020-01-01T00:00:00.000Z"
+      };
+
+      try {
+        await ratings.refreshPeriodicRatings({ force: true, delayMs: 0, includePaused: true });
+        assert.ok(fetchedNames.includes("Paused Player"), "Should call fetchTennisRecordRating when includePaused: true");
+        assert.equal(data.players["mock_paused_tr@lid"].rating, 4.0);
+        assert.equal(data.players["mock_paused_tr@lid"].tennisRecord, true);
+      } finally {
+        delete data.players["mock_paused_tr@lid"];
         restore();
       }
     });
@@ -370,11 +401,126 @@ describe('ratings', () => {
       try {
         const res = await ratings.resetRating("mock_false_reset@lid");
         assert.equal(fetchCalled, false, "Should NOT call fetchTennisRecordRating on resetRating if tennisRecord: false");
-        assert.equal(res.rating, 3.49);
+        assert.equal(res.rating, 3.0);
         assert.equal(res.tennisRecord, false);
       } finally {
         delete data.players["mock_false_reset@lid"];
         restore();
+      }
+    });
+  });
+
+  describe("unsetRating", () => {
+    const ratings = require("../lib/ratings");
+    it("should mark a player as tennisRecord: false, clear URL/location, and set default rating 3.0", () => {
+      const data = ratings.load();
+      const lid = "test_unset_player@lid";
+      data.players[lid] = {
+        rating: 4.25,
+        locallyModified: true,
+        tennisRecord: true,
+        tennisRecordUrl: "https://example.com/test",
+        tennisRecordLocation: "San Jose, CA"
+      };
+
+      const res = ratings.unsetRating(lid);
+      assert.ok(res);
+      assert.equal(res.rating, 3.0);
+      assert.equal(res.tennisRecord, false);
+      assert.strictEqual(res.tennisRecordUrl, null);
+      assert.strictEqual(res.tennisRecordLocation, null);
+
+      assert.equal(data.players[lid].rating, 3.0);
+      assert.equal(data.players[lid].tennisRecord, false);
+      assert.strictEqual(data.players[lid].tennisRecordUrl, null);
+    });
+
+    it("should accept an explicit rating when unsetting TennisRecord profile", () => {
+      const data = ratings.load();
+      const lid = "test_unset_explicit@lid";
+
+      const res = ratings.unsetRating(lid, 3.75);
+      assert.ok(res);
+      assert.equal(res.rating, 3.75);
+      assert.equal(res.tennisRecord, false);
+      assert.equal(res.locallyModified, true);
+      assert.equal(data.players[lid].rating, 3.75);
+    });
+  });
+
+  describe("loadFromDisk and startup sync regression tests", () => {
+    const fs = require("fs");
+    const ratings = require("../lib/ratings");
+    const namesStore = require("../lib/names");
+    const tennisRecord = require("../lib/tennisRecord");
+
+    it("should preserve player entries whose name field is undefined (standard ratings.json schema)", () => {
+      const origFile = fs.readFileSync(ratings.RATINGS_FILE, "utf8");
+      try {
+        const testPayload = {
+          players: {
+            "123456789@lid": {
+              rating: 4.15,
+              locallyModified: true,
+              tennisRecord: true,
+              tennisRecordUrl: "https://www.tennisrecord.com/adult/profile.aspx?playername=Real%20Player",
+              tennisRecordLocation: "San Jose, CA"
+            },
+            "tenbot": { rating: 3.0 },
+            "24104010813588@lid": { rating: 3.0 },
+            "placeholder@lid": { rating: 3.0, name: "Player 1" }
+          }
+        };
+        fs.writeFileSync(ratings.RATINGS_FILE, JSON.stringify(testPayload, null, 2), "utf8");
+
+        const loaded = ratings.loadFromDisk();
+        assert.ok(loaded.players["123456789@lid"], "Real player entry must NOT be deleted");
+        assert.equal(loaded.players["123456789@lid"].rating, 4.15);
+        assert.strictEqual(loaded.players["tenbot"], undefined, "tenbot must be filtered out");
+        assert.strictEqual(loaded.players["24104010813588@lid"], undefined, "bot LID must be filtered out");
+        assert.strictEqual(loaded.players["placeholder@lid"], undefined, "explicit placeholder name must be filtered out");
+      } finally {
+        fs.writeFileSync(ratings.RATINGS_FILE, origFile, "utf8");
+      }
+    });
+
+    it("syncRatingsWithNames should never overwrite existing player ratings or alert superadmin for them", async () => {
+      const data = ratings.load();
+      const existingLid = "existing_player_test@lid";
+      data.players[existingLid] = {
+        rating: 4.5,
+        locallyModified: false,
+        tennisRecord: true,
+        tennisRecordUrl: "https://example.com/existing",
+        tennisRecordLocation: "San Jose, CA"
+      };
+
+      namesStore.setName(existingLid, "Existing Player");
+
+      const calledPlayers = [];
+      const origFetch = tennisRecord.fetchTennisRecordRating;
+      tennisRecord.fetchTennisRecordRating = async (name) => {
+        calledPlayers.push(name);
+        return { success: false, tennisRecord: false, rating: null, reason: "not_found" };
+      };
+
+      const alerts = [];
+      ratings.setBotSocket({
+        sendMessage: async (jid, content) => {
+          alerts.push({ jid, content });
+          return { key: { id: "m1" } };
+        }
+      });
+
+      try {
+        await ratings.syncRatingsWithNames();
+        assert.equal(data.players[existingLid].rating, 4.5, "Existing rating must remain 4.5");
+        assert.equal(calledPlayers.includes("Existing Player"), false, "TennisRecord lookup must NOT be called for existing player");
+        assert.equal(alerts.some((a) => a.content?.text?.includes("Existing Player")), false, "No superadmin alert should be sent for existing player");
+      } finally {
+        tennisRecord.fetchTennisRecordRating = origFetch;
+        delete data.players[existingLid];
+        ratings.setBotSocket(null);
       }
     });
   });

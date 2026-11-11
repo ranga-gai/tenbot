@@ -132,7 +132,7 @@ const SYSTEM_PROMPT =
   'Results can be reported to you in plain words ("Mike & Sara ' +
   'beat John & Alex 6-4", or "we won" right after a draw) and are logged automatically before ' +
   "you see the message, so don't claim you can't record scores. " +
-  'Initial ratings for new players are looked up from TennisRecord.com (defaulting to 3.49 if not found). ' +
+  'Initial ratings for new players are looked up from TennisRecord.com (defaulting to 3.0 if not found). ' +
   'Users can also change their own rating by addressing you (e.g. "@tenbot my rating is 4.0" or "@tenbot set my rating to 3.5") -- ' +
   'call the set_rating or reset_rating tool to update it. Group admins can also update or reset ratings for other players. ' +
   'When creating a poll: ' +

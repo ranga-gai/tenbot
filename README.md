@@ -130,7 +130,7 @@ Set 2:
 ## Player Ratings
 
 Every player carries a rating between **2.50 and 4.50**, formatted to two decimals:
-- **Initial Rating**: When a player is first encountered, the bot looks up their estimated dynamic rating or NTRP benchmark rating on [TennisRecord.com](https://www.tennisrecord.com/). If not found, their rating starts at **3.49**.
+- **Initial Rating**: When a player is first encountered, the bot looks up their estimated dynamic rating or NTRP benchmark rating on [TennisRecord.com](https://www.tennisrecord.com/). If not found, their rating starts at **3.0**.
 - **User Rating Adjustments**: Users can update their own rating anytime:
   - `@tenbot my rating is 4.0` or `@tenbot set my rating to 3.5`
   - Command: `!setrating 4.0` (or `!myrating 4.0`)

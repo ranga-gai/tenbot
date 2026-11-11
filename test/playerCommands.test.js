@@ -3,6 +3,8 @@ const assert = require('node:assert/strict');
 const {
   parseSide,
   parseSetRatingCommand,
+  parseUnsetRatingCommand,
+  handleUnsetRating,
   parseFullNameCommand,
   parseAliasCommand,
   handleScoreCommand,
@@ -20,6 +22,29 @@ describe('playerCommands', () => {
 
     it('should return a single player when no delimiter exists', () => {
       assert.deepEqual(parseSide('Roger'), ['Roger']);
+    });
+  });
+
+  describe('parseUnsetRatingCommand', () => {
+    it('should parse command with player name only', () => {
+      const res = parseUnsetRatingCommand('!unsetrating Bob');
+      assert.deepEqual(res, { name: 'Bob', rating: null });
+    });
+
+    it('should parse command with player name and explicit rating', () => {
+      const res = parseUnsetRatingCommand('!unsetrating Bob = 3.5');
+      assert.deepEqual(res, { name: 'Bob', rating: 3.5 });
+
+      const res2 = parseUnsetRatingCommand('!unsetrating Bob 3.75');
+      assert.deepEqual(res2, { name: 'Bob', rating: 3.75 });
+    });
+
+    it('should parse self unsetrating', () => {
+      const res = parseUnsetRatingCommand('!unsetrating', 'Alice');
+      assert.deepEqual(res, { name: 'Alice', rating: null });
+
+      const res2 = parseUnsetRatingCommand('!unsetrating 3.5', 'Alice');
+      assert.deepEqual(res2, { name: 'Alice', rating: 3.5 });
     });
   });
 
