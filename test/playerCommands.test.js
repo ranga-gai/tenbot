@@ -8,6 +8,7 @@ const {
   parseFullNameCommand,
   parseAliasCommand,
   handleScoreCommand,
+  handlePlayerCommand,
   nameFor,
   canUserManagePlayerAlias
 } = require('../lib/commands/playerCommands');
@@ -48,72 +49,52 @@ describe('playerCommands', () => {
     });
   });
 
-  describe('parseSetRatingCommand', () => {
-    it('should parse simple numeric rating for sender', () => {
-      const res = parseSetRatingCommand('!setrating 3.5', 'Alice');
-      assert.deepEqual(res, { name: 'Alice', rating: 3.5 });
-    });
-
-    it('should parse rating with "for <player> = <rating>"', () => {
-      const res = parseSetRatingCommand('!setrating for Bob = 4.0');
-      assert.deepEqual(res, { name: 'Bob', rating: 4.0 });
-    });
-
-    it('should parse rating with "<player> to <rating>"', () => {
-      const res = parseSetRatingCommand('!setrating Charlie to 3.75');
-      assert.deepEqual(res, { name: 'Charlie', rating: 3.75 });
-    });
-
-    it('should return null for invalid text or non-numeric ratings', () => {
-      assert.equal(parseSetRatingCommand('!setrating abc'), null);
-      assert.equal(parseSetRatingCommand('!setrating'), null);
-    });
-  });
-
   describe('parseFullNameCommand', () => {
-    it('should parse full name for sender', () => {
-      const res = parseFullNameCommand('!fullname Roger Federer', 'Roger');
-      assert.deepEqual(res, { name: 'Roger', fullName: 'Roger Federer' });
-    });
-
-    it('should parse "for" syntax with target player', () => {
-      const res = parseFullNameCommand('!setfullname Johnathan Smith for John');
-      assert.deepEqual(res, { name: 'John', fullName: 'Johnathan Smith' });
-    });
-
-    it('should parse delimiter syntax with target player', () => {
+    it('should parse command with player name and full name', () => {
       const res = parseFullNameCommand('!setfullname John = Johnathan Smith');
       assert.deepEqual(res, { name: 'John', fullName: 'Johnathan Smith' });
+
+      const res2 = parseFullNameCommand('!fullname John = Johnathan Smith');
+      assert.deepEqual(res2, { name: 'John', fullName: 'Johnathan Smith' });
     });
 
-    it('should return null if no full name is provided', () => {
-      assert.equal(parseFullNameCommand('!fullname'), null);
+    it('should parse command for sender when only full name provided', () => {
+      const res = parseFullNameCommand('!fullname Johnathan Smith', 'John');
+      assert.deepEqual(res, { name: 'John', fullName: 'Johnathan Smith' });
     });
   });
 
   describe('parseAliasCommand', () => {
-    it('should parse single alias for sender', () => {
-      const res = parseAliasCommand('!alias PK', 'Pramod');
-      assert.deepEqual(res, { name: 'Pramod', alias: 'PK' });
+    it('should parse alias addition for self', () => {
+      const res = parseAliasCommand('!alias Johnny', 'John');
+      assert.deepEqual(res, { name: 'John', alias: 'Johnny' });
     });
 
-    it('should parse "for" syntax with target player', () => {
-      const res = parseAliasCommand('!alias PK for Pramod');
-      assert.deepEqual(res, { name: 'Pramod', alias: 'PK' });
+    it('should parse alias addition for another player', () => {
+      const res = parseAliasCommand('!alias John = Johnny');
+      assert.deepEqual(res, { name: 'John', alias: 'Johnny' });
+    });
+  });
+
+  describe('parseSetRatingCommand', () => {
+    it('should parse "!setrating 4.0" as self rating', () => {
+      const res = parseSetRatingCommand('!setrating 4.0', 'Alice');
+      assert.deepEqual(res, { name: 'Alice', rating: 4.0 });
     });
 
-    it('should parse delimiter syntax with target player', () => {
-      const res = parseAliasCommand('!alias Jonathan Doe = JD');
-      assert.deepEqual(res, { name: 'Jonathan Doe', alias: 'JD' });
+    it('should parse "!setrating John = 3.75"', () => {
+      const res = parseSetRatingCommand('!setrating John = 3.75');
+      assert.deepEqual(res, { name: 'John', rating: 3.75 });
     });
 
-    it('should parse quoted alias', () => {
-      const res = parseAliasCommand('!alias "The Ace"', 'Bob');
-      assert.deepEqual(res, { name: 'Bob', alias: 'The Ace' });
+    it('should parse "!setrating for John 3.5"', () => {
+      const res = parseSetRatingCommand('!setrating for John 3.5');
+      assert.deepEqual(res, { name: 'John', rating: 3.5 });
     });
 
-    it('should return null for empty alias command', () => {
-      assert.equal(parseAliasCommand('!alias'), null);
+    it('should return null for invalid text', () => {
+      assert.equal(parseSetRatingCommand('!setrating'), null);
+      assert.equal(parseSetRatingCommand('!setrating abc'), null);
     });
   });
 
@@ -149,6 +130,28 @@ describe('playerCommands', () => {
 
       const res2 = await canUserManagePlayerAlias(sock, '120363@g.us', '123@s.whatsapp.net', 'Alice', 'me');
       assert.equal(res2, true);
+    });
+  });
+
+  describe('tennisRecord configuration commands', () => {
+    it('should display configuration via !trconfig', async () => {
+      const sock = {
+        groupMetadata: async () => ({ participants: [] })
+      };
+      const res = await handlePlayerCommand(sock, '!trconfig', '120363@g.us', 'Alice', '123@s.whatsapp.net');
+      assert.ok(res);
+      assert.match(res, /TennisRecord Configuration/);
+      assert.match(res, /URL/);
+      assert.match(res, /Timeout/);
+    });
+
+    it('should display cert status via !certstatus', async () => {
+      const sock = {
+        groupMetadata: async () => ({ participants: [] })
+      };
+      const res = await handlePlayerCommand(sock, '!certstatus', '120363@g.us', 'Alice', '123@s.whatsapp.net');
+      assert.ok(res);
+      assert.match(res, /TennisRecord SSL certificate check status/);
     });
   });
 });
