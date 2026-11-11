@@ -29,6 +29,7 @@ const {
   getPollDayWord,
   checkAndSendPollReminders,
   handleTriggerReminder,
+  handlePollCommand,
   parseTriggerReminderArgs,
   handleQuietHoursCommand,
   pollStatusText,
@@ -2835,9 +2836,132 @@ describe('pollCommands', () => {
           persistPolls: () => {}
         }, true, t1130pm);
 
-        assert.equal(res, null);
+        assert.equal(res, true);
         assert.equal(sentMessages.length, 1);
         assert.match(sentMessages[0].content.text, /Tennis Friday/i);
+      });
+
+      it('should send single reminder to target group and return confirmation message when triggered from DM', async () => {
+        const sentMessages = [];
+        const mockSock = {
+          sendMessage: async (jid, content, opts) => {
+            sentMessages.push({ jid, content, opts });
+            return { key: { id: 'msg_dm_remind_1' } };
+          }
+        };
+
+        const pollState = {
+          name: 'Saturday Doubles 10am',
+          status: 'active',
+          remoteJid: '120363403838804497@g.us',
+          playAt: new Date(Date.now() + 24 * 3600 * 1000).toISOString(),
+          options: ['Yes', 'No'],
+          type: 'opt_in',
+          voteBuffer: new Map()
+        };
+        const activePolls = new Map([['p_sat_doubles', pollState]]);
+
+        const dmChatId = '14081234567@s.whatsapp.net';
+        const noonTime = new Date('2026-11-10T14:00:00-08:00').getTime();
+        const res = await handleTriggerReminder(mockSock, dmChatId, 'Alice', null, {
+          activePolls,
+          recurringPolls: new Map(),
+          targetGroupJid: '120363403838804497@g.us',
+          now: noonTime,
+          persistPolls: () => {}
+        }, false, noonTime);
+
+        assert.equal(sentMessages.length, 1);
+        assert.equal(sentMessages[0].jid, '120363403838804497@g.us');
+        assert.match(sentMessages[0].content.text, /Saturday Doubles 10am/i);
+        assert.equal(typeof res, 'string');
+        assert.match(res, /reminder triggered and sent to group/i);
+        assert.match(res, /Saturday Doubles 10am/i);
+      });
+
+      it('should filter polls to targetGroupJid when triggered from DM', async () => {
+        const sentMessages = [];
+        const mockSock = {
+          sendMessage: async (jid, content, opts) => {
+            sentMessages.push({ jid, content, opts });
+            return { key: { id: 'msg_filter_1' } };
+          }
+        };
+
+        const group1Poll = {
+          name: 'Group 1 Match',
+          status: 'active',
+          remoteJid: 'group1@g.us',
+          playAt: new Date(Date.now() + 10 * 3600 * 1000).toISOString(),
+          options: ['Yes', 'No'],
+          type: 'opt_in',
+          voteBuffer: new Map()
+        };
+        const group2Poll = {
+          name: 'Group 2 Match',
+          status: 'active',
+          remoteJid: 'group2@g.us',
+          playAt: new Date(Date.now() + 10 * 3600 * 1000).toISOString(),
+          options: ['Yes', 'No'],
+          type: 'opt_in',
+          voteBuffer: new Map()
+        };
+        const activePolls = new Map([
+          ['p_grp1', group1Poll],
+          ['p_grp2', group2Poll]
+        ]);
+
+        const dmChatId = '14081234567@s.whatsapp.net';
+        const noonTime = new Date('2026-11-10T14:00:00-08:00').getTime();
+        const res = await handleTriggerReminder(mockSock, dmChatId, 'Alice', null, {
+          activePolls,
+          recurringPolls: new Map(),
+          targetGroupJid: 'group1@g.us',
+          now: noonTime,
+          persistPolls: () => {}
+        }, false, noonTime);
+
+        assert.equal(sentMessages.length, 1);
+        assert.equal(sentMessages[0].jid, 'group1@g.us');
+        assert.match(sentMessages[0].content.text, /Group 1 Match/i);
+        assert.match(res, /Group 1 Match/i);
+      });
+
+      it('should return non-null response string via handlePollCommand in DM to prevent fallthrough', async () => {
+        const sentMessages = [];
+        const mockSock = {
+          sendMessage: async (jid, content, opts) => {
+            sentMessages.push({ jid, content, opts });
+            return { key: { id: 'msg_cmd_1' } };
+          }
+        };
+
+        const pollState = {
+          name: 'Sunday 9am Match',
+          status: 'active',
+          remoteJid: '120363403838804497@g.us',
+          playAt: new Date(Date.now() + 48 * 3600 * 1000).toISOString(),
+          options: ['Yes', 'No'],
+          type: 'opt_in',
+          voteBuffer: new Map()
+        };
+        const activePolls = new Map([['p_sun_9am', pollState]]);
+        const dmChatId = '14081234567@s.whatsapp.net';
+
+        const noonTime = new Date('2026-11-10T14:00:00-08:00').getTime();
+        const cmdRes = await handlePollCommand(mockSock, '!remind', dmChatId, 'Alice', dmChatId, null, {
+          activePolls,
+          recurringPolls: new Map(),
+          targetGroupJid: '120363403838804497@g.us',
+          now: noonTime,
+          persistPolls: () => {}
+        });
+
+        assert.ok(cmdRes, 'handlePollCommand should return a non-null result for !remind in DM');
+        assert.equal(typeof cmdRes, 'string');
+        assert.match(cmdRes, /reminder triggered and sent to group/i);
+        assert.match(cmdRes, /Sunday 9am Match/i);
+        assert.equal(sentMessages.length, 1, 'Only 1 reminder message sent to the group');
       });
 
       it("should show Scheduled for day before match at 6:00 PM in pollStatusText for manual poll with day", () => {
