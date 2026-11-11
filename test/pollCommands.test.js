@@ -29,6 +29,7 @@ const {
   getPollDayWord,
   checkAndSendPollReminders,
   handleTriggerReminder,
+  parseTriggerReminderArgs,
   handleQuietHoursCommand,
   pollStatusText,
   createMatchPoll,
@@ -2766,6 +2767,77 @@ describe('pollCommands', () => {
         });
 
         assert.match(res, /no match time or day was specified/i);
+      });
+
+      it('should parse trigger reminder arguments with parseTriggerReminderArgs', () => {
+        assert.deepEqual(parseTriggerReminderArgs('!remind'), { isForce: false, specificPollId: null });
+        assert.deepEqual(parseTriggerReminderArgs('!sendreminder poll_123'), { isForce: false, specificPollId: 'poll_123' });
+        assert.deepEqual(parseTriggerReminderArgs('!remind --force'), { isForce: true, specificPollId: null });
+        assert.deepEqual(parseTriggerReminderArgs('!remind force'), { isForce: true, specificPollId: null });
+        assert.deepEqual(parseTriggerReminderArgs('!remind poll_123 --force'), { isForce: true, specificPollId: 'poll_123' });
+        assert.deepEqual(parseTriggerReminderArgs('!remind --force poll_123'), { isForce: true, specificPollId: 'poll_123' });
+        assert.deepEqual(parseTriggerReminderArgs('!forceremind'), { isForce: true, specificPollId: null });
+        assert.deepEqual(parseTriggerReminderArgs('!forceremind poll_123'), { isForce: true, specificPollId: 'poll_123' });
+        assert.deepEqual(parseTriggerReminderArgs('!remindforce poll_123'), { isForce: true, specificPollId: 'poll_123' });
+        assert.deepEqual(parseTriggerReminderArgs('!forcereminder'), { isForce: true, specificPollId: null });
+      });
+
+      it('should block normal !remind during quiet hours and suggest !forceremind', async () => {
+        const pollState = {
+          name: 'Tennis Friday',
+          status: 'active',
+          remoteJid: '120363403838804497@g.us',
+          playAt: new Date(Date.now() + 2 * 3600 * 1000).toISOString(),
+          options: ['Yes', 'No'],
+          type: 'opt_in',
+          voteBuffer: new Map()
+        };
+        const activePolls = new Map([['p_qh_test', pollState]]);
+
+        // Mock 11:30 PM (inside quiet hours 22:00-07:00)
+        const t1130pm = new Date('2026-11-10T23:30:00-08:00').getTime();
+
+        const res = await handleTriggerReminder(null, '120363403838804497@g.us', 'Alice', 'p_qh_test', {
+          activePolls,
+          recurringPolls: new Map(),
+          persistPolls: () => {}
+        }, false, t1130pm);
+
+        assert.ok(res);
+        assert.match(res, /Quiet Hours Active/i);
+        assert.match(res, /!forceremind/i);
+      });
+
+      it('should allow forced reminder (!forceremind / isForce: true) during quiet hours', async () => {
+        const sentMessages = [];
+        const mockSock = {
+          sendMessage: async (jid, content, opts) => {
+            sentMessages.push({ jid, content, opts });
+            return { key: { id: 'msg_remind_1' } };
+          }
+        };
+
+        const pollState = {
+          name: 'Tennis Friday',
+          status: 'active',
+          remoteJid: '120363403838804497@g.us',
+          playAt: new Date(Date.now() + 2 * 3600 * 1000).toISOString(),
+          options: ['Yes', 'No'],
+          type: 'opt_in',
+          voteBuffer: new Map()
+        };
+        const activePolls = new Map([['p_qh_force', pollState]]);
+        const t1130pm = new Date('2026-11-10T23:30:00-08:00').getTime();
+
+        const res = await handleTriggerReminder(mockSock, '120363403838804497@g.us', 'Alice', 'p_qh_force', {
+          activePolls,
+          recurringPolls: new Map(),
+          persistPolls: () => {}
+        }, true, t1130pm);
+
+        assert.equal(res, null);
+        assert.equal(sentMessages.length, 1);
+        assert.match(sentMessages[0].content.text, /Tennis Friday/i);
       });
 
       it("should show Scheduled for day before match at 6:00 PM in pollStatusText for manual poll with day", () => {
