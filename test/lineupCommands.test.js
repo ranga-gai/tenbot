@@ -655,5 +655,40 @@ describe('lineupCommands', () => {
 
       assert.match(res, /Could not parse a valid match lineup/);
     });
+
+    it('should parse courts without vs with 4 players (first two vs next two) and 3 players (first two vs third)', () => {
+      const { parseLineup } = require('../lib/lineupParser');
+      const text = `LINEUPS FOR TODAY
+
+FIRST SET 7.00 pm
+
+COURT 2 - JJ - Conrad vs Mausam - Amit
+COURT 3 - Deepak - Mehul vs Chandra - Vik
+COURT 5 - VJ - Anupam vs Som - Kej
+
+SECOND SET -
+COURT 3 - Mausam - Kej vs Mehul - Chandra
+COURT 2 - Amit - Conrad vs JJ - Deepak
+COURT 5 - Anupam - Som - Vik - VJ`;
+      const roster = ['JJ', 'Conrad', 'Mausam', 'Amit', 'Deepak', 'Mehul', 'Chandra', 'Vik', 'VJ', 'Anupam', 'Som', 'Kej'];
+
+      const res = parseLineup(text, roster);
+      assert.ok(res);
+      assert.equal(res.sets.length, 2);
+      assert.equal(res.sets[1].courts.length, 3);
+
+      const court5Set2 = res.sets[1].courts.find((c) => c.court === 5);
+      assert.ok(court5Set2);
+      assert.deepEqual(court5Set2.teamA, ['Anupam', 'Som']);
+      assert.deepEqual(court5Set2.teamB, ['Vik', 'VJ']);
+
+      // 3-player court test: first two vs third
+      const text3 = `COURT 5 - Anupam - Som - Vik`;
+      const res3 = parseLineup(text3, roster);
+      assert.ok(res3);
+      assert.equal(res3.sets[0].courts.length, 1);
+      assert.deepEqual(res3.sets[0].courts[0].teamA, ['Anupam', 'Som']);
+      assert.deepEqual(res3.sets[0].courts[0].teamB, ['Vik']);
+    });
   });
 });

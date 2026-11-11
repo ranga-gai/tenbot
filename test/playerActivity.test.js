@@ -9,6 +9,7 @@ const namesStore = require('../lib/names');
 const playerCommands = require('../lib/commands/playerCommands');
 const pollCommands = require('../lib/commands/pollCommands');
 const lineupCommands = require('../lib/commands/lineupCommands');
+const ratings = require('../lib/ratings');
 const { DATA_DIR } = require('../lib/paths');
 
 const TEST_ACTIVITY_FILE = path.join(DATA_DIR, 'player-activity.json');
@@ -562,6 +563,79 @@ describe('playerActivity', () => {
       playerActivity.recordMessaged('CreatedTestPlayer', '2026-11-08T12:00:00.000Z');
       const act = playerActivity.getPlayerActivity('CreatedTestPlayer');
       assert.ok(act.created);
+    });
+
+    it('should resolve bare numeric IDs and mentions to canonical LID without creating numeric entries', () => {
+      const lid = '90611059302558@lid';
+      const bareNumber = '90611059302558';
+      const atMention = '@90611059302558';
+      const now = new Date('2026-11-09T14:00:00.000Z').getTime();
+
+      // Ensure names store has the test player
+      namesStore.setName(lid, 'PI');
+
+      // 1. Resolve canonical player key
+      const resolvedBare = playerActivity.resolveCanonicalPlayerKey(bareNumber);
+      assert.equal(resolvedBare.key, lid);
+      assert.equal(resolvedBare.name, 'PI');
+      assert.equal(resolvedBare.id, lid);
+
+      const resolvedAt = playerActivity.resolveCanonicalPlayerKey(atMention);
+      assert.equal(resolvedAt.key, lid);
+      assert.equal(resolvedAt.name, 'PI');
+
+      // 2. Record played via bare number
+      playerActivity.recordPlayed(bareNumber, now);
+
+      const storeData = playerActivity.load();
+      // Should be stored under canonical LID, NOT under bare number
+      assert.ok(storeData[lid], 'Entry should exist under canonical LID');
+      assert.strictEqual(storeData[bareNumber], undefined, 'Bare number should not exist in store');
+      assert.equal(storeData[lid].played, new Date(now).toISOString());
+
+      // 3. Record played via @mention
+      const later = now + 3600000;
+      playerActivity.recordPlayed(atMention, later);
+      assert.equal(storeData[lid].played, new Date(later).toISOString());
+      assert.strictEqual(storeData[bareNumber], undefined);
+    });
+    it('should exclude tenbot from player activity, names, and ratings', () => {
+      const botLid = '24104010813588@lid';
+      const botPn = '16693124812@s.whatsapp.net';
+
+      // 1. Player activity resolution and recording
+      assert.strictEqual(playerActivity.resolveCanonicalPlayerKey('tenbot'), null);
+      assert.strictEqual(playerActivity.resolveCanonicalPlayerKey('@tenbot'), null);
+      assert.strictEqual(playerActivity.resolveCanonicalPlayerKey(botLid), null);
+      assert.strictEqual(playerActivity.resolveCanonicalPlayerKey(botPn), null);
+
+      assert.strictEqual(playerActivity.recordPlayed('tenbot'), null);
+      assert.strictEqual(playerActivity.recordPlayed(botLid), null);
+      assert.strictEqual(playerActivity.recordVoted('@tenbot'), null);
+      assert.strictEqual(playerActivity.recordMessaged(botPn), null);
+
+      const allActivity = playerActivity.getAllActivity();
+      assert.ok(!allActivity.some((a) => a.name?.toLowerCase() === 'tenbot' || a.key === botLid));
+
+      // 2. Names store exclusion
+      assert.strictEqual(namesStore.findIdByNameOrAlias('tenbot'), null);
+      assert.strictEqual(namesStore.findIdByNameOrAlias('@tenbot'), null);
+      assert.strictEqual(namesStore.setName(botLid, 'tenbot'), null);
+      assert.strictEqual(namesStore.setName('99999999@lid', 'tenbot'), null);
+      namesStore.setMapping(botLid, botPn, 'tenbot');
+      assert.strictEqual(namesStore.getName(botLid), null);
+
+      // 3. Ratings exclusion
+      assert.strictEqual(ratings.isPlaceholder('tenbot'), true);
+      assert.strictEqual(ratings.isPlaceholder('@tenbot'), true);
+      assert.strictEqual(ratings.isPlaceholder(botLid), true);
+      assert.strictEqual(ratings.isPlaceholder(botPn), true);
+
+      assert.strictEqual(ratings.setRating('tenbot', 4.0), null);
+      assert.strictEqual(ratings.setRating(botLid, 4.0), null);
+
+      const allRatings = ratings.getAllRatings();
+      assert.ok(!allRatings.some((r) => r.name?.toLowerCase() === 'tenbot' || r.id === botLid));
     });
   });
 });

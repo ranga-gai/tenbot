@@ -224,7 +224,9 @@ function escapeRegex(str) {
 function recordName(jid, name, explicitPn = null) {
   if (!jid || !name) return false;
   const trimmed = String(name).trim();
-  if (!trimmed) return false;
+  if (!trimmed || trimmed.toLowerCase() === 'tenbot' || trimmed.toLowerCase() === '@tenbot') return false;
+  const rawJid = String(jid);
+  if (rawJid.toLowerCase() === 'tenbot' || rawJid === '24104010813588@lid' || rawJid === '16693124812@s.whatsapp.net') return false;
   const raw = jid;
   const norm = jidNormalizedUser(jid);
   const canonicalId = namesStore.resolveCanonicalId(norm || raw);
@@ -993,11 +995,7 @@ async function startBot() {
   const meLid = sock.user?.lid || state.creds?.me?.lid;
   const mePnNorm = meId ? jidNormalizedUser(meId) : null;
   const meLidNorm = meLid ? jidNormalizedUser(meLid) : null;
-  if (meLidNorm && mePnNorm && meLidNorm !== mePnNorm) {
-    namesStore.setMapping(meLidNorm, mePnNorm, meName);
-  } else if (meLidNorm && meName) {
-    recordName(meLidNorm, meName);
-  }
+  // Bot identity is excluded from names, ratings, and player activity
 
   sock.ev.on('creds.update', saveCreds);
 
@@ -1077,11 +1075,7 @@ async function startBot() {
       const currMeLid = sock.user?.lid || sock.authState?.creds?.me?.lid;
       const currMePn = currMeId ? jidNormalizedUser(currMeId) : null;
       const currMeLidNorm = currMeLid ? jidNormalizedUser(currMeLid) : null;
-      if (currMeLidNorm && currMePn && currMeLidNorm !== currMePn) {
-        namesStore.setMapping(currMeLidNorm, currMePn, currMeName);
-      } else if (currMeLidNorm && currMeName) {
-        recordName(currMeLidNorm, currMeName);
-      }
+      // Bot identity is excluded from names, ratings, and player activity
 
       try {
         const groups = await sock.groupFetchAllParticipating();
