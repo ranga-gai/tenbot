@@ -80,7 +80,7 @@ describe('Multi-Time Poll Feature', () => {
       assert.ok(Array.isArray(p1.timeSlots));
       assert.equal(p1.timeSlots.length, 3);
       assert.equal(p1.multiVote, true);
-      assert.equal(p1.multiSessionMode, null);
+      assert.equal(p1.multiSessionMode, 'single_session');
 
       const p2 = parsePollCreationText('!poll 4 Saturday 8am, 9:30am --single-vote --single-session');
       assert.ok(p2);
@@ -88,6 +88,18 @@ describe('Multi-Time Poll Feature', () => {
       assert.equal(p2.timeSlots.length, 2);
       assert.equal(p2.multiVote, false);
       assert.equal(p2.multiSessionMode, 'single_session');
+
+      // --single-vote automatically implies single_session mode
+      const p3 = parsePollCreationText('!poll 4 Saturday 8am, 9:30am --single-vote');
+      assert.ok(p3);
+      assert.equal(p3.multiVote, false);
+      assert.equal(p3.multiSessionMode, 'single_session');
+
+      // --independent sets independent session mode
+      const p4 = parsePollCreationText('!poll 4 Saturday 8am, 9:30am --independent');
+      assert.ok(p4);
+      assert.equal(p4.multiVote, true);
+      assert.equal(p4.multiSessionMode, 'independent');
     });
   });
 
@@ -162,7 +174,7 @@ describe('Multi-Time Poll Feature', () => {
       assert.equal(state.type, 'multi_time');
       assert.equal(state.creator, null);
       assert.equal(state.multiVote, true);
-      assert.equal(state.multiSessionMode, 'independent');
+      assert.equal(state.multiSessionMode, 'single_session');
       assert.equal(state.timeSlots.length, 3);
       assert.equal(state.timeSlots[0].slotLimit, 4);
       assert.equal(state.timeSlots[1].slotLimit, 8);
@@ -310,7 +322,7 @@ describe('Multi-Time Poll Feature', () => {
   });
 
   describe('resolveMultiTimePollRoster & session modes', () => {
-    it('supports independent mode (default) and single_session mode deduplication', () => {
+    it('supports single_session mode (default) and independent mode deduplication', () => {
       namesStore.setName('p1@s.whatsapp.net', 'Alice');
       namesStore.setName('p2@s.whatsapp.net', 'Bob');
       namesStore.setName('p3@s.whatsapp.net', 'Charlie');
@@ -351,7 +363,30 @@ describe('Multi-Time Poll Feature', () => {
         }
       ];
 
-      // 1. Independent mode: Alice & Bob are in BOTH 8:00am and 9:30am; Eve is excess (5th) in 8:00am and active in 9:30am
+      // 1. Default (single_session) mode: Since 8:00am is filled with Alice, Bob, Charlie, Dave, Alice & Bob are deduplicated from 9:30am, leaving Eve in 9:30am!
+      const pollDefault = {
+        type: 'multi_time',
+        timeSlots: baseSlots(),
+        voteBuffer: new Map()
+      };
+      const rDefault = resolveMultiTimePollRoster(pollDefault, aggregated);
+      assert.deepEqual(rDefault[0].players, ['Alice', 'Bob', 'Charlie', 'Dave']);
+      assert.deepEqual(rDefault[1].players, ['Eve']);
+      assert.deepEqual(rDefault[1].skippedForOtherSession, ['Alice', 'Bob']);
+
+      // 2. Explicit single-session mode: same deduplication
+      const pollSingleSession = {
+        type: 'multi_time',
+        multiSessionMode: 'single_session',
+        timeSlots: baseSlots(),
+        voteBuffer: new Map()
+      };
+      const rSingle = resolveMultiTimePollRoster(pollSingleSession, aggregated);
+      assert.deepEqual(rSingle[0].players, ['Alice', 'Bob', 'Charlie', 'Dave']);
+      assert.deepEqual(rSingle[1].players, ['Eve']);
+      assert.deepEqual(rSingle[1].skippedForOtherSession, ['Alice', 'Bob']);
+
+      // 3. Independent mode: Alice & Bob are in BOTH 8:00am and 9:30am; Eve is excess (5th) in 8:00am and active in 9:30am
       const pollIndependent = {
         type: 'multi_time',
         multiSessionMode: 'independent',
@@ -363,18 +398,6 @@ describe('Multi-Time Poll Feature', () => {
       assert.deepEqual(rInd[0].excessPlayers, ['Eve']);
       assert.equal(rInd[0].isAllFilled, true);
       assert.deepEqual(rInd[1].players, ['Alice', 'Bob', 'Eve']);
-
-      // 2. Single-session mode: Since 8:00am is filled with Alice, Bob, Charlie, Dave, Alice & Bob are deduplicated from 9:30am, leaving Eve in 9:30am!
-      const pollSingleSession = {
-        type: 'multi_time',
-        multiSessionMode: 'single_session',
-        timeSlots: baseSlots(),
-        voteBuffer: new Map()
-      };
-      const rSingle = resolveMultiTimePollRoster(pollSingleSession, aggregated);
-      assert.deepEqual(rSingle[0].players, ['Alice', 'Bob', 'Charlie', 'Dave']);
-      assert.deepEqual(rSingle[1].players, ['Eve']);
-      assert.deepEqual(rSingle[1].skippedForOtherSession, ['Alice', 'Bob']);
     });
   });
 
@@ -443,7 +466,7 @@ describe('Multi-Time Poll Feature', () => {
         null,
         null,
         context,
-        { lineupGeneration: 'filled' }
+        { lineupGeneration: 'filled', multiSessionMode: 'independent' }
       );
 
       const pollState = activePolls.get('mt_poll_vote_1');
