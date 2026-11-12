@@ -4364,7 +4364,7 @@ describe('pollCommands', () => {
         "test@g.us",
         8,
         "tomorrow 7pm",
-        "Wednesday",
+        "tomorrow",
         "7:00 PM",
         "Alice",
         "alice@lid",

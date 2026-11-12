@@ -72,6 +72,7 @@ const recurringPollsModule = require('./lib/recurringPolls');
 const groupsConfig = require('./lib/groupsConfig');
 const courtsConfig = require('./lib/courtsConfig');
 const playerActivity = require('./lib/playerActivity');
+const groupSync = require('./lib/groupSync');
 const anthropic = require('./lib/anthropic');
 const pollTime = require('./lib/pollTime');
 const { parseLineup } = require('./lib/lineupParser');
@@ -1106,6 +1107,7 @@ async function startBot() {
           }
         }
         console.log(`✅ Tennis group bot is ready and listening for ${allowedCount} group(s).`);
+        await groupSync.syncGroupMembership(sock);
       } catch (err) {
         console.error('[groups] Failed to pre-fetch groups on connection open:', err.message);
       }
@@ -1138,23 +1140,7 @@ async function startBot() {
   sock.ev.on('group-participants.update', async ({ id, participants, action }) => {
     if (!id || !participants) return;
     try {
-      const metadata = await groupCommands.getGroupMetadata(sock, id, recordName);
-      if (metadata && metadata.participants) {
-        namesStore.setGroupMembers(id, metadata.participants);
-        for (const p of metadata.participants) {
-          const rawPn = p.id || p.jid;
-          const rawLid = p.lid;
-          const pn = rawPn && rawPn.endsWith('@s.whatsapp.net') ? jidNormalizedUser(rawPn) : null;
-          const lid = rawLid && rawLid.endsWith('@lid') ? jidNormalizedUser(rawLid) : (rawPn && rawPn.endsWith('@lid') ? jidNormalizedUser(rawPn) : null);
-          const name = p.name || p.notify || p.verifiedName;
-          if (pn && lid && pn !== lid) {
-            namesStore.setMapping(lid, pn, name);
-          } else if (name) {
-            if (pn) recordName(pn, name);
-            if (lid) recordName(lid, name);
-          }
-        }
-      }
+      await groupSync.handleParticipantsUpdate(sock, { id, participants, action }, recordName);
     } catch (e) {
       console.error('[group-participants] Error updating group participants:', e.message);
     }
