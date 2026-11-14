@@ -251,6 +251,16 @@ describe('playerActivity', () => {
       assert.ok(reply.includes('Messaged'));
     });
 
+    it('should display activity details even if player has never played, voted, or messaged', async () => {
+      playerActivity.addPlayerActivity('NewUser@lid', 'chat1', 'New User');
+      const reply = await playerCommands.handlePlayerActivity(null, 'chat1', 'Me', 'New User');
+      assert.ok(reply.includes('Activity for New User:'));
+      assert.ok(reply.includes('*Latest Activity:* Never'));
+      assert.ok(reply.includes('*Last Played:* Never'));
+      assert.ok(reply.includes('*Last Voted:* Never'));
+      assert.ok(reply.includes('*Last Messaged:* Never'));
+    });
+
     it('should label future match as Next Match instead of Last Played and not count it as Latest Activity', async () => {
       const futureMatch = new Date(Date.now() + 86400000).toISOString();
       playerActivity.recordPlayed('FuturePlayer', futureMatch);
