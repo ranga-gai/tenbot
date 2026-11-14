@@ -247,6 +247,18 @@ describe('playerActivity', () => {
       assert.ok(reply.includes('Last Played:'));
       assert.ok(reply.includes('Last Voted:'));
       assert.ok(reply.includes('Last Messaged:'));
+      assert.ok(reply.includes('Details:'));
+      assert.ok(reply.includes('Messaged'));
+    });
+
+    it('should label future match as Next Match instead of Last Played and not count it as Latest Activity', async () => {
+      const futureMatch = new Date(Date.now() + 86400000).toISOString();
+      playerActivity.recordPlayed('FuturePlayer', futureMatch);
+      playerActivity.recordMessaged('FuturePlayer', new Date(Date.now() - 3600000).toISOString());
+
+      const reply = await playerCommands.handlePlayerActivity(null, 'chat1', 'Me', 'FuturePlayer');
+      assert.ok(reply.includes('Next Match:'));
+      assert.ok(!reply.includes('Last Played:'));
       assert.ok(reply.includes('Messaged'));
     });
 
