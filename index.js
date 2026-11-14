@@ -193,10 +193,6 @@ const {
 
 const storeKey = (remoteJid, id) => `${remoteJid}:${id}`;
 
-// Ensure all players in names.json have full names defaulted and ratings on startup
-namesStore.defaultMissingFullNames();
-ratings.syncRatingsWithNames();
-
 function persistPolls(chatId = null) {
   pollStore.save({ messageStore, activePolls, latestPollIdByChat, recurringPolls }, chatId);
 }
